@@ -44,6 +44,27 @@ def _last_two_dates(cur):
     return last, prev
 
 
+def _last_two_dates_market(cur, descripcion: str):
+    """Últimas dos fechas con datos para un mercado específico."""
+    cur.execute("""
+        SELECT MAX(v.fecha) AS last_date
+        FROM valorhistoricoaccion v
+        JOIN accion a ON a.id = v.accion_id
+        JOIN mercado m ON m.id = a.mercado_id
+        WHERE m.descripcion = %s
+    """, [descripcion])
+    last = cur.fetchone()['last_date']
+    cur.execute("""
+        SELECT MAX(v.fecha) AS last_date
+        FROM valorhistoricoaccion v
+        JOIN accion a ON a.id = v.accion_id
+        JOIN mercado m ON m.id = a.mercado_id
+        WHERE m.descripcion = %s AND v.fecha < %s
+    """, [descripcion, last])
+    prev = cur.fetchone()['last_date']
+    return last, prev
+
+
 # ── Top movers ────────────────────────────────────────────────────────────────
 
 def get_top_movers(segment: str, direction: str, n: int = 5) -> list[dict]:
@@ -57,7 +78,10 @@ def get_top_movers(segment: str, direction: str, n: int = 5) -> list[dict]:
 
     with _conn() as conn:
         with conn.cursor() as cur:
-            last, prev = _last_two_dates(cur)
+            if segment == 'BYMA':
+                last, prev = _last_two_dates_market(cur, 'BYMA')
+            else:
+                last, prev = _last_two_dates(cur)
             params = [last, prev]
             if segment != 'BYMA':
                 params.extend(USA_MARKETS)

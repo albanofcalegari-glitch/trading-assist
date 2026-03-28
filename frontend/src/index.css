@@ -1,0 +1,107 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-bg text-text-primary font-sans antialiased;
+    font-size: 13px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border rounded;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-neutral;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface border border-border rounded-lg shadow-card;
+  }
+
+  .card-elevated {
+    @apply bg-elevated border border-border rounded-lg shadow-card;
+  }
+
+  .btn {
+    @apply inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium
+           transition-colors duration-150 cursor-pointer select-none;
+  }
+
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent-hover;
+  }
+
+  .btn-ghost {
+    @apply btn text-text-secondary hover:text-text-primary hover:bg-elevated;
+  }
+
+  .btn-outline {
+    @apply btn border border-border text-text-secondary hover:border-neutral hover:text-text-primary;
+  }
+
+  .input {
+    @apply w-full bg-elevated border border-border rounded-md px-3 py-1.5 text-sm
+           text-text-primary placeholder-text-muted
+           focus:outline-none focus:border-accent transition-colors;
+  }
+
+  .select {
+    @apply input appearance-none cursor-pointer pr-8;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded text-2xs font-medium;
+  }
+
+  .badge-up     { @apply badge bg-up/10 text-up; }
+  .badge-down   { @apply badge bg-down/10 text-down; }
+  .badge-warn   { @apply badge bg-warn/10 text-warn; }
+  .badge-signal { @apply badge bg-signal/10 text-signal; }
+  .badge-neutral { @apply badge bg-neutral/10 text-neutral; }
+  .badge-accent  { @apply badge bg-accent/10 text-accent; }
+
+  .table-row {
+    @apply border-b border-border-subtle hover:bg-elevated/50 transition-colors;
+  }
+
+  .table-header {
+    @apply text-2xs font-medium text-text-muted uppercase tracking-wider;
+  }
+
+  .separator { @apply border-t border-border; }
+
+  .nav-item {
+    @apply flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-text-secondary
+           hover:text-text-primary hover:bg-elevated transition-colors cursor-pointer;
+  }
+
+  .nav-item-active {
+    @apply nav-item text-text-primary bg-elevated;
+  }
+
+  /* Precio positivo/negativo */
+  .price-up   { @apply text-up font-mono; }
+  .price-down { @apply text-down font-mono; }
+  .price-flat { @apply text-text-secondary font-mono; }
+
+  /* Número mono */
+  .num { @apply font-mono tabular-nums; }
+}

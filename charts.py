@@ -4,6 +4,7 @@ charts.py — Gráficos Plotly para trading-assist
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
+import numpy as np
 
 # ── Paleta dark terminal ──────────────────────────────────────────────────────
 C = {
@@ -20,6 +21,8 @@ C = {
     'text2':   '#94a3b8',
     'grid':    'rgba(255,255,255,0.04)',
     'spike':   'rgba(255,255,255,0.2)',
+    'cyan':    '#06b6d4',
+    'lime':    '#a3e635',
 }
 
 _FONT = dict(family="'JetBrains Mono', 'Fira Code', monospace", size=11, color=C['text2'])
@@ -57,42 +60,106 @@ def _base(height=480) -> dict:
 
 
 def _apply_date_ticks(fig: go.Figure, df: pd.DataFrame, tf: str,
-                      hide_labels_row: int | None = None) -> None:
+                      hide_labels_row: int | None = None,
+                      candle_freq: str = 'D') -> None:
     """
-    Aplica ticks de fecha al eje X usando update_xaxes (funciona correctamente
-    con make_subplots). Se llama DESPUÉS de update_layout.
+    Aplica ticks de fecha al eje X usando update_xaxes.
 
-    hide_labels_row: si se indica, oculta los tick labels de esa fila (1-indexed).
-      price_chart  → hide_labels_row=2 (ocultar en panel volumen)
-      momentum_chart→ hide_labels_row=1 (ocultar en panel superior)
+    D  → type='date'     (eje continuo, ticks diarios/semanales)
+    W/M/Y → type='category' (barras equidistantes, sin gaps de fin de semana)
     """
-    tick0 = df['fecha'].iloc[0] if not df.empty else '2020-01-01'
+    from datetime import datetime as _dt
 
-    if tf == '3M':
-        cfg = dict(
-            type='date',
-            tickmode='linear',
-            tick0=tick0,
-            dtick=7 * 24 * 60 * 60 * 1000,  # 7 días en ms → ~1 tick por semana
-            tickformat='%d %b',              # "12 Mar"
+    if candle_freq == 'D':
+        tick0 = df['fecha'].iloc[0] if not df.empty else '2020-01-01'
+        if tf == '3M':
+            cfg = dict(type='date', tickmode='linear', tick0=tick0,
+                       dtick=7 * 24 * 60 * 60 * 1000, tickformat='%d %b',
+                       tickangle=0, showticklabels=True)
+        else:  # 1A
+            cfg = dict(type='date', tickmode='linear', tick0=tick0,
+                       dtick='M1', tickformat='%b %Y',
+                       tickangle=0, showticklabels=True)
+        fig.update_xaxes(**cfg)
+
+    else:
+        # W/M/Y: eje categórico — barras equidistantes, sin gaps de fines de semana
+        if df.empty:
+            fig.update_xaxes(type='category')
+            return
+
+        dates = df['fecha'].tolist()
+        n = len(dates)
+
+        if candle_freq == 'W':
+            step = max(1, round(n / 16))   # ~16 etiquetas max
+            fmt  = '%b %Y'
+        elif candle_freq == 'M':
+            step = max(1, round(n / 8))    # ~8 etiquetas max
+            fmt  = '%b %Y'
+        else:  # Y
+            step = 1
+            fmt  = '%Y'
+
+        tick_indices = list(range(0, n, step))
+        tickvals = [dates[i] for i in tick_indices]
+        ticktext = [_dt.strptime(dates[i], '%Y-%m-%d').strftime(fmt)
+                    for i in tick_indices]
+
+        fig.update_xaxes(
+            type='category',
+            tickvals=tickvals,
+            ticktext=ticktext,
             tickangle=0,
             showticklabels=True,
         )
-    else:  # 1A
-        cfg = dict(
-            type='date',
-            tickmode='linear',
-            tick0=tick0,
-            dtick='M1',                      # 1 mes exacto
-            tickformat='%b %Y',              # "Mar 2025"
-            tickangle=0,
-            showticklabels=True,
-        )
-
-    fig.update_xaxes(**cfg)   # aplica a TODOS los ejes X de la figura
 
     if hide_labels_row is not None:
         fig.update_xaxes(showticklabels=False, row=hide_labels_row, col=1)
+
+
+# ── Resampling OHLCV ──────────────────────────────────────────────────────────
+
+def resample_ohlcv(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """
+    Reagrupa velas diarias a frecuencia superior.
+    freq: 'D' sin cambio, 'W' semanal, 'M' mensual, 'Y' anual.
+
+    OHLCV:  open=primero, high=max, low=min, close=ultimo, volume=suma.
+    MAs (sma50/ema20/sma200): ultimo valor del periodo.
+
+    Usa type='category' en el grafico para evitar gaps de fines de semana.
+    """
+    if freq == 'D' or df.empty:
+        return df.copy()
+
+    df2 = df.copy()
+    df2['fecha'] = pd.to_datetime(df2['fecha'])
+    df2 = df2.set_index('fecha').sort_index()
+
+    # Aliases: intenta primero la API moderna (pandas 2.2+), fallback a la clasica
+    _rules_primary  = {'W': 'W-FRI', 'M': 'ME',  'Y': 'YE'}
+    _rules_fallback = {'W': 'W',     'M': 'M',   'Y': 'Y'}
+    rule     = _rules_primary.get(freq,  freq)
+    rule_fb  = _rules_fallback.get(freq, freq)
+
+    agg: dict = {}
+    for c, fn in [('open', 'first'), ('high', 'max'), ('low', 'min'),
+                  ('close', 'last'), ('volume', 'sum')]:
+        if c in df2.columns:
+            agg[c] = fn
+    for c in ('sma50', 'ema20', 'sma200'):
+        if c in df2.columns:
+            agg[c] = 'last'
+
+    try:
+        out = df2.resample(rule).agg(agg)
+    except Exception:
+        out = df2.resample(rule_fb).agg(agg)
+
+    out = out.dropna(subset=['close']).reset_index()
+    out['fecha'] = out['fecha'].dt.strftime('%Y-%m-%d')
+    return out
 
 
 # ── Helpers de análisis dinámico ──────────────────────────────────────────────
@@ -205,6 +272,552 @@ def get_dynamic_sr(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
     return sup_dyn, res_dyn
 
 
+# ── WMA21 / SMA30 crossover ────────────────────────────────────────────────────
+
+def get_wma_sma_signal(df: pd.DataFrame) -> dict:
+    """
+    Calcula WMA21 y SMA30 sobre precios de cierre y detecta cruces.
+
+    WMA21: media ponderada lineal de 21 períodos.
+      Pesos: 1, 2, …, 21 (el bar más reciente recibe peso 21).
+      Fórmula: WMA[i] = sum(close[i-20..i] * [1..21]) / sum(1..21)
+               donde sum(1..21) = 231.
+
+    SMA30: media simple de 30 períodos.
+
+    Cruce alcista  : WMA21[t-1] < SMA30[t-1]  y  WMA21[t] > SMA30[t]
+    Cruce bajista  : WMA21[t-1] > SMA30[t-1]  y  WMA21[t] < SMA30[t]
+
+    Returns dict:
+      wma21        : pd.Series (índice = índice del df)
+      sma30        : pd.Series
+      bull_crosses : list[(fecha, close)]  — cruces alcistas
+      bear_crosses : list[(fecha, close)]  — cruces bajistas
+      estado       : 'Alcista' | 'Bajista' | 'N/D'
+      ultimo_cruce : {'fecha': str, 'tipo': str} | None
+    """
+    _empty = dict(wma21=pd.Series(dtype=float), sma30=pd.Series(dtype=float),
+                  bull_crosses=[], bear_crosses=[], estado='N/D', ultimo_cruce=None)
+    if df.empty or len(df) < 30:
+        return _empty
+
+    closes = pd.to_numeric(df['close'], errors='coerce')
+
+    # WMA21
+    _w    = np.arange(1, 22, dtype=float)
+    _wsum = _w.sum()          # 231
+    wma21 = closes.rolling(21).apply(lambda x: float(np.dot(x, _w) / _wsum), raw=True)
+
+    # SMA30
+    sma30 = closes.rolling(30).mean()
+
+    # Detección de cruces (iterar solo sobre posiciones con ambas series válidas)
+    bull_crosses: list = []
+    bear_crosses: list = []
+    ultimo_cruce = None
+
+    valid_pos = [i for i in range(len(df))
+                 if pd.notna(wma21.iloc[i]) and pd.notna(sma30.iloc[i])]
+
+    for k in range(1, len(valid_pos)):
+        ii = valid_pos[k]
+        ip = valid_pos[k - 1]
+        w_cur,  w_prev  = float(wma21.iloc[ii]), float(wma21.iloc[ip])
+        s_cur,  s_prev  = float(sma30.iloc[ii]),  float(sma30.iloc[ip])
+        fecha = df['fecha'].iloc[ii]
+        price = float(closes.iloc[ii])
+
+        if w_prev < s_prev and w_cur > s_cur:          # cruce alcista
+            bull_crosses.append((fecha, price))
+            ultimo_cruce = {'fecha': str(fecha)[:10], 'tipo': 'Alcista'}
+        elif w_prev > s_prev and w_cur < s_cur:        # cruce bajista
+            bear_crosses.append((fecha, price))
+            ultimo_cruce = {'fecha': str(fecha)[:10], 'tipo': 'Bajista'}
+
+    # Estado actual (último valor válido)
+    wma_v = wma21.dropna()
+    sma_v = sma30.dropna()
+    if len(wma_v) > 0 and len(sma_v) > 0:
+        estado = 'Alcista' if float(wma_v.iloc[-1]) > float(sma_v.iloc[-1]) else 'Bajista'
+    else:
+        estado = 'N/D'
+
+    return dict(wma21=wma21, sma30=sma30,
+                bull_crosses=bull_crosses, bear_crosses=bear_crosses,
+                estado=estado, ultimo_cruce=ultimo_cruce)
+
+
+# ── BUY_CONFIRMATION — cruce WMA21/SMA30 + confirmación RSI ──────────────────
+
+def get_buy_confirmation(
+    df: pd.DataFrame,
+    sup: list | None = None,
+    dyn_sup: list | None = None,
+    sr_threshold: float = 0.02,
+    lookback_oversold: int = 5,
+) -> dict:
+    """
+    Señal compuesta BUY_CONFIRMATION.
+
+    Condición principal:
+      1. WMA21 cruza por encima de SMA30 (cruce alcista)
+      Y además se cumple al menos una de:
+      2A. RSI estuvo en sobreventa (<30) en los `lookback_oversold` días anteriores
+          y está subiendo al momento del cruce.
+      2B. RSI cruza hacia arriba el nivel 50 (RSI[t-1] < 50 y RSI[t] >= 50).
+
+    Condición de fuerza:
+      FUERTE → precio ≤ sr_threshold (2%) de un soporte estático o dinámico.
+      MEDIA  → en caso contrario.
+
+    Retorna dict:
+      activo        : bool   — WMA21 sigue sobre SMA30 (señal no invalidada)
+      fuerza        : 'FUERTE' | 'MEDIA' | None
+      motivo        : list[str]
+      cerca_soporte : bool
+      fecha         : str | None
+      price         : float | None
+      signals       : list[dict]   — histórico de todas las señales detectadas
+    """
+    _empty = dict(activo=False, fuerza=None, motivo=[], cerca_soporte=False,
+                  fecha=None, price=None, signals=[])
+    if df.empty or len(df) < 30:
+        return _empty
+
+    closes = pd.to_numeric(df['close'], errors='coerce')
+    rsi    = (pd.to_numeric(df['rsi14'], errors='coerce')
+              if 'rsi14' in df.columns
+              else pd.Series([float('nan')] * len(df), index=df.index))
+
+    # WMA21
+    _w    = np.arange(1, 22, dtype=float)
+    _wsum = _w.sum()          # 231
+    wma21 = closes.rolling(21).apply(lambda x: float(np.dot(x, _w) / _wsum), raw=True)
+
+    # SMA30
+    sma30 = closes.rolling(30).mean()
+
+    # Consolidar niveles de soporte (estáticos + dinámicos)
+    all_supports: list[float] = list(sup or [])
+    for item in (dyn_sup or []):
+        v = item.get('value') or item.get('vmin')
+        if v is not None:
+            all_supports.append(float(v))
+
+    valid_pos = [i for i in range(len(df))
+                 if pd.notna(wma21.iloc[i]) and pd.notna(sma30.iloc[i])]
+
+    signals: list[dict] = []
+
+    for k in range(1, len(valid_pos)):
+        ii = valid_pos[k]
+        ip = valid_pos[k - 1]
+
+        w_cur, w_prev = float(wma21.iloc[ii]), float(wma21.iloc[ip])
+        s_cur, s_prev = float(sma30.iloc[ii]),  float(sma30.iloc[ip])
+
+        # Condición 1: cruce alcista WMA21 sobre SMA30
+        if not (w_prev < s_prev and w_cur > s_cur):
+            continue
+
+        fecha = df['fecha'].iloc[ii]
+        price = float(closes.iloc[ii])
+        rsi_cur  = float(rsi.iloc[ii]) if pd.notna(rsi.iloc[ii]) else None
+        rsi_prev = float(rsi.iloc[ip]) if pd.notna(rsi.iloc[ip]) else None
+
+        # Condición RSI
+        motivo = ['cruce WMA21/SMA30']
+        rsi_ok = False
+
+        # 2A: sobreventa reciente + RSI subiendo
+        lb_start   = max(0, ii - lookback_oversold)
+        rsi_window = rsi.iloc[lb_start: ii + 1].dropna()
+        if (rsi_cur is not None and rsi_prev is not None
+                and len(rsi_window) > 0
+                and float(rsi_window.min()) < 30
+                and rsi_cur > rsi_prev):
+            motivo.append('RSI recuperación')
+            rsi_ok = True
+
+        # 2B: RSI cruza 50 al alza
+        if (not rsi_ok and rsi_cur is not None and rsi_prev is not None
+                and rsi_prev < 50 and rsi_cur >= 50):
+            motivo.append('RSI > 50')
+            rsi_ok = True
+
+        if not rsi_ok:
+            continue
+
+        # Fuerza: cercanía a soporte
+        cerca = (
+            any(abs(price - s) / max(abs(price), 1e-9) <= sr_threshold
+                for s in all_supports)
+            if all_supports else False
+        )
+
+        signals.append(dict(
+            fecha=str(fecha)[:10],
+            price=price,
+            fuerza='FUERTE' if cerca else 'MEDIA',
+            motivo=list(motivo),
+            cerca_soporte=cerca,
+        ))
+
+    if not signals:
+        return _empty
+
+    latest = signals[-1]
+
+    # Activo si WMA21 sigue sobre SMA30 actualmente
+    wma_v = wma21.dropna()
+    sma_v = sma30.dropna()
+    activo = (
+        len(wma_v) > 0 and len(sma_v) > 0
+        and float(wma_v.iloc[-1]) > float(sma_v.iloc[-1])
+    )
+
+    return dict(
+        activo=activo,
+        fuerza=latest['fuerza'],
+        motivo=latest['motivo'],
+        cerca_soporte=latest['cerca_soporte'],
+        fecha=latest['fecha'],
+        price=latest['price'],
+        signals=signals,
+    )
+
+
+# ── Swing trading: WMA6 / WMA30 crossover ────────────────────────────────────
+
+def get_swing_signal(df: pd.DataFrame, n_recent: int = 4) -> dict:
+    """
+    Señal de corto plazo basada en WMA6 / WMA30.
+
+    WMA6 : media ponderada lineal de 6 períodos  (pesos 1..6,  suma=21).
+    WMA30: media ponderada lineal de 30 períodos (pesos 1..30, suma=465).
+
+    BUY_SWING  : WMA6[t-1] < WMA30[t-1]  y  WMA6[t] > WMA30[t]
+    SELL_SWING : WMA6[t-1] > WMA30[t-1]  y  WMA6[t] < WMA30[t]
+
+    Estado actual:
+      'Compra'  → WMA6 > WMA30 (y no Neutral)
+      'Venta'   → WMA6 < WMA30 (y no Neutral)
+      'Neutral' → cruce ocurrió hace ≤ 2 barras  O  distancia < 0.3% del precio
+
+    Returns dict:
+      wma6           : pd.Series
+      wma30          : pd.Series
+      recent_crosses : list[dict]  — últimos `n_recent` cruces (para markers gráfico)
+      estado         : 'Compra' | 'Venta' | 'Neutral' | 'N/D'
+      ultimo_cruce   : {'fecha', 'tipo'} | None
+    """
+    _empty = dict(wma6=pd.Series(dtype=float), wma30=pd.Series(dtype=float),
+                  recent_crosses=[], estado='N/D', ultimo_cruce=None)
+    if df.empty or len(df) < 30:
+        return _empty
+
+    closes = pd.to_numeric(df['close'], errors='coerce')
+
+    # WMA6 — pesos [1..6], suma=21
+    _w6    = np.arange(1, 7,  dtype=float)
+    _w6s   = _w6.sum()
+    wma6   = closes.rolling(6).apply(lambda x: float(np.dot(x, _w6) / _w6s), raw=True)
+
+    # WMA30 — pesos [1..30], suma=465
+    _w30   = np.arange(1, 31, dtype=float)
+    _w30s  = _w30.sum()
+    wma30  = closes.rolling(30).apply(lambda x: float(np.dot(x, _w30) / _w30s), raw=True)
+
+    valid_pos = [i for i in range(len(df))
+                 if pd.notna(wma6.iloc[i]) and pd.notna(wma30.iloc[i])]
+
+    all_crosses: list[dict] = []
+    for k in range(1, len(valid_pos)):
+        ii = valid_pos[k]
+        ip = valid_pos[k - 1]
+        w6_cur,  w6_prev  = float(wma6.iloc[ii]),  float(wma6.iloc[ip])
+        w30_cur, w30_prev = float(wma30.iloc[ii]), float(wma30.iloc[ip])
+        fecha = df['fecha'].iloc[ii]
+        price = float(closes.iloc[ii])
+
+        if w6_prev < w30_prev and w6_cur > w30_cur:
+            all_crosses.append(dict(fecha=str(fecha)[:10], price=price,
+                                    tipo='BUY_SWING',  pos=ii))
+        elif w6_prev > w30_prev and w6_cur < w30_cur:
+            all_crosses.append(dict(fecha=str(fecha)[:10], price=price,
+                                    tipo='SELL_SWING', pos=ii))
+
+    ultimo_cruce = all_crosses[-1] if all_crosses else None
+
+    # Estado actual
+    wma6_v       = wma6.dropna()
+    wma30_v      = wma30.dropna()
+    closes_clean = closes.dropna()
+    if len(wma6_v) > 0 and len(wma30_v) > 0 and len(closes_clean) > 0:
+        v6         = float(wma6_v.iloc[-1])
+        v30        = float(wma30_v.iloc[-1])
+        price_last = float(closes_clean.iloc[-1])
+        bars_since = (len(df) - 1 - ultimo_cruce['pos']) if ultimo_cruce else 999
+        near_zero  = abs(v6 - v30) / max(price_last, 1e-9) < 0.003
+        if near_zero or bars_since <= 2:
+            estado = 'Neutral'
+        elif v6 > v30:
+            estado = 'Compra'
+        else:
+            estado = 'Venta'
+    else:
+        estado = 'N/D'
+
+    recent_crosses = all_crosses[-n_recent:] if all_crosses else []
+
+    return dict(
+        wma6=wma6, wma30=wma30,
+        recent_crosses=recent_crosses,
+        estado=estado,
+        ultimo_cruce=ultimo_cruce,
+    )
+
+
+# ── Early swing: anticipar cruce WMA6/WMA30 ──────────────────────────────────
+
+def get_early_swing_signal(
+    df: pd.DataFrame,
+    dyn_res: list | None = None,
+    static_res: list | None = None,
+    gap_threshold: float = 0.005,
+    res_threshold: float = 0.015,
+    vol_lookback: int = 20,
+    max_signals: int = 5,
+) -> dict:
+    """
+    Dos estrategias de corto plazo sobre WMA6/WMA30 (capa adicional).
+
+    BUY_EARLY_SWING — compra anticipada (1 dia antes del cruce alcista):
+      1. Tendencia alcista: precio > SMA200  o  SMA50 > SMA200
+      2. WMA6 < WMA30 (aun no cruzo)
+      3. Gap % = (WMA30 - WMA6) / WMA30 < gap_threshold (muy cerca del cruce)
+      4. Gap hoy < gap ayer  (brecha cerrandose)
+      5. WMA6 hoy > WMA6 ayer (pendiente alcista)
+      6. Precio hoy >= precio ayer (confirmacion)
+      7. Sin resistencia dentro de res_threshold por encima del precio
+
+    BUY_EARLY_SWING_STRONG: idem + volumen comprador
+      vol > avg_vol_N  AND  (close > open  OR  close > close_prev con vol > vol_prev)
+
+    SELL_SWING_CROSS:
+      WMA6[i-1] > WMA30[i-1]  AND  WMA6[i] < WMA30[i]  (cruce bajista exacto)
+
+    Returns dict:
+      estado             : 'COMPRA' | 'COMPRA_FUERTE' | 'VENTA' | 'NEUTRAL'
+      senal_activa       : 'BUY_EARLY_SWING' | 'BUY_EARLY_SWING_STRONG' |
+                           'SELL_SWING_CROSS' | None
+      fuerza             : 'FUERTE' | 'MEDIA' | None
+      volumen_comprador  : bool  (estado actual del ultimo bar)
+      resistencia_cercana: bool  (estado actual)
+      tendencia_alcista  : bool  (estado actual)
+      buy_markers        : list[dict]  — señales alcistas para el grafico
+      sell_markers       : list[dict]  — señales bajistas para el grafico
+      fecha_senal        : str | None
+    """
+    _empty = dict(
+        estado='NEUTRAL', senal_activa=None, fuerza=None,
+        volumen_comprador=False, resistencia_cercana=False,
+        tendencia_alcista=False, buy_markers=[], sell_markers=[],
+        fecha_senal=None,
+    )
+    if df.empty or len(df) < 31:
+        return _empty
+
+    closes = pd.to_numeric(df['close'],  errors='coerce')
+    opens  = pd.to_numeric(df['open'],   errors='coerce')
+    vols   = pd.to_numeric(df['volume'], errors='coerce')
+
+    # WMA6 — pesos [1..6], suma=21
+    _w6  = np.arange(1,  7, dtype=float); _w6s  = _w6.sum()
+    wma6  = closes.rolling(6).apply(lambda x: float(np.dot(x, _w6)  / _w6s),  raw=True)
+
+    # WMA30 — pesos [1..30], suma=465
+    _w30 = np.arange(1, 31, dtype=float); _w30s = _w30.sum()
+    wma30 = closes.rolling(30).apply(lambda x: float(np.dot(x, _w30) / _w30s), raw=True)
+
+    # SMA50 / SMA200 para filtro de tendencia
+    sma50  = (pd.to_numeric(df['sma50'],  errors='coerce')
+              if 'sma50'  in df.columns else closes.rolling(50).mean())
+    sma200 = (pd.to_numeric(df['sma200'], errors='coerce')
+              if 'sma200' in df.columns else closes.rolling(200).mean())
+
+    vol_avg = vols.rolling(vol_lookback).mean()
+
+    # Resistencias consolidadas
+    all_res: list[float] = list(static_res or [])
+    for item in (dyn_res or []):
+        v = item.get('value')
+        if v is not None:
+            all_res.append(float(v))
+
+    valid_pos = [i for i in range(len(df))
+                 if pd.notna(wma6.iloc[i]) and pd.notna(wma30.iloc[i])]
+
+    buy_markers:  list[dict] = []
+    sell_markers: list[dict] = []
+
+    for k in range(1, len(valid_pos)):
+        ii = valid_pos[k]
+        ip = valid_pos[k - 1]
+
+        w6_cur,  w6_prev  = float(wma6.iloc[ii]),  float(wma6.iloc[ip])
+        w30_cur, w30_prev = float(wma30.iloc[ii]), float(wma30.iloc[ip])
+        price   = float(closes.iloc[ii])
+        price_p = float(closes.iloc[ip]) if pd.notna(closes.iloc[ip]) else price
+        open_i  = float(opens.iloc[ii])  if pd.notna(opens.iloc[ii])  else price
+        vol_i   = float(vols.iloc[ii])   if pd.notna(vols.iloc[ii])   else 0.0
+        vol_p   = float(vols.iloc[ip])   if pd.notna(vols.iloc[ip])   else 0.0
+        vavg_i  = float(vol_avg.iloc[ii]) if pd.notna(vol_avg.iloc[ii]) else 0.0
+        fecha   = df['fecha'].iloc[ii]
+
+        # ── SELL_SWING_CROSS: cruce bajista exacto ──────────────────────────
+        if w6_prev > w30_prev and w6_cur < w30_cur:
+            sell_markers.append(dict(fecha=str(fecha)[:10], price=price))
+            continue
+
+        # ── BUY_EARLY_SWING: anticipacion cruce alcista ──────────────────────
+        if w6_cur >= w30_cur:
+            continue   # ya cruzo → no es "anticipado"
+
+        gap_cur  = (w30_cur  - w6_cur)  / max(w30_cur,  1e-9)
+        gap_prev = (w30_prev - w6_prev) / max(w30_prev, 1e-9)
+
+        if not (gap_cur  < gap_threshold    # brecha muy pequeña
+                and gap_cur  < gap_prev     # brecha cerrandose
+                and w6_cur   > w6_prev      # WMA6 con pendiente alcista
+                and price    >= price_p):   # precio confirma
+            continue
+
+        # Tendencia alcista de fondo
+        s50_i  = float(sma50.iloc[ii])  if pd.notna(sma50.iloc[ii])  else None
+        s200_i = float(sma200.iloc[ii]) if pd.notna(sma200.iloc[ii]) else None
+        trend_up = (
+            (s200_i is not None and price > s200_i) or
+            (s50_i is not None and s200_i is not None and s50_i > s200_i)
+        )
+        if not trend_up:
+            continue
+
+        # Sin resistencia bloqueante
+        res_near = any(
+            0 < (r - price) / max(price, 1e-9) <= res_threshold
+            for r in all_res
+        ) if all_res else False
+        if res_near:
+            continue
+
+        # Volumen comprador
+        vol_buyer = (
+            vavg_i > 0 and vol_i > vavg_i and
+            (price > open_i or (price > price_p and vol_i > vol_p))
+        )
+
+        buy_markers.append(dict(
+            fecha=str(fecha)[:10],
+            price=price,
+            strong=vol_buyer,
+            tipo='BUY_EARLY_SWING_STRONG' if vol_buyer else 'BUY_EARLY_SWING',
+        ))
+
+    # ── Estado actual (ultimo bar) ────────────────────────────────────────────
+    estado       = 'NEUTRAL'
+    senal_activa = None
+    fuerza       = None
+    fecha_senal  = None
+
+    if len(valid_pos) >= 2:
+        ii_l = valid_pos[-1]
+        ip_l = valid_pos[-2]
+
+        w6_l,  w6_pl  = float(wma6.iloc[ii_l]),  float(wma6.iloc[ip_l])
+        w30_l, w30_pl = float(wma30.iloc[ii_l]), float(wma30.iloc[ip_l])
+        price_l  = float(closes.iloc[ii_l])
+        price_pl = float(closes.iloc[ip_l]) if pd.notna(closes.iloc[ip_l]) else price_l
+        open_l   = float(opens.iloc[ii_l])  if pd.notna(opens.iloc[ii_l])  else price_l
+        vol_l    = float(vols.iloc[ii_l])   if pd.notna(vols.iloc[ii_l])   else 0.0
+        vol_pl   = float(vols.iloc[ip_l])   if pd.notna(vols.iloc[ip_l])   else 0.0
+        vavg_l   = float(vol_avg.iloc[ii_l]) if pd.notna(vol_avg.iloc[ii_l]) else 0.0
+        fecha_l  = str(df['fecha'].iloc[ii_l])[:10]
+
+        # SELL_SWING_CROSS hoy
+        if w6_pl > w30_pl and w6_l < w30_l:
+            senal_activa = 'SELL_SWING_CROSS'
+            estado       = 'VENTA'
+            fecha_senal  = fecha_l
+
+        # BUY_EARLY_SWING hoy
+        elif w6_l < w30_l:
+            gap_l  = (w30_l  - w6_l)  / max(w30_l,  1e-9)
+            gap_pl = (w30_pl - w6_pl) / max(w30_pl, 1e-9)
+
+            if (gap_l  < gap_threshold
+                    and gap_l  < gap_pl
+                    and w6_l   > w6_pl
+                    and price_l >= price_pl):
+
+                s50_lv  = float(sma50.iloc[ii_l])  if pd.notna(sma50.iloc[ii_l])  else None
+                s200_lv = float(sma200.iloc[ii_l]) if pd.notna(sma200.iloc[ii_l]) else None
+                trend_l = (
+                    (s200_lv is not None and price_l > s200_lv) or
+                    (s50_lv  is not None and s200_lv is not None and s50_lv > s200_lv)
+                )
+
+                if trend_l:
+                    res_l = any(0 < (r - price_l) / max(price_l, 1e-9) <= res_threshold
+                                for r in all_res) if all_res else False
+                    if not res_l:
+                        vol_bl = (vavg_l > 0 and vol_l > vavg_l and
+                                  (price_l > open_l or (price_l > price_pl and vol_l > vol_pl)))
+                        senal_activa = 'BUY_EARLY_SWING_STRONG' if vol_bl else 'BUY_EARLY_SWING'
+                        fuerza       = 'FUERTE' if vol_bl else 'MEDIA'
+                        estado       = 'COMPRA_FUERTE' if vol_bl else 'COMPRA'
+                        fecha_senal  = fecha_l
+
+    # ── Condiciones actuales para el panel ───────────────────────────────────
+    _ii = valid_pos[-1] if valid_pos else (len(df) - 1)
+    price_now = float(closes.iloc[_ii]) if pd.notna(closes.iloc[_ii]) else 0.0
+    open_now  = float(opens.iloc[_ii])  if pd.notna(opens.iloc[_ii])  else price_now
+    vol_now   = float(vols.iloc[_ii])   if pd.notna(vols.iloc[_ii])   else 0.0
+    vol_pn    = float(vols.iloc[_ii - 1])   if _ii > 0 and pd.notna(vols.iloc[_ii - 1])   else 0.0
+    price_pn  = float(closes.iloc[_ii - 1]) if _ii > 0 and pd.notna(closes.iloc[_ii - 1]) else price_now
+    vavg_now  = float(vol_avg.iloc[_ii]) if pd.notna(vol_avg.iloc[_ii]) else 0.0
+    s50_now   = float(sma50.iloc[_ii])  if pd.notna(sma50.iloc[_ii])  else None
+    s200_now  = float(sma200.iloc[_ii]) if pd.notna(sma200.iloc[_ii]) else None
+
+    vol_buyer_now = (
+        vavg_now > 0 and vol_now > vavg_now and
+        (price_now > open_now or (price_now > price_pn and vol_now > vol_pn))
+    ) if price_now > 0 else False
+
+    res_near_now = (
+        any(0 < (r - price_now) / max(price_now, 1e-9) <= res_threshold
+            for r in all_res)
+        if (all_res and price_now > 0) else False
+    )
+
+    trend_now = (
+        (s200_now is not None and price_now > s200_now) or
+        (s50_now is not None and s200_now is not None and s50_now > s200_now)
+    ) if price_now > 0 else False
+
+    return dict(
+        estado=estado,
+        senal_activa=senal_activa,
+        fuerza=fuerza,
+        volumen_comprador=vol_buyer_now,
+        resistencia_cercana=res_near_now,
+        tendencia_alcista=trend_now,
+        buy_markers=buy_markers[-max_signals:],
+        sell_markers=sell_markers[-max_signals:],
+        fecha_senal=fecha_senal,
+    )
+
+
 # ── S/R estático ───────────────────────────────────────────────────────────────
 
 def get_support_resistance(df: pd.DataFrame, window: int = 15, n: int = 4) -> tuple[list, list]:
@@ -243,16 +856,32 @@ def get_support_resistance(df: pd.DataFrame, window: int = 15, n: int = 4) -> tu
 
 def price_chart(df: pd.DataFrame, simbolo: str = '', tf: str = '3M',
                 dyn_sup: list | None = None,
-                dyn_res: list | None = None) -> go.Figure:
+                dyn_res: list | None = None,
+                wma_data: dict | None = None,
+                buy_conf_data: dict | None = None,
+                swing_data: dict | None = None,
+                early_swing_data: dict | None = None,
+                show_sma50: bool = True,
+                show_sma200: bool = True,
+                show_ema20: bool = True,
+                show_volume: bool = True,
+                show_static_sr: bool = True,
+                show_wma6: bool = True,
+                show_wma30: bool = True,
+                candle_freq: str = 'D') -> go.Figure:
     """
-    Candlestick + EMA20 + SMA50 + SMA200 + S/R estático + S/R dinámico + Volumen.
-    dyn_sup / dyn_res: output de get_dynamic_sr() — se dibuja sin tocar el S/R estático.
+    Candlestick + MAs opcionales + S/R + Volumen opcional.
+    Flags show_* permiten activar/desactivar cada capa individualmente.
+    candle_freq: 'D'/'W'/'M'/'Y' — se usa para ajustar ticks del eje X.
     """
-    sup, res = get_support_resistance(df) if len(df) > 40 else ([], [])
+    sup, res = (get_support_resistance(df) if (len(df) > 40 and show_static_sr)
+                else ([], []))
 
+    n_rows     = 2 if show_volume else 1
+    row_h      = [0.78, 0.22] if show_volume else [1.0]
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.78, 0.22],
+        rows=n_rows, cols=1, shared_xaxes=True,
+        row_heights=row_h,
         vertical_spacing=0.02,
     )
 
@@ -318,12 +947,19 @@ def price_chart(df: pd.DataFrame, simbolo: str = '', tf: str = '3M',
     ), row=1, col=1)
 
     # ── Moving averages ───────────────────────────────────────────────────────
+    _show_ma = {
+        'ema20':  show_ema20,
+        'sma50':  show_sma50,
+        'sma200': show_sma200,
+    }
     ma_cfg = [
-        ('ema20',  C['purple'], 'EMA 20', 1.2),
-        ('sma50',  C['blue'],   'SMA 50', 1.2),
+        ('ema20',  C['purple'], 'EMA 20',  1.2),
+        ('sma50',  C['blue'],   'SMA 50',  1.2),
         ('sma200', C['orange'], 'SMA 200', 1.4),
     ]
     for col, color, name, width in ma_cfg:
+        if not _show_ma.get(col, True):
+            continue
         series = pd.to_numeric(df.get(col, pd.Series()), errors='coerce')
         if series.notna().sum() >= 2:
             fig.add_trace(go.Scatter(
@@ -332,16 +968,173 @@ def price_chart(df: pd.DataFrame, simbolo: str = '', tf: str = '3M',
                 opacity=0.85, hovertemplate=f'{name}: %{{y:.2f}}<extra></extra>',
             ), row=1, col=1)
 
-    # ── Volumen ───────────────────────────────────────────────────────────────
-    vol = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
-    bar_colors = [C['green'] if float(c) >= float(o) else C['red']
-                  for c, o in zip(df['close'], df['open'])]
-    fig.add_trace(go.Bar(
-        x=df['fecha'], y=vol, name='Vol',
-        marker=dict(color=bar_colors, opacity=0.45),
-        showlegend=False,
-        hovertemplate='Vol: %{y:,.0f}<extra></extra>',
-    ), row=2, col=1)
+    # ── Volumen (opcional) ────────────────────────────────────────────────────
+    if show_volume:
+        vol = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+        bar_colors = [C['green'] if float(c) >= float(o) else C['red']
+                      for c, o in zip(df['close'], df['open'])]
+        fig.add_trace(go.Bar(
+            x=df['fecha'], y=vol, name='Vol',
+            marker=dict(color=bar_colors, opacity=0.45),
+            showlegend=False,
+            hovertemplate='Vol: %{y:,.0f}<extra></extra>',
+        ), row=2, col=1)
+
+    # ── WMA21 / SMA30 (capa adicional — no toca MAs existentes) ──────────────
+    if wma_data:
+        wma21 = wma_data.get('wma21', pd.Series(dtype=float))
+        sma30 = wma_data.get('sma30', pd.Series(dtype=float))
+
+        if wma21.notna().sum() >= 2:
+            fig.add_trace(go.Scatter(
+                x=df['fecha'], y=wma21, name='WMA 21',
+                line=dict(color=C['cyan'], width=1.2),
+                opacity=0.9,
+                hovertemplate='WMA 21: %{y:.2f}<extra></extra>',
+            ), row=1, col=1)
+
+        if sma30.notna().sum() >= 2:
+            fig.add_trace(go.Scatter(
+                x=df['fecha'], y=sma30, name='SMA 30',
+                line=dict(color=C['lime'], width=1.2),
+                opacity=0.9,
+                hovertemplate='SMA 30: %{y:.2f}<extra></extra>',
+            ), row=1, col=1)
+
+        # Cruces alcistas: triángulo verde hacia arriba, debajo de la vela
+        bull = wma_data.get('bull_crosses', [])
+        if bull:
+            fig.add_trace(go.Scatter(
+                x=[c[0] for c in bull],
+                y=[c[1] * 0.975 for c in bull],
+                mode='markers', name='Cruce ↑',
+                marker=dict(symbol='triangle-up', size=11,
+                            color=C['green'],
+                            line=dict(color='white', width=0.8)),
+                hovertemplate='Cruce alcista: %{x}<extra></extra>',
+            ), row=1, col=1)
+
+        # Cruces bajistas: triángulo rojo hacia abajo, encima de la vela
+        bear = wma_data.get('bear_crosses', [])
+        if bear:
+            fig.add_trace(go.Scatter(
+                x=[c[0] for c in bear],
+                y=[c[1] * 1.025 for c in bear],
+                mode='markers', name='Cruce ↓',
+                marker=dict(symbol='triangle-down', size=11,
+                            color=C['red'],
+                            line=dict(color='white', width=0.8)),
+                hovertemplate='Cruce bajista: %{x}<extra></extra>',
+            ), row=1, col=1)
+
+    # ── BUY_CONFIRMATION markers (capa adicional — siempre visible) ──────────
+    if buy_conf_data and buy_conf_data.get('signals'):
+        _sigs   = buy_conf_data['signals']
+        _bc_x   = [s['fecha']  for s in _sigs]
+        _bc_y   = [s['price'] * 0.963 for s in _sigs]
+        _bc_clr = ['#fbbf24' if s['fuerza'] == 'FUERTE' else '#fb923c' for s in _sigs]
+        _bc_cd  = [(s['fuerza'], ', '.join(s['motivo'])) for s in _sigs]
+        fig.add_trace(go.Scatter(
+            x=_bc_x, y=_bc_y,
+            mode='markers', name='BUY_CONF',
+            marker=dict(symbol='star', size=13, color=_bc_clr,
+                        line=dict(color='white', width=0.8)),
+            customdata=_bc_cd,
+            hovertemplate=(
+                '<b>BUY_CONFIRMATION</b><br>'
+                'Fuerza: %{customdata[0]}<br>'
+                'Motivo: %{customdata[1]}<extra></extra>'
+            ),
+        ), row=1, col=1)
+
+    # ── Swing: WMA6/WMA30 + cruces recientes (controlado por show_wma6/show_wma30) ──
+    if swing_data:
+        _sw6  = swing_data.get('wma6',  pd.Series(dtype=float))
+        _sw30 = swing_data.get('wma30', pd.Series(dtype=float))
+
+        if show_wma6 and _sw6.notna().sum() >= 2:
+            fig.add_trace(go.Scatter(
+                x=df['fecha'], y=_sw6, name='WMA 6',
+                line=dict(color='#f97316', width=1.0),
+                opacity=0.60,
+                hovertemplate='WMA 6: %{y:.2f}<extra></extra>',
+            ), row=1, col=1)
+
+        if show_wma30 and _sw30.notna().sum() >= 2:
+            fig.add_trace(go.Scatter(
+                x=df['fecha'], y=_sw30, name='WMA 30',
+                line=dict(color='#60a5fa', width=1.0),
+                opacity=0.60,
+                hovertemplate='WMA 30: %{y:.2f}<extra></extra>',
+            ), row=1, col=1)
+
+        if show_wma6 and show_wma30:
+            for cross in swing_data.get('recent_crosses', []):
+                _is_buy = cross['tipo'] == 'BUY_SWING'
+                fig.add_trace(go.Scatter(
+                    x=[cross['fecha']],
+                    y=[cross['price'] * (0.972 if _is_buy else 1.028)],
+                    mode='markers',
+                    name=cross['tipo'],
+                    showlegend=False,
+                    marker=dict(
+                        symbol='triangle-up' if _is_buy else 'triangle-down',
+                        size=9,
+                        color=C['green'] if _is_buy else C['red'],
+                        line=dict(color='white', width=0.6),
+                    ),
+                    hovertemplate=(
+                        f"{'BUY_SWING' if _is_buy else 'SELL_SWING'}: "
+                        f"{cross['fecha']}<extra></extra>"
+                    ),
+                ), row=1, col=1)
+
+    # ── Early swing markers (BUY_EARLY_SWING / SELL_SWING_CROSS) ────────────
+    # Capa adicional — usa las mismas lineas WMA6/WMA30 del bloque swing_data
+    if early_swing_data:
+        buy_m  = early_swing_data.get('buy_markers',  [])
+        sell_m = early_swing_data.get('sell_markers', [])
+
+        # BUY_EARLY_SWING: circulo vacio verde (sin volumen especial)
+        reg = [m for m in buy_m if not m.get('strong')]
+        if reg:
+            fig.add_trace(go.Scatter(
+                x=[m['fecha'] for m in reg],
+                y=[m['price'] * 0.971 for m in reg],
+                mode='markers', name='BUY_EARLY_SWING',
+                showlegend=False,
+                marker=dict(symbol='circle-open', size=11,
+                            color='#22c55e',
+                            line=dict(color='#22c55e', width=2.0)),
+                hovertemplate='BUY_EARLY_SWING: %{x}<extra></extra>',
+            ), row=1, col=1)
+
+        # BUY_EARLY_SWING_STRONG: circulo relleno verde brillante
+        strong = [m for m in buy_m if m.get('strong')]
+        if strong:
+            fig.add_trace(go.Scatter(
+                x=[m['fecha'] for m in strong],
+                y=[m['price'] * 0.971 for m in strong],
+                mode='markers', name='BUY_EARLY_STRONG',
+                showlegend=False,
+                marker=dict(symbol='circle', size=13,
+                            color='#4ade80',
+                            line=dict(color='white', width=0.8)),
+                hovertemplate='BUY_EARLY_SWING_STRONG: %{x}<extra></extra>',
+            ), row=1, col=1)
+
+        # SELL_SWING_CROSS: X roja
+        if sell_m:
+            fig.add_trace(go.Scatter(
+                x=[m['fecha'] for m in sell_m],
+                y=[m['price'] * 1.029 for m in sell_m],
+                mode='markers', name='SELL_SWING_CROSS',
+                showlegend=False,
+                marker=dict(symbol='x', size=11,
+                            color=C['red'],
+                            line=dict(color=C['red'], width=2.0)),
+                hovertemplate='SELL_SWING_CROSS: %{x}<extra></extra>',
+            ), row=1, col=1)
 
     # ── Layout ────────────────────────────────────────────────────────────────
     layout = _base(height=520)
@@ -350,17 +1143,19 @@ def price_chart(df: pd.DataFrame, simbolo: str = '', tf: str = '3M',
         x=0.01, xanchor='left',
     )
     layout['xaxis_rangeslider_visible'] = False
-    layout['yaxis2'] = dict(
-        showgrid=False, zeroline=False, showticklabels=False,
-        side='right', showline=False,
-    )
+    if show_volume:
+        layout['yaxis2'] = dict(
+            showgrid=False, zeroline=False, showticklabels=False,
+            side='right', showline=False,
+        )
     layout['plot_bgcolor'] = C['panel2']
 
     fig.update_layout(**layout)
 
-    # Aplicar ticks de fecha DESPUÉS de update_layout (garantía con subplots)
-    # hide row 2 (volumen) para no duplicar las fechas
-    _apply_date_ticks(fig, df, tf, hide_labels_row=2)
+    # Aplicar ticks: ocultar row 2 solo si existe el panel de volumen
+    _apply_date_ticks(fig, df, tf,
+                      hide_labels_row=(2 if show_volume else None),
+                      candle_freq=candle_freq)
 
     return fig
 

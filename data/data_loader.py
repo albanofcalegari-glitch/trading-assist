@@ -234,14 +234,14 @@ def update_prices_daily(
         if last:
             start = last + timedelta(days=1)
             if start > date.today():
-                print(f"  {sym:6s} → ya actualizado ({last})")
+                print(f"  {sym:6s} -> ya actualizado ({last})")
                 continue
         else:
             start = None  # descarga completa
 
         rows = fetch_price_history(sym, start_date=start)
         if not rows:
-            print(f"  {sym:6s} → sin datos nuevos")
+            print(f"  {sym:6s} -> sin datos nuevos")
             time.sleep(delay)
             continue
 
@@ -257,7 +257,7 @@ def update_prices_daily(
         else:
             n = save_asset_prices(rows)
 
-        print(f"  {sym:6s} → {n} filas guardadas (desde {rows[0]['fecha']})")
+        print(f"  {sym:6s} -> {n} filas guardadas (desde {rows[0]['fecha']})")
         time.sleep(delay)
 
     print("\nDone.\n")

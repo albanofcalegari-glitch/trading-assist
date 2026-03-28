@@ -31,8 +31,56 @@ _DEFAULTS = {
     'tbl_market':         None,
     'tbl_market_label':   'Todos',
     'tbl_search':         '',
-    'tf':                 '3M',    # timeframe activo en detalle: '3M'|'1A'
+    # Controles del gráfico de detalle
+    'chart_strategy':     '(Seleccionar)',
+    'chart_tf_label':     'Diario',
 }
+
+# ── Definición de estrategias y sus indicadores asociados ─────────────────
+
+_STRAT_OPTIONS = [
+    '(Seleccionar)',
+    'WMA21 / SMA30 — Tendencia media',
+    'BUY_CONFIRMATION',
+    'WMA6 / WMA30 — Swing',
+    'BUY_EARLY_SWING — Anticipado',
+]
+
+# Flags de indicadores por estrategia
+_STRAT_FLAGS: dict[str, dict] = {
+    '(Seleccionar)': dict(
+        sma50=False, sma200=False, ema20=False,
+        dyn_sr=False, static_sr=False,
+        wma=False, wma6=False, wma30=False,
+        buy_conf=False, swing=False, early_swing=False,
+    ),
+    'WMA21 / SMA30 — Tendencia media': dict(
+        sma50=False, sma200=False, ema20=False,
+        dyn_sr=True,  static_sr=False,
+        wma=True,  wma6=False, wma30=False,
+        buy_conf=False, swing=False, early_swing=False,
+    ),
+    'BUY_CONFIRMATION': dict(
+        sma50=True,  sma200=False, ema20=False,
+        dyn_sr=True,  static_sr=True,
+        wma=True,  wma6=False, wma30=False,
+        buy_conf=True,  swing=False, early_swing=False,
+    ),
+    'WMA6 / WMA30 — Swing': dict(
+        sma50=False, sma200=False, ema20=False,
+        dyn_sr=False, static_sr=False,
+        wma=False, wma6=True,  wma30=True,
+        buy_conf=False, swing=True,  early_swing=False,
+    ),
+    'BUY_EARLY_SWING — Anticipado': dict(
+        sma50=True,  sma200=True,  ema20=False,
+        dyn_sr=True,  static_sr=True,
+        wma=False, wma6=True,  wma30=True,
+        buy_conf=False, swing=False, early_swing=True,
+    ),
+}
+
+_TF_CHART = {'Diario': 'D', 'Semanal': 'W', 'Mensual': 'M'}
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -247,18 +295,284 @@ def _render_status_block(status: dict) -> None:
         )
 
 
-def _render_chart_legend() -> None:
-    """Fila compacta que identifica cada tipo de línea del gráfico de precio."""
-    items = [
-        # (símbolo SVG-like, color, etiqueta)
-        ('dotted', '#10b981',              'Soporte estático'),
-        ('dotted', '#ef4444',              'Resistencia estática'),
-        ('dashed', 'rgba(16,185,129,0.8)', 'Soporte dinámico'),
-        ('dashed', 'rgba(239,68,68,0.8)',  'Resistencia dinámica'),
-        ('solid',  '#8b5cf6',              'EMA 20'),
-        ('solid',  '#3b82f6',              'SMA 50'),
-        ('solid',  '#f59e0b',              'SMA 200'),
-    ]
+def _render_wma_signal_block(wma_data: dict) -> None:
+    """Panel compacto con estado y último cruce WMA21/SMA30."""
+    estado = wma_data.get('estado', 'N/D')
+    uc     = wma_data.get('ultimo_cruce')
+
+    est_color = {'Alcista': '#10b981', 'Bajista': '#ef4444'}.get(estado, '#64748b')
+
+    if uc:
+        uc_color = {'Alcista': '#10b981', 'Bajista': '#ef4444'}.get(uc['tipo'], '#94a3b8')
+        uc_tipo  = uc['tipo']
+        uc_fecha = uc['fecha']
+    else:
+        uc_color = '#64748b'
+        uc_tipo  = '—'
+        uc_fecha = ''
+
+    c1, c2 = st.columns(2)
+
+    def _card(label, val_html):
+        return (
+            f'<div style="background:#111827;border:1px solid #1e293b;border-radius:8px;'
+            f'padding:10px 14px">'
+            f'<div style="color:#475569;font-size:0.68rem;text-transform:uppercase;'
+            f'letter-spacing:0.07em;margin-bottom:4px">{label}</div>'
+            f'{val_html}'
+            f'</div>'
+        )
+
+    with c1:
+        st.markdown(_card(
+            'Señal WMA21 / SMA30',
+            f'<div style="color:{est_color};font-size:1rem;font-weight:700;'
+            f'font-family:monospace">{estado}</div>',
+        ), unsafe_allow_html=True)
+
+    with c2:
+        fecha_span = (f'&nbsp;<span style="color:#64748b;font-size:0.8rem;'
+                      f'font-weight:400">{uc_fecha}</span>') if uc_fecha else ''
+        st.markdown(_card(
+            'Último cruce WMA/SMA',
+            f'<div style="color:{uc_color};font-size:1rem;font-weight:700;'
+            f'font-family:monospace">{uc_tipo}{fecha_span}</div>',
+        ), unsafe_allow_html=True)
+
+
+def _render_buy_confirmation_block(conf_data: dict) -> None:
+    """Panel compacto para la señal BUY_CONFIRMATION."""
+    activo = conf_data.get('activo', False)
+    fuerza = conf_data.get('fuerza')
+    motivo = conf_data.get('motivo', [])
+    fecha  = conf_data.get('fecha')
+    cerca  = conf_data.get('cerca_soporte', False)
+
+    est_label = 'ACTIVO'  if activo else 'inactivo'
+    est_color = '#10b981' if activo else '#475569'
+    fuerza_color = {'FUERTE': '#fbbf24', 'MEDIA': '#fb923c'}.get(fuerza or '', '#64748b')
+    fuerza_label = fuerza or '—'
+    motivo_txt   = ' · '.join(motivo) if motivo else '—'
+    fecha_span   = (f' <span style="color:#64748b;font-size:0.75rem">{fecha}</span>'
+                    if fecha else '')
+
+    def _card(label, val_html):
+        return (
+            f'<div style="background:#111827;border:1px solid #1e293b;border-radius:8px;'
+            f'padding:10px 14px">'
+            f'<div style="color:#475569;font-size:0.68rem;text-transform:uppercase;'
+            f'letter-spacing:0.07em;margin-bottom:4px">{label}</div>'
+            f'{val_html}'
+            f'</div>'
+        )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(_card(
+            'BUY_CONFIRMATION',
+            f'<div style="color:{est_color};font-size:1rem;font-weight:700;'
+            f'font-family:monospace">{est_label}{fecha_span}</div>'
+            f'<div style="color:#64748b;font-size:0.72rem;margin-top:3px">{motivo_txt}</div>',
+        ), unsafe_allow_html=True)
+    with c2:
+        st.markdown(_card(
+            'Fuerza',
+            f'<div style="color:{fuerza_color};font-size:1rem;font-weight:700;'
+            f'font-family:monospace">{fuerza_label}</div>'
+            f'<div style="color:#64748b;font-size:0.72rem;margin-top:3px">'
+            f'Cerca soporte: {"sí 📍" if cerca else "no"}</div>',
+        ), unsafe_allow_html=True)
+
+
+def _render_swing_block(swing_data: dict, early_swing_data: dict | None = None) -> None:
+    """Semaforo de corto plazo (WMA6/WMA30): estado + ultimo cruce + estrategias anticipadas."""
+    estado = swing_data.get('estado', 'N/D')
+    uc     = swing_data.get('ultimo_cruce')
+
+    _map = {
+        'Compra':  ('#10b981', '●', 'COMPRA'),
+        'Venta':   ('#ef4444', '●', 'VENTA'),
+        'Neutral': ('#f59e0b', '●', 'NEUTRAL'),
+    }
+    color, dot, label = _map.get(estado, ('#64748b', '○', estado or 'N/D'))
+
+    if uc:
+        uc_color = '#10b981' if uc['tipo'] == 'BUY_SWING' else '#ef4444'
+        uc_tipo  = 'Compra' if uc['tipo'] == 'BUY_SWING' else 'Venta'
+        uc_fecha = uc['fecha']
+    else:
+        uc_color, uc_tipo, uc_fecha = '#64748b', '—', ''
+
+    def _card(lbl, val_html):
+        return (
+            f'<div style="background:#0f1623;border:1px solid #1e293b;border-radius:8px;'
+            f'padding:10px 14px">'
+            f'<div style="color:#475569;font-size:0.65rem;text-transform:uppercase;'
+            f'letter-spacing:0.07em;margin-bottom:4px">{lbl}</div>'
+            f'{val_html}</div>'
+        )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(_card(
+            'Corto plazo (WMA6/WMA30)',
+            f'<div style="display:flex;align-items:center;gap:8px">'
+            f'<span style="color:{color};font-size:1.3rem;line-height:1">{dot}</span>'
+            f'<span style="color:{color};font-size:1rem;font-weight:700;'
+            f'font-family:monospace">{label}</span></div>',
+        ), unsafe_allow_html=True)
+    with c2:
+        st.markdown(_card(
+            'Estado WMA6 / WMA30',
+            f'<div style="color:{color};font-size:1rem;font-weight:700;'
+            f'font-family:monospace">{estado}</div>',
+        ), unsafe_allow_html=True)
+    with c3:
+        fecha_span = (f'&nbsp;<span style="color:#64748b;font-size:0.78rem">'
+                      f'{uc_fecha}</span>') if uc_fecha else ''
+        st.markdown(_card(
+            'Último cruce WMA6/WMA30',
+            f'<div style="color:{uc_color};font-size:1rem;font-weight:700;'
+            f'font-family:monospace">{uc_tipo}{fecha_span}</div>',
+        ), unsafe_allow_html=True)
+
+    # ── Bloque de estrategias anticipadas ────────────────────────────────────
+    if early_swing_data:
+        st.markdown(
+            '<div style="color:#475569;font-size:0.65rem;font-weight:700;'
+            'text-transform:uppercase;letter-spacing:0.08em;margin:10px 0 6px">'
+            'Estrategias anticipadas (BUY_EARLY_SWING / SELL_SWING_CROSS)</div>',
+            unsafe_allow_html=True,
+        )
+
+        es_estado   = early_swing_data.get('estado', 'NEUTRAL')
+        es_senal    = early_swing_data.get('senal_activa')
+        es_fuerza   = early_swing_data.get('fuerza')
+        es_vol      = early_swing_data.get('volumen_comprador', False)
+        es_res      = early_swing_data.get('resistencia_cercana', False)
+        es_tend     = early_swing_data.get('tendencia_alcista', False)
+        es_fecha    = early_swing_data.get('fecha_senal')
+
+        _sem_map = {
+            'COMPRA_FUERTE': ('#10b981', '●', 'COMPRA FUERTE'),
+            'COMPRA':        ('#22c55e', '○', 'COMPRA'),
+            'VENTA':         ('#ef4444', '●', 'VENTA'),
+            'NEUTRAL':       ('#f59e0b', '●', 'NEUTRAL'),
+        }
+        sem_c, sem_dot, sem_lbl = _sem_map.get(es_estado, ('#64748b', '○', 'NEUTRAL'))
+
+        e1, e2, e3, e4 = st.columns(4)
+
+        with e1:
+            fecha_es = (f'<div style="color:#64748b;font-size:0.72rem;margin-top:2px">'
+                        f'{es_fecha}</div>') if es_fecha else ''
+            st.markdown(_card(
+                'Semáforo anticipado',
+                f'<div style="display:flex;align-items:center;gap:7px">'
+                f'<span style="color:{sem_c};font-size:1.2rem;line-height:1">{sem_dot}</span>'
+                f'<span style="color:{sem_c};font-size:0.95rem;font-weight:700;'
+                f'font-family:monospace">{sem_lbl}</span></div>'
+                f'{fecha_es}',
+            ), unsafe_allow_html=True)
+
+        with e2:
+            s_color = ('#22c55e' if es_senal and 'BUY' in es_senal
+                       else ('#ef4444' if es_senal == 'SELL_SWING_CROSS' else '#64748b'))
+            f_color = {'FUERTE': '#fbbf24', 'MEDIA': '#fb923c'}.get(es_fuerza or '', '#64748b')
+            st.markdown(_card(
+                'Señal activa',
+                f'<div style="color:{s_color};font-size:0.82rem;font-weight:700;'
+                f'font-family:monospace;word-break:break-all">{es_senal or "—"}</div>'
+                f'<div style="color:{f_color};font-size:0.78rem;margin-top:2px">'
+                f'Fuerza: {es_fuerza or "—"}</div>',
+            ), unsafe_allow_html=True)
+
+        with e3:
+            vc = '#10b981' if es_vol else '#64748b'
+            rc = '#ef4444' if es_res else '#10b981'
+            st.markdown(_card(
+                'Condiciones',
+                f'<div style="font-size:0.82rem;line-height:1.6">'
+                f'<span style="color:#94a3b8">Vol. comprador: </span>'
+                f'<span style="color:{vc};font-weight:700">{"sí" if es_vol else "no"}</span>'
+                f'<br>'
+                f'<span style="color:#94a3b8">Res. cercana: </span>'
+                f'<span style="color:{rc};font-weight:700">{"sí" if es_res else "no"}</span>'
+                f'</div>',
+            ), unsafe_allow_html=True)
+
+        with e4:
+            tc = '#10b981' if es_tend else '#ef4444'
+            st.markdown(_card(
+                'Tendencia fondo',
+                f'<div style="color:{tc};font-size:0.95rem;font-weight:700;'
+                f'font-family:monospace">{"alcista" if es_tend else "no alcista"}</div>'
+                f'<div style="color:#64748b;font-size:0.70rem;margin-top:2px">'
+                f'precio &gt; SMA200 o SMA50 &gt; SMA200</div>',
+            ), unsafe_allow_html=True)
+
+
+def _render_chart_legend(
+    show_wma: bool = False,
+    show_wma6: bool = False,
+    show_wma30: bool = False,
+    show_sma50: bool = False,
+    show_sma200: bool = False,
+    show_ema20: bool = False,
+    show_buy_conf: bool = False,
+    show_dyn_sr: bool = False,
+    show_static_sr: bool = False,
+) -> None:
+    """Fila compacta que identifica las líneas activas del gráfico."""
+    sr_items = []
+    if show_static_sr:
+        sr_items += [
+            ('dotted', '#10b981', 'Soporte estático'),
+            ('dotted', '#ef4444', 'Resistencia estática'),
+        ]
+    if show_dyn_sr:
+        sr_items += [
+            ('dashed', 'rgba(16,185,129,0.8)', 'Soporte dinámico'),
+            ('dashed', 'rgba(239,68,68,0.8)',  'Resistencia dinámica'),
+        ]
+
+    ma_items = []
+    if show_wma:
+        ma_items += [
+            ('solid', '#06b6d4', 'WMA 21'),
+            ('solid', '#a3e635', 'SMA 30'),
+            ('tri-up',   '#10b981', 'Cruce alcista'),
+            ('tri-down', '#ef4444', 'Cruce bajista'),
+        ]
+    if show_ema20:
+        ma_items.append(('solid', '#8b5cf6', 'EMA 20'))
+    if show_sma50:
+        ma_items.append(('solid', '#3b82f6', 'SMA 50'))
+    if show_sma200:
+        ma_items.append(('solid', '#f59e0b', 'SMA 200'))
+    if show_buy_conf:
+        ma_items += [
+            ('star', '#fbbf24', 'BUY_CONF fuerte'),
+            ('star', '#fb923c', 'BUY_CONF media'),
+        ]
+
+    swing_items = []
+    if show_wma6:
+        swing_items.append(('thin', '#f97316', 'WMA 6'))
+    if show_wma30:
+        swing_items.append(('thin', '#60a5fa', 'WMA 30'))
+    if show_wma6 and show_wma30:
+        swing_items += [
+            ('tri-up',      '#10b981', 'BUY_SWING'),
+            ('tri-down',    '#ef4444', 'SELL_SWING'),
+            ('circle-open', '#22c55e', 'BUY_EARLY_SWING'),
+            ('circle',      '#4ade80', 'BUY_EARLY_STRONG'),
+            ('x-marker',    '#ef4444', 'SELL_SWING_CROSS'),
+        ]
+
+    items = sr_items + ma_items + swing_items
+    if not items:
+        return   # gráfico limpio — sin leyenda
 
     # Renderiza cada ítem como una pequeña línea SVG + label
     # stroke-linecap="round" + dasharray="0,N" → puntos circulares (= Plotly dash='dot')
@@ -273,6 +587,32 @@ def _render_chart_legend() -> None:
             line = (f'<svg width="30" height="10" style="vertical-align:middle">'
                     f'<line x1="0" y1="5" x2="30" y2="5" stroke="{color}" '
                     f'stroke-width="1.5" stroke-dasharray="7,4"/></svg>')
+        elif style == 'tri-up':
+            line = (f'<svg width="14" height="14" style="vertical-align:middle">'
+                    f'<polygon points="7,1 13,13 1,13" fill="{color}"/></svg>')
+        elif style == 'tri-down':
+            line = (f'<svg width="14" height="14" style="vertical-align:middle">'
+                    f'<polygon points="7,13 13,1 1,1" fill="{color}"/></svg>')
+        elif style == 'star':
+            line = (f'<span style="color:{color};font-size:13px;'
+                    f'vertical-align:middle">★</span>')
+        elif style == 'thin':
+            line = (f'<svg width="30" height="10" style="vertical-align:middle">'
+                    f'<line x1="0" y1="5" x2="30" y2="5" stroke="{color}" '
+                    f'stroke-width="1.2" opacity="0.65"/></svg>')
+        elif style == 'circle-open':
+            line = (f'<svg width="14" height="14" style="vertical-align:middle">'
+                    f'<circle cx="7" cy="7" r="5" fill="none" stroke="{color}" '
+                    f'stroke-width="2"/></svg>')
+        elif style == 'circle':
+            line = (f'<svg width="14" height="14" style="vertical-align:middle">'
+                    f'<circle cx="7" cy="7" r="5" fill="{color}"/></svg>')
+        elif style == 'x-marker':
+            line = (f'<svg width="14" height="14" style="vertical-align:middle">'
+                    f'<line x1="2" y1="2" x2="12" y2="12" stroke="{color}" '
+                    f'stroke-width="2.5" stroke-linecap="round"/>'
+                    f'<line x1="12" y1="2" x2="2" y2="12" stroke="{color}" '
+                    f'stroke-width="2.5" stroke-linecap="round"/></svg>')
         else:  # solid
             line = (f'<svg width="30" height="10" style="vertical-align:middle">'
                     f'<line x1="0" y1="5" x2="30" y2="5" stroke="{color}" '
@@ -404,9 +744,9 @@ def _render_sr_values(sup: list, res: list,
 # ── PDF export ────────────────────────────────────────────────────────────────
 
 def _build_pdf(simbolo, mercado, tf, prices_df_full, prices_slice,
-               sup, res, status, fig,
-               dyn_sup=None, dyn_res=None) -> bytes:
-    """Genera un PDF con ticker, fecha, gráfico, S/R y estado del activo."""
+               sup, res, status,
+               dyn_sup=None, dyn_res=None, wma_data=None) -> bytes:
+    """Genera un PDF con ticker, fecha, dos gráficos (clásico + WMA), S/R y estado del activo."""
     import io
     from datetime import datetime
     from reportlab.lib.pagesizes import A4
@@ -472,12 +812,36 @@ def _build_pdf(simbolo, mercado, tf, prices_df_full, prices_slice,
         return Paragraph(f'<font name="{fn}" color="{color.hexval()}">{txt}</font>',
                          ParagraphStyle('c', fontSize=9))
 
+    # WMA21/SMA30
+    wma_sig = (wma_data or {}).get('estado', 'N/D')
+    wma_uc  = (wma_data or {}).get('ultimo_cruce')
+    wma_col = C_GRN if wma_sig == 'Alcista' else (C_RED if wma_sig == 'Bajista' else C_MUTED)
+    uc_txt  = f'{wma_uc["tipo"]}  {wma_uc["fecha"]}' if wma_uc else 'N/D'
+    uc_col  = C_GRN if (wma_uc and wma_uc['tipo'] == 'Alcista') else (C_RED if wma_uc else C_MUTED)
+
+    # BUY_CONFIRMATION para PDF
+    import charts as _ch_pdf
+    _bc_pdf  = _ch_pdf.get_buy_confirmation(prices_slice,
+                                            list(sup or []),
+                                            list(dyn_sup or []))
+    bc_act   = _bc_pdf.get('activo', False)
+    bc_fuerza= _bc_pdf.get('fuerza') or '—'
+    bc_motivo= ' · '.join(_bc_pdf.get('motivo', [])) or '—'
+    bc_act_txt = f'ACTIVO  {_bc_pdf["fecha"]}' if bc_act and _bc_pdf.get('fecha') else ('inactivo' if not bc_act else 'ACTIVO')
+    bc_act_col = C_GRN if bc_act else C_MUTED
+    bc_f_col   = HexColor('#fbbf24') if bc_fuerza == 'FUERTE' else (HexColor('#fb923c') if bc_fuerza == 'MEDIA' else C_MUTED)
+
     status_data = [
         [_p('Indicador', bold=True), _p('Valor', bold=True)],
         [_p('Tendencia'),            _p(tend,    tend_col, True)],
         [_p('Sobre SMA 200'),        _p(sma_txt, sma_col,  True)],
         [_p('RSI 14'),               _p(rsi_txt, rsi_col,  True)],
         [_p('Momentum 12-1'),        _p(mom_txt, mom_col,  True)],
+        [_p('Señal WMA21/SMA30'),    _p(wma_sig, wma_col,  True)],
+        [_p('Último cruce WMA/SMA'), _p(uc_txt,  uc_col,   True)],
+        [_p('BUY_CONFIRMATION'),     _p(bc_act_txt, bc_act_col, True)],
+        [_p('Fuerza BUY_CONF'),      _p(bc_fuerza,  bc_f_col,   True)],
+        [_p('Motivo BUY_CONF'),      _p(bc_motivo,  C_TEXT)],
     ]
     tbl = Table(status_data, colWidths=[7*cm, 7*cm])
     tbl.setStyle(TableStyle([
@@ -491,14 +855,46 @@ def _build_pdf(simbolo, mercado, tf, prices_df_full, prices_slice,
     ]))
     story.append(tbl)
 
-    # ── Gráfico ───────────────────────────────────────────────────────────────
-    story.append(Paragraph('Gráfico de precio', s_head2))
+    # ── Gráfico 1: clásico (EMA20 / SMA50 / SMA200) + BUY_CONF markers ───────
+    story.append(Paragraph('Gráfico de precio — EMA20 / SMA50 / SMA200', s_head2))
     try:
-        img_bytes = fig.to_image(format='png', width=900, height=480, scale=1.5)
-        story.append(RLImage(io.BytesIO(img_bytes),
+        fig1 = _ch_pdf.price_chart(prices_slice, simbolo, tf,
+                                   dyn_sup or [], dyn_res or [],
+                                   wma_data=None, buy_conf_data=_bc_pdf)
+        img1 = fig1.to_image(format='png', width=900, height=480, scale=1.5)
+        story.append(RLImage(io.BytesIO(img1),
                              width=W - 4*cm, height=(W - 4*cm) * 480/900))
     except Exception as e:
-        story.append(Paragraph(f'(Gráfico no disponible: {e})', s_norm))
+        story.append(Paragraph(f'(Gráfico clásico no disponible: {e})', s_norm))
+
+    # ── Gráfico 2: WMA21 / SMA30 + BUY_CONF markers ──────────────────────────
+    story.append(Spacer(1, 0.4*cm))
+    story.append(Paragraph('Gráfico de precio — WMA21 / SMA30', s_head2))
+    try:
+        _wma_pdf = _ch_pdf.get_wma_sma_signal(prices_slice) if not prices_slice.empty else None
+        fig2 = _ch_pdf.price_chart(prices_slice, simbolo, tf,
+                                   dyn_sup or [], dyn_res or [],
+                                   wma_data=_wma_pdf, buy_conf_data=_bc_pdf)
+        img2 = fig2.to_image(format='png', width=900, height=480, scale=1.5)
+        story.append(RLImage(io.BytesIO(img2),
+                             width=W - 4*cm, height=(W - 4*cm) * 480/900))
+    except Exception as e:
+        story.append(Paragraph(f'(Gráfico WMA no disponible: {e})', s_norm))
+
+    # ── Gráfico 3: Corto plazo (WMA6 / WMA30) ────────────────────────────────
+    story.append(Spacer(1, 0.4*cm))
+    story.append(Paragraph('Gráfico de corto plazo — WMA6 / WMA30', s_head2))
+    try:
+        _swing_pdf = _ch_pdf.get_swing_signal(prices_slice) if not prices_slice.empty else None
+        fig3 = _ch_pdf.price_chart(prices_slice, simbolo, tf,
+                                   dyn_sup or [], dyn_res or [],
+                                   wma_data=None, buy_conf_data=_bc_pdf,
+                                   swing_data=_swing_pdf)
+        img3 = fig3.to_image(format='png', width=900, height=480, scale=1.5)
+        story.append(RLImage(io.BytesIO(img3),
+                             width=W - 4*cm, height=(W - 4*cm) * 480/900))
+    except Exception as e:
+        story.append(Paragraph(f'(Gráfico corto plazo no disponible: {e})', s_norm))
 
     # ── Soportes y Resistencias ───────────────────────────────────────────────
     if sup or res:
@@ -615,62 +1011,140 @@ def page_detail():
     # ── Bloque de estado ──────────────────────────────────────────────────────
     status = _asset_status(prices_df, indic_df)
     _render_status_block(status)
+
+    # Señal WMA21/SMA30 (calculada sobre datos completos para ver último cruce real)
+    wma_data_full = ch.get_wma_sma_signal(prices_df) if not prices_df.empty else {}
+    st.markdown('<br>', unsafe_allow_html=True)
+    _render_wma_signal_block(wma_data_full)
     st.markdown('<br>', unsafe_allow_html=True)
 
-    # ── Selector de temporalidad + botón PDF — fila fija sobre el gráfico ────
-    tf_labels = list(TF_OPTIONS.keys())   # ['3M', '1A']
-    cur_tf    = st.session_state['tf']
-    if cur_tf not in tf_labels:
-        cur_tf = '3M'
-        st.session_state['tf'] = cur_tf
+    # BUY_CONFIRMATION (capa adicional — calculada sobre datos completos)
+    if not prices_df.empty:
+        _sup_bc, _  = ch.get_support_resistance(prices_df)
+        _dyn_bc, _2 = ch.get_dynamic_sr(prices_df)
+        buy_conf_full = ch.get_buy_confirmation(prices_df, _sup_bc, _dyn_bc)
+    else:
+        buy_conf_full = {}
+    _render_buy_confirmation_block(buy_conf_full)
+    st.markdown('<br>', unsafe_allow_html=True)
 
-    row_tf, row_pdf = st.columns([3, 1])
-    with row_tf:
-        selected_tf = st.segmented_control(
-            'Timeframe',
-            tf_labels,
-            default=cur_tf,
-            label_visibility='collapsed',
-            key='tf_ctrl',
-        )
-        if selected_tf is not None and selected_tf != st.session_state['tf']:
-            st.session_state['tf'] = selected_tf
-            st.rerun()
+    # Corto plazo: WMA6/WMA30 (calculado sobre datos completos para el panel)
+    swing_data_full = ch.get_swing_signal(prices_df) if not prices_df.empty else {}
+    if not prices_df.empty:
+        _sup_es, _res_es = ch.get_support_resistance(prices_df)
+        _, _dyn_res_es   = ch.get_dynamic_sr(prices_df)
+        early_swing_full = ch.get_early_swing_signal(prices_df, _dyn_res_es, _res_es)
+    else:
+        early_swing_full = {}
+    _render_swing_block(swing_data_full, early_swing_full)
+    st.markdown('<br>', unsafe_allow_html=True)
 
-    cur_tf = st.session_state['tf']
-
-    # Cortar el DataFrame al timeframe seleccionado por fecha calendario
+    # ── Controles encima del gráfico: Estrategia + Temporalidad + PDF ────────
     import pandas as _pd
-    _last  = _pd.Timestamp(prices_df['fecha'].iloc[-1])
-    _cut   = (_last - _pd.Timedelta(days=TF_OPTIONS[cur_tf])).strftime('%Y-%m-%d')
-    prices_slice = prices_df[prices_df['fecha'] >= _cut].reset_index(drop=True)
 
-    # Indicators: mismo rango temporal
-    if not indic_df.empty and not prices_slice.empty:
+    col_strat, col_tf, col_pdf = st.columns([3, 1.5, 1])
+
+    with col_strat:
+        chart_strategy = st.selectbox(
+            'Estrategia',
+            _STRAT_OPTIONS,
+            key='chart_strategy',
+        )
+
+    with col_tf:
+        chart_tf_label = st.selectbox(
+            'Temporalidad',
+            list(_TF_CHART.keys()),
+            key='chart_tf_label',
+        )
+
+    candle_freq = _TF_CHART.get(chart_tf_label, 'D')
+    cur_tf      = '1A'   # para ticks diarios
+
+    # Flags derivados de la estrategia seleccionada
+    _flags        = _STRAT_FLAGS.get(chart_strategy, _STRAT_FLAGS['(Seleccionar)'])
+    ind_sma50     = _flags['sma50']
+    ind_sma200    = _flags['sma200']
+    ind_ema20     = _flags['ema20']
+    ind_volume    = True   # siempre
+    ind_dyn_sr    = _flags['dyn_sr']
+    ind_static_sr = _flags['static_sr']
+    ind_wma6      = _flags['wma6']
+    ind_wma30     = _flags['wma30']
+    show_wma      = _flags['wma']        and (candle_freq == 'D')
+    show_swing    = (_flags['wma6'] or _flags['wma30'] or _flags['swing']) and (candle_freq == 'D')
+    _do_buy_conf  = _flags['buy_conf']   and (candle_freq == 'D')
+    _do_early_sw  = _flags['early_swing'] and (candle_freq == 'D')
+
+    # ── Datos fuente ──────────────────────────────────────────────────────────
+    if candle_freq == 'D':
+        _last = _pd.Timestamp(prices_df['fecha'].iloc[-1])
+        _cut  = (_last - _pd.Timedelta(days=TF_OPTIONS[cur_tf])).strftime('%Y-%m-%d')
+        prices_slice = prices_df[prices_df['fecha'] >= _cut].reset_index(drop=True)
+    else:
+        prices_slice = prices_df
+
+    if not indic_df.empty and not prices_slice.empty and candle_freq == 'D':
         cutoff      = prices_slice['fecha'].iloc[0]
         indic_slice = indic_df[indic_df['fecha'] >= cutoff].reset_index(drop=True)
     else:
         indic_slice = indic_df
 
-    # S/R estático + dinámico (ambos sobre datos completos — más señal)
+    # S/R siempre sobre datos diarios completos
     sup, res         = ch.get_support_resistance(prices_df) if not prices_df.empty else ([], [])
     dyn_sup, dyn_res = ch.get_dynamic_sr(prices_df)         if not prices_df.empty else ([], [])
 
-    # Figura con ambas capas de S/R
-    price_fig = (ch.price_chart(prices_slice, simbolo, cur_tf, dyn_sup, dyn_res)
-                 if not prices_slice.empty else None)
+    chart_df = ch.resample_ohlcv(prices_slice, candle_freq)
 
-    with row_pdf:
+    # Señales (solo en modo diario — marcadores necesitan fechas diarias)
+    wma_data_slice = (ch.get_wma_sma_signal(prices_slice)
+                      if show_wma and not prices_slice.empty else None)
+
+    buy_conf_slice = (ch.get_buy_confirmation(prices_slice, sup, dyn_sup)
+                      if _do_buy_conf and not prices_slice.empty else {})
+
+    swing_slice = (ch.get_swing_signal(prices_slice)
+                   if show_swing and not prices_slice.empty else None)
+
+    early_swing_slice = (ch.get_early_swing_signal(prices_slice, dyn_res, res)
+                         if _do_early_sw and not prices_slice.empty else None)
+
+    _dyn_sup_chart = dyn_sup if ind_dyn_sr else []
+    _dyn_res_chart = dyn_res if ind_dyn_sr else []
+
+    price_fig = (ch.price_chart(
+        chart_df, simbolo, cur_tf,
+        _dyn_sup_chart, _dyn_res_chart,
+        wma_data=wma_data_slice,
+        buy_conf_data=buy_conf_slice,
+        swing_data=swing_slice,
+        early_swing_data=early_swing_slice,
+        show_sma50=ind_sma50,
+        show_sma200=ind_sma200,
+        show_ema20=ind_ema20,
+        show_volume=ind_volume,
+        show_static_sr=ind_static_sr,
+        show_wma6=ind_wma6,
+        show_wma30=ind_wma30,
+        candle_freq=candle_freq,
+    ) if not chart_df.empty else None)
+
+    # PDF en la tercera columna (disponible tras calcular price_fig)
+    with col_pdf:
         if price_fig is not None:
-            pdf_bytes = _build_pdf(simbolo, mercado, cur_tf, prices_df, prices_slice,
-                                   sup, res, status, price_fig, dyn_sup, dyn_res)
-            st.download_button(
-                label='⬇ PDF',
-                data=pdf_bytes,
-                file_name=f'{simbolo}_{cur_tf}.pdf',
-                mime='application/pdf',
-                use_container_width=True,
-            )
+            try:
+                pdf_bytes = _build_pdf(simbolo, mercado, cur_tf, prices_df, prices_slice,
+                                       sup, res, status, dyn_sup, dyn_res,
+                                       wma_data=wma_data_full)
+                st.download_button(
+                    label='⬇ PDF',
+                    data=pdf_bytes,
+                    file_name=f'{simbolo}_{cur_tf}.pdf',
+                    mime='application/pdf',
+                    use_container_width=True,
+                )
+            except Exception:
+                st.button('⬇ PDF', disabled=True, use_container_width=True)
 
     # ── Tabs de gráficos ──────────────────────────────────────────────────────
     tab_price, tab_rsi, tab_mom = st.tabs(['📈 Precio', '📉 RSI', '🚀 Momentum'])
@@ -684,7 +1158,17 @@ def page_detail():
                 use_container_width=True,
                 config={'displayModeBar': False},
             )
-            _render_chart_legend()
+            _render_chart_legend(
+                show_wma=show_wma,
+                show_wma6=ind_wma6,
+                show_wma30=ind_wma30,
+                show_sma50=ind_sma50,
+                show_sma200=ind_sma200,
+                show_ema20=ind_ema20,
+                show_buy_conf=_do_buy_conf,
+                show_dyn_sr=ind_dyn_sr,
+                show_static_sr=ind_static_sr,
+            )
             st.markdown('<hr>', unsafe_allow_html=True)
             _render_sr_values(sup, res, dyn_sup, dyn_res)
 
