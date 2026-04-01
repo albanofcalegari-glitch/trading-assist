@@ -14,6 +14,9 @@ MYSQL_CONFIG = dict(
     ssl={'ssl_disabled': False},
 )
 
+# Alias — todos los módulos importan desde acá
+DB_CONFIG = MYSQL_CONFIG
+
 # ── Universo de activos ───────────────────────────────────────────────────────
 UNIVERSE = ['NVDA', 'MSFT', 'GOOGL', 'AAPL', 'MELI', 'VIST', 'JPM', 'DIS', 'PYPL', 'NU']
 

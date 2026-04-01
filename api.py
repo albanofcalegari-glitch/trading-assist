@@ -34,6 +34,18 @@ _scan_running:  set   = set()    # markets cuyo scan está en curso
 _scan_lock = threading.Lock()
 _SCAN_TTL  = 600                 # 10 minutos
 
+# ── Caché para longterm-support (cálculo O(n²) puede tardar 30-60s) ────────────
+
+_ltsupp_cache: dict = {}         # (symbol, horizon) → {'data': dict, 'ts': float}
+_ltsupp_lock = threading.Lock()
+_LTSUPP_TTL  = 3600              # 1 hora
+
+# ── Caché para horizontal-zones ───────────────────────────────────────────────
+
+_hzones_cache: dict = {}         # symbol → {'data': dict, 'ts': float}
+_hzones_lock = threading.Lock()
+_HZONES_TTL  = 3600              # 1 hora
+
 # ── Optionals ──────────────────────────────────────────────────────────────────
 try:
     from flask import Flask, jsonify, request
@@ -53,7 +65,7 @@ except ImportError:
 
 MYSQL_CONFIG = dict(
     host='localhost', user='root', password='123456',
-    db='bolsa', charset='utf8mb4',
+    db='trading_assist', charset='utf8mb4',
     cursorclass=pymysql.cursors.DictCursor,
     ssl={'ssl_disabled': False},
 )
@@ -104,6 +116,17 @@ def _conn():
 
 
 def _last_two_dates(cur):
+    # Usar fechas con cobertura real (>= 5000 activos) para evitar
+    # que un update parcial excluya activos con datos válidos.
+    cur.execute("""
+        SELECT fecha FROM valorhistoricoaccion
+        GROUP BY fecha HAVING COUNT(*) >= 5000
+        ORDER BY fecha DESC LIMIT 2
+    """)
+    rows = cur.fetchall()
+    if len(rows) >= 2:
+        return rows[0]['fecha'], rows[1]['fecha']
+    # fallback al comportamiento anterior si no hay suficientes datos
     cur.execute("SELECT MAX(fecha) FROM valorhistoricoaccion")
     last = cur.fetchone()['MAX(fecha)']
     cur.execute("SELECT MAX(fecha) FROM valorhistoricoaccion WHERE fecha < %s", [last])
@@ -184,6 +207,11 @@ def get_assets():
     search    = request.args.get('search', '')
     page      = int(request.args.get('page', 0))
     limit     = int(request.args.get('limit', 50))
+    # Con búsqueda: símbolo exacto primero, luego prefijo, luego resto
+    # Sin búsqueda: ordenar por mayor movimiento
+    s_order      = "(CASE WHEN simbolo = %s THEN 0 WHEN simbolo LIKE %s THEN 1 ELSE 2 END), simbolo" if search else "ABS(pct_cambio) DESC, simbolo"
+    s_order_full = "(CASE WHEN a.simbolo = %s THEN 0 WHEN a.simbolo LIKE %s THEN 1 ELSE 2 END), a.simbolo" if search else "ABS(pct_cambio) DESC, a.simbolo"
+    opt_order    = [search.upper(), f"{search.upper()}%"] if search else []
 
     s_clause   = "AND (a.simbolo LIKE %s OR a.nombre LIKE %s)" if search else ""
     opt_search = [f"%{search}%", f"%{search}%"] if search else []
@@ -231,9 +259,9 @@ def get_assets():
                         WHERE v1.fecha = %s AND v1.precio_cierre > 0.5
                           AND v2.precio_cierre > 0.5 {s_clause}
                     ) _s WHERE rn = 1
-                    ORDER BY ABS(pct_cambio) DESC, simbolo
+                    ORDER BY {s_order}
                     LIMIT %s OFFSET %s
-                """, base + [limit, page * limit])
+                """, base + opt_order + [limit, page * limit])
                 rows = cur.fetchall()
 
             else:
@@ -272,9 +300,9 @@ def get_assets():
                     JOIN mercado m ON m.id = a.mercado_id
                     WHERE v1.fecha = %s AND v1.precio_cierre > 0.5
                       AND v2.precio_cierre > 0.5 {m_clause} {s_clause}
-                    ORDER BY ABS(pct_cambio) DESC, simbolo
+                    ORDER BY {s_order_full}
                     LIMIT %s OFFSET %s
-                """, [prev, last] + opt_mkt + opt_search + [limit, page * limit])
+                """, [prev, last] + opt_mkt + opt_search + opt_order + [limit, page * limit])
                 rows = cur.fetchall()
 
     return _jresp({
@@ -326,14 +354,28 @@ def get_ohlcv(accion_id: int):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT fecha,
-                       COALESCE(precio_apertura, precio_cierre) AS open,
-                       COALESCE(precio_max, precio_cierre)      AS high,
-                       COALESCE(precio_min, precio_cierre)      AS low,
-                       precio_cierre AS close, volumen AS volume
-                FROM valorhistoricoaccion
-                WHERE accion_id = %s AND fecha >= %s
-                ORDER BY fecha ASC
+                SELECT v.fecha,
+                       COALESCE(ph.open,  v.precio_apertura, v.precio_cierre) AS open,
+                       COALESCE(ph.high,  v.precio_max,
+                           GREATEST(
+                               COALESCE(ph.open,  v.precio_apertura, v.precio_cierre),
+                               COALESCE(ph.close, v.precio_cierre)
+                           )
+                       ) AS high,
+                       COALESCE(ph.low,   v.precio_min,
+                           LEAST(
+                               COALESCE(ph.open,  v.precio_apertura, v.precio_cierre),
+                               COALESCE(ph.close, v.precio_cierre)
+                           )
+                       ) AS low,
+                       COALESCE(ph.close, v.precio_cierre)  AS close,
+                       COALESCE(ph.volume, v.volumen, 0)    AS volume
+                FROM valorhistoricoaccion v
+                JOIN accion a ON a.id = v.accion_id
+                LEFT JOIN price_history ph
+                       ON ph.simbolo = a.simbolo AND ph.fecha = v.fecha
+                WHERE v.accion_id = %s AND v.fecha >= %s
+                ORDER BY v.fecha ASC
             """, [accion_id, cutoff])
             rows = cur.fetchall()
 
@@ -342,6 +384,45 @@ def get_ohlcv(accion_id: int):
         r['fecha'] = str(r['fecha'])
 
     return _jresp({'accion_id': accion_id, 'candles': rows})
+
+
+# ── /api/assets/<id>/ohlcv-extended ───────────────────────────────────────────
+# Sirve OHLCV desde ohlcv_extended (histórico completo: 20-30 años).
+# ?tf=D  → diario   (hasta ~20 años según símbolo)
+# ?tf=W  → semanal  (hasta ~25 años)
+# ?tf=M  → mensual  (hasta ~30 años)
+
+@app.route('/api/assets/<int:accion_id>/ohlcv-extended')
+def get_ohlcv_extended(accion_id: int):
+    tf = request.args.get('tf', 'D').upper()
+    if tf not in ('D', 'W', 'M'):
+        return _jresp({'error': 'tf must be D, W or M'}, 400)
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    simbolo = row['simbolo']
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT fecha,
+                       open, high, low, close, volume
+                FROM ohlcv_extended
+                WHERE simbolo = %s AND timeframe = %s
+                ORDER BY fecha ASC
+            """, [simbolo, tf])
+            rows = cur.fetchall()
+
+    for r in rows:
+        r['fecha'] = str(r['fecha'])
+
+    return _jresp({'accion_id': accion_id, 'simbolo': simbolo, 'tf': tf, 'candles': rows})
 
 
 # ── /api/assets/<id>/indicators ───────────────────────────────────────────────
@@ -596,6 +677,95 @@ def scan_wma_cross():
     threading.Thread(target=_bg, daemon=True).start()
     return _jresp({'status': 'computing', 'market': market,
                    'setup': [], 'cross': [], 'fecha': ''})
+
+
+# ── /api/assets/<id>/longterm-support ─────────────────────────────────────────
+#
+# Retorna la directriz de soporte estructural calculada sobre el histórico
+# COMPLETO de ohlcv_extended (semanal o mensual según el horizonte).
+# No depende del zoom ni de las velas visibles en el chart.
+#
+# Query params:
+#   horizon = 'long_term' (default) | 'mid_term' | 'short_term'
+#
+# Requiere que backfill_history.py haya corrido previamente para el símbolo.
+
+@app.route('/api/assets/<int:accion_id>/longterm-support')
+def get_longterm_support_endpoint(accion_id: int):
+    horizon = request.args.get('horizon', 'long_term')
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+    cache_key = (symbol, horizon)
+
+    # ── Devolver desde caché si está fresco ──────────────────────────────────
+    with _ltsupp_lock:
+        entry = _ltsupp_cache.get(cache_key)
+        if entry and (time.time() - entry['ts']) < _LTSUPP_TTL:
+            return _jresp(entry['data'])
+
+    # ── Calcular (puede tardar varios segundos) ───────────────────────────────
+    try:
+        from strategies.longterm_support import get_longterm_support
+        result = get_longterm_support(symbol, datetime.date.today(), horizon=horizon)
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    if result is None:
+        result = {
+            'status':  'NO_DATA',
+            'symbol':  symbol,
+            'horizon': horizon,
+            'message': 'Sin datos en ohlcv_extended. Ejecutar scripts/backfill_history.py',
+            'line_points': [],
+            'resistance_line_points': [],
+        }
+
+    with _ltsupp_lock:
+        _ltsupp_cache[cache_key] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/assets/<id>/horizontal-zones ─────────────────────────────────────────
+#
+# Zonas horizontales de soporte y resistencia detectadas sobre ohlcv_extended
+# semanal.  Retorna múltiples zonas para soporte y resistencia.
+
+@app.route('/api/assets/<int:accion_id>/horizontal-zones')
+def get_horizontal_zones(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _hzones_lock:
+        entry = _hzones_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _HZONES_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        from strategies.horizontal_zones import detect_horizontal_zones
+        result = detect_horizontal_zones(symbol, datetime.date.today())
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _hzones_lock:
+        _hzones_cache[symbol] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
 
 
 # ── Pre-calentado del caché en background ─────────────────────────────────────

@@ -34,6 +34,23 @@ interface TrendlineResult {
   }
 }
 
+export interface LongtermSupportLayer {
+  line_points:     { fecha: string; value: number }[]
+  status:          string   // 'ACTIVE' | 'TESTING' | 'BROKEN' | 'NO_SUPPORT'
+  timeframe_used?: string
+}
+
+export interface HorizontalZoneData {
+  zone_low:        number
+  zone_high:       number
+  center:          number
+  total_touches:   number
+  recent_touches:  number
+  score:           number
+  type:            'support' | 'resistance'
+  rank:            'primary' | 'secondary' | 'tertiary'
+}
+
 function addMonths(dateStr: string, n: number): string {
   const [y, m, d] = dateStr.split('-').map(Number)
   const dt = new Date(y, m - 1 + n, Math.min(d, 28))
@@ -342,9 +359,19 @@ interface Props {
   indicators:           IndicatorLine[]
   showTrendline?:       boolean
   showResistanceTrend?: boolean
-  debugSegmentOnly?:    boolean   // si true: dibuja SOLO el segmento p1→p2, sin extensión
+  debugSegmentOnly?:    boolean
   height?:              number
   onTrendlineResult?:   (support: TrendlineStatus | null, resistance: TrendlineStatus | null) => void
+  // Capas de soporte/resistencia estructural desde ohlcv_extended (motor longterm_support.py)
+  longtermLayer?:           LongtermSupportLayer | null
+  longtermResistanceLayer?: LongtermSupportLayer | null
+  midtermLayer?:            LongtermSupportLayer | null
+  shorttermLayer?:          LongtermSupportLayer | null
+  // Capas activas (ultimos 7 anos)
+  activeLayer?:             LongtermSupportLayer | null
+  activeResistanceLayer?:   LongtermSupportLayer | null
+  // Zonas horizontales de soporte/resistencia
+  horizontalZones?:         HorizontalZoneData[] | null
 }
 
 // Colores exactos TradingView dark theme
@@ -368,6 +395,13 @@ export default function PriceChart({
   debugSegmentOnly = false,
   height = 440,
   onTrendlineResult,
+  longtermLayer           = null,
+  longtermResistanceLayer = null,
+  midtermLayer            = null,
+  shorttermLayer          = null,
+  activeLayer             = null,
+  activeResistanceLayer   = null,
+  horizontalZones         = null,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef     = useRef<IChartApi | null>(null)
@@ -382,10 +416,20 @@ export default function PriceChart({
 
     const el = containerRef.current
 
-    // Resample según temporalidad
+    // Resample según temporalidad desde datos diarios (ohlcv_extended D = 20 años).
+    // D: sin resample. W: agrega diario→semanal. M: agrega diario→mensual.
     const data = freq === 'D' ? candles
                : freq === 'W' ? resampleOHLCV(candles, 'W')
-               : resampleOHLCV(candles, 'M')
+               :                resampleOHLCV(candles, 'M')
+
+    // ── [DATA CHECK] ──────────────────────────────────────────────────────────
+    console.log(
+      '[DATA CHECK]\n' +
+      `timeframe=${freq}\n` +
+      `candles_count=${data.length}\n` +
+      `first_date=${data[0]?.fecha ?? 'n/a'}\n` +
+      `last_date=${data[data.length - 1]?.fecha ?? 'n/a'}`
+    )
 
     // ── Chart — opciones idénticas al look TradingView dark ───────────────────
     const chart = createChart(el, {
@@ -440,7 +484,19 @@ export default function PriceChart({
 
     chartRef.current = chart
 
+    // Ocultar logo de TradingView (lightweight-charts lo inyecta como <a>)
+    const hideLogo = () => {
+      el.querySelectorAll('a').forEach(a => {
+        if (a.href.includes('tradingview')) (a as HTMLElement).style.display = 'none'
+      })
+    }
+    hideLogo()
+    setTimeout(hideLogo, 200)   // fallback por si lo inyecta de forma asíncrona
+
     // ── Velas — colores exactos TradingView ───────────────────────────────────
+    // Color definido SOLO por close >= open (regla estándar japonesa).
+    // Se fuerza color/wickColor/borderColor por barra para no depender de
+    // la lógica interna de la versión de lightweight-charts instalada.
     const candleSeries = chart.addCandlestickSeries({
       upColor:          COLORS.up,
       downColor:        COLORS.down,
@@ -452,13 +508,38 @@ export default function PriceChart({
       lastValueVisible: true,
     } as Partial<CandlestickSeriesOptions>)
 
-    const ohlcData = data.map(c => ({
-      time:  c.fecha as any,
-      open:  Number(c.open),
-      high:  Number(c.high),
-      low:   Number(c.low),
-      close: Number(c.close),
-    }))
+    const ohlcData = data.map(c => {
+      const open  = Number(c.open)
+      const close = Number(c.close)
+      const isUp  = close >= open
+      return {
+        time:        c.fecha as any,
+        open,
+        high:        Number(c.high),
+        low:         Number(c.low),
+        close,
+        color:       isUp ? COLORS.up : COLORS.down,
+        wickColor:   isUp ? COLORS.up : COLORS.down,
+        borderColor: isUp ? COLORS.up : COLORS.down,
+      }
+    })
+
+    // ── [CANDLE DEBUG] últimas 10 velas ───────────────────────────────────────
+    console.group('[CANDLE DEBUG] últimas 10 velas')
+    ohlcData.slice(-10).forEach(c => {
+      const isUp = c.close >= c.open
+      console.log(
+        `date=${c.time}  open=${c.open}  close=${c.close}  ` +
+        `isUp=${isUp}  renderColor=${isUp ? 'GREEN (#26a69a)' : 'RED (#ef5350)'}`
+      )
+    })
+    console.groupEnd()
+
+    // ── [RENDER DATA] debug ───────────────────────────────────────────────────
+    console.log(
+      `[RENDER DATA]\nfirst=${ohlcData[0]?.time ?? 'n/a'}\nlast=${ohlcData[ohlcData.length - 1]?.time ?? 'n/a'}\ncount=${ohlcData.length}`
+    )
+
     candleSeries.setData(ohlcData)
 
     // ── Volumen — histograma en la zona inferior (20%) ─────────────────────────
@@ -518,12 +599,13 @@ export default function PriceChart({
           )
         }
 
-        // Color según estado: ACTIVE=verde, TESTING=amarillo
-        const supportColor = tl.meta?.status === 'TESTING_SUPPORT' ? '#facc15' : '#26a69a'
+        // Color según estado — capa secundaria (demoted): fino y transparente
+        const supportColor = tl.meta?.status === 'TESTING_SUPPORT'
+          ? 'rgba(74,222,128,0.45)' : 'rgba(38,166,154,0.40)'
         const tlSeries = chart.addLineSeries({
           color:                  supportColor,
-          lineWidth:              2,
-          lineStyle:              LineStyle.Solid,
+          lineWidth:              1,
+          lineStyle:              LineStyle.Dashed,
           priceLineVisible:       false,
           lastValueVisible:       false,
           crosshairMarkerVisible: false,
@@ -563,12 +645,13 @@ export default function PriceChart({
           )
         }
 
-        // Color según estado: ACTIVE=naranja, TESTING=amarillo
-        const resistanceColor = tr.meta?.status === 'TESTING_RESISTANCE' ? '#facc15' : '#f97316'
+        // Color según estado — capa secundaria (demoted): fino y transparente
+        const resistanceColor = tr.meta?.status === 'TESTING_RESISTANCE'
+          ? 'rgba(250,204,21,0.45)' : 'rgba(249,115,22,0.40)'
         const trSeries = chart.addLineSeries({
           color:                  resistanceColor,
-          lineWidth:              2,
-          lineStyle:              LineStyle.Solid,
+          lineWidth:              1,
+          lineStyle:              LineStyle.Dashed,
           priceLineVisible:       false,
           lastValueVisible:       false,
           crosshairMarkerVisible: false,
@@ -586,6 +669,140 @@ export default function PriceChart({
     // Markers ordenados por fecha
     allMarkers.sort((a, b) => String(a.time) < String(b.time) ? -1 : 1)
     if (allMarkers.length > 0) candleSeries.setMarkers(allMarkers)
+
+    // ── Capas de soporte estructural (motor longterm_support.py) ─────────────
+    //
+    // Estilos por horizonte:
+    //   long_term  → 3px sólido   — el más importante, color según estado
+    //   mid_term   → 2px dashed   — intermedio
+    //   short_term → 1px dashed   — fino
+    //
+    // Colores por estado:
+    //   ACTIVE  → color sobrio del horizonte
+    //   TESTING → amarillo (#f59e0b) en todos
+    //   BROKEN  → long_term: gris tenue punteado; mid/short: no renderizar
+    //
+    // Sólo se renderizan puntos que están dentro del rango visible del chart
+    // (desde el primer candle disponible en adelante) para evitar scroll.
+
+    const firstCandleDate = data.length ? data[0].fecha : null
+
+    function renderStructuralLayer(
+      layer:     LongtermSupportLayer | null | undefined,
+      activeColor: string,
+      width:     1 | 2 | 3,
+      style:     0 | 1 | 2 | 3,   // LineStyle enum values
+    ) {
+      if (!layer || !layer.line_points.length) return
+      if (layer.status === 'NO_SUPPORT') return
+
+      // BROKEN: mid_term y short_term no se renderizan
+      // BROKEN: long_term se renderiza tenue y punteada
+      let color: string
+      let lineStyle: 0 | 1 | 2 | 3
+      let lineWidth: 1 | 2 | 3
+
+      if (layer.status === 'BROKEN') {
+        if (width < 3) return   // mid_term y short_term rotos: no renderizar
+        color     = 'rgba(239,83,80,0.38)'   // rojo tenue — directriz rota, contexto histórico
+        lineStyle = 2   // Dashed
+        lineWidth = 1
+      } else if (layer.status === 'TESTING') {
+        color     = '#f59e0b'
+        lineStyle = style
+        lineWidth = width
+      } else {
+        color     = activeColor
+        lineStyle = style
+        lineWidth = width
+      }
+
+      // Filtrar puntos desde el primer candle disponible
+      const pts = firstCandleDate
+        ? layer.line_points.filter(p => p.fecha >= firstCandleDate)
+        : layer.line_points
+
+      if (pts.length < 2) return
+
+      const series = chart.addLineSeries({
+        color,
+        lineWidth,
+        lineStyle,
+        priceLineVisible:       false,
+        lastValueVisible:       false,
+        crosshairMarkerVisible: false,
+      })
+      series.setData(pts.map(p => ({ time: p.fecha as any, value: p.value })))
+    }
+
+    // Capas diagonales — demoted a secundarias (1px, transparentes)
+    renderStructuralLayer(longtermLayer,           'rgba(91,108,246,0.35)',  1, 2)
+    renderStructuralLayer(longtermResistanceLayer, 'rgba(249,115,22,0.35)', 1, 2)
+    renderStructuralLayer(midtermLayer,            'rgba(96,165,250,0.30)',  1, 2)
+    renderStructuralLayer(shorttermLayer,          'rgba(34,211,238,0.25)',  1, 2)
+    renderStructuralLayer(activeLayer,             'rgba(132,204,22,0.35)', 1, 2)
+    renderStructuralLayer(activeResistanceLayer,   'rgba(234,179,8,0.35)',  1, 2)
+
+    // ── Zonas horizontales de soporte/resistencia ─────────────────────────────
+    //
+    // Cada zona se renderiza como DOS líneas horizontales (zone_high y zone_low)
+    // que delimitan la banda.  Colores:
+    //   Soporte     → teal (#26a69a)   — primary 2px, secondary 1px
+    //   Resistencia → coral (#ef5350)  — primary 2px, secondary 1px
+
+    if (horizontalZones && horizontalZones.length > 0 && data.length >= 2) {
+      const zoneFirst = data[Math.max(0, data.length - (freq === 'W' ? 520 : freq === 'M' ? 240 : 365))].fecha
+      const zoneLast  = data[data.length - 1].fecha
+
+      for (const hz of horizontalZones) {
+        if (hz.rank === 'tertiary') continue   // skip noise — solo primary + secondary
+
+        const isSup   = hz.type === 'support'
+        const baseClr = isSup ? '38,166,154' : '239,83,80'
+
+        // Visual hierarchy por rank
+        const isPrimary = hz.rank === 'primary'
+        const alpha     = isPrimary ? 0.6 : 0.3
+        const width: 1 | 2 = isPrimary ? 2 : 1
+        const style     = isPrimary ? LineStyle.Solid : LineStyle.Dashed
+
+        // zone_high line
+        const hi = chart.addLineSeries({
+          color: `rgba(${baseClr},${alpha})`,
+          lineWidth: width, lineStyle: style,
+          priceLineVisible: false, lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        })
+        hi.setData([
+          { time: zoneFirst as any, value: hz.zone_high },
+          { time: zoneLast  as any, value: hz.zone_high },
+        ])
+
+        // zone_low line
+        const lo = chart.addLineSeries({
+          color: `rgba(${baseClr},${alpha})`,
+          lineWidth: width, lineStyle: style,
+          priceLineVisible: false, lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        })
+        lo.setData([
+          { time: zoneFirst as any, value: hz.zone_low },
+          { time: zoneLast  as any, value: hz.zone_low },
+        ])
+
+        // Y-axis label solo para primary
+        if (isPrimary) {
+          candleSeries.createPriceLine({
+            price:            hz.center,
+            color:            `rgba(${baseClr},0.55)`,
+            lineWidth:        1,
+            lineStyle:        LineStyle.Dotted,
+            axisLabelVisible: true,
+            title:            isSup ? `S ${hz.total_touches}t` : `R ${hz.total_touches}t`,
+          })
+        }
+      }
+    }
 
     // ── Indicadores (WMA, SMA, etc.) ──────────────────────────────────────────
     for (const ind of indicators) {
@@ -607,13 +824,15 @@ export default function PriceChart({
       for (const entry of entries) chart.applyOptions({ width: entry.contentRect.width })
     })
     ro.observe(el)
-    // Mostrar solo los últimos ~250 bars por defecto (igual que TradingView).
-    // El usuario puede hacer zoom-out para ver el histórico completo.
-    const DEFAULT_BARS = 250
+    // Bars visibles por defecto según timeframe:
+    //   D → 365  (~1.5 años de diario)
+    //   W → 520  (~10 años de semanal — muestra la estructura de largo plazo)
+    //   M → 240  (~20 años de mensual)
+    const DEFAULT_BARS = freq === 'W' ? 520 : freq === 'M' ? 240 : 365
     if (data.length > DEFAULT_BARS) {
       chart.timeScale().setVisibleLogicalRange({
         from: data.length - DEFAULT_BARS - 0.5,
-        to:   data.length - 1 + 15,  // margen para ver la proyección de la trendline
+        to:   data.length - 1 + 15,
       })
     } else {
       chart.timeScale().fitContent()
@@ -624,7 +843,7 @@ export default function PriceChart({
       chart.remove()
       chartRef.current = null
     }
-  }, [candles, freq, indicators, showTrendline, showResistanceTrend, debugSegmentOnly, height, onTrendlineResult])
+  }, [candles, freq, indicators, showTrendline, showResistanceTrend, debugSegmentOnly, height, onTrendlineResult, longtermLayer, longtermResistanceLayer, midtermLayer, shorttermLayer, activeLayer, activeResistanceLayer, horizontalZones])
 
   return (
     <div

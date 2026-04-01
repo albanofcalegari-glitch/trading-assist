@@ -162,114 +162,306 @@ def resample_ohlcv(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     return out
 
 
-# ── Helpers de análisis dinámico ──────────────────────────────────────────────
-
-def _count_touches(df: pd.DataFrame, level: float, tol: float = 0.005) -> int:
-    """Velas donde high >= level*(1-tol) AND low <= level*(1+tol)."""
-    return int(((df['high'] >= level * (1 - tol)) & (df['low'] <= level * (1 + tol))).sum())
-
-
-def _score_to_fuerza(score: float) -> str:
-    if score >= 5.0:  return 'muy alta'
-    if score >= 3.5:  return 'alta'
-    if score >= 2.0:  return 'media'
-    return 'baja'
-
+# ── S/R dinámico: trendlines construidas con pivotes reales ──────────────────
 
 def get_dynamic_sr(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
     """
-    Niveles dinámicos de S/R: MAs actuales + swing lows/highs recientes.
+    Detecta pivot lows y pivot highs con ventana de 1 barra:
+      pivot low:  low[i] < low[i-1]  AND  low[i] < low[i+1]
+      pivot high: high[i] > high[i-1] AND high[i] > high[i+1]
 
-    Lógica:
-      1. SMA200 / SMA50 / EMA20: si está por debajo del precio → soporte, si no → resistencia.
-         Puntaje base: SMA200=3.5, SMA50=2.5, EMA20=1.5
-      2. Swing lows (low[i] < low[i-1] y low[i] < low[i+1]) en los últimos 80 bars.
-         Puntaje = 1 + recencia(0-1.5) + toques(0-1.5)
-      3. Swing highs: análogo.
-      4. Agrupación en zonas si niveles están dentro del 1% entre sí.
-         La confluencia suma +0.8 por nivel adicional en la zona.
+    Construye líneas que:
+      - Soporte    → une mínimos CRECIENTES (slope > 0)
+      - Resistencia → une máximos DECRECIENTES (slope < 0)
 
-    Returns (sup_dynamic, res_dynamic) — lista de dicts:
-      {'label': str, 'value': float, 'fuerza': str,
-       'is_zone': bool, 'vmin': float, 'vmax': float}
+    La línea pasa EXACTAMENTE por los dos pivotes que la definen.
+    Se valida contando cuántos otros pivotes caen cerca de ella (±0.5%).
+    Puntaje = toques - violaciones * 2 + bonus_recencia.
+    Se prefiere la línea con más toques, menos violaciones y más reciente.
+
+    Returns (dyn_supports, dyn_resistances) — listas de 0 ó 1 dict:
+      {
+        'p1'/'p2' : {'time': str, 'price': float, 'idx': int},
+        'value'   : float,   # valor proyectado en el último bar
+        'slope'   : float,
+        'touches' : int,
+        'status'  : 'active' | 'broken',
+        'fuerza'  : 'alta' | 'media',
+        'is_zone' : False,
+      }
     """
-    if df.empty or len(df) < 10:
+    if df.empty or len(df) < 6:
         return [], []
 
-    df = df.copy()
-    for col in ('high', 'low', 'close', 'sma200', 'sma50', 'ema20'):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+    highs  = pd.to_numeric(df['high'],  errors='coerce')
+    lows   = pd.to_numeric(df['low'],   errors='coerce')
+    dates  = df['fecha'].tolist()
+    n      = len(df)
+    TOL     = 0.005   # 0.5% — tolerancia para contar un toque en la línea
+    PIVOT_W = 7       # barras a cada lado → mínimo/máximo en ventana de 15 barras
+    MIN_SEP = 15      # separación mínima entre pivotes consecutivos (barras)
 
-    cur  = float(df['close'].iloc[-1])
-    last = df.iloc[-1]
-    raw_sup: list[dict] = []
-    raw_res: list[dict] = []
+    # ── 1. Pivot detection: ventana estructural ───────────────────────────────
+    # Pivot low:  low[i] == min(low[i-PIVOT_W : i+PIVOT_W+1])
+    # Pivot high: high[i] == max(high[i-PIVOT_W : i+PIVOT_W+1])
+    # + separación mínima MIN_SEP barras entre pivotes consecutivos
+    pivot_lows:  list[tuple[int, float, str]] = []
+    pivot_highs: list[tuple[int, float, str]] = []
 
-    # 1. MAs como S/R dinámico ─────────────────────────────────────────────────
-    for col, name, base_score in (('sma200','SMA200',3.5), ('sma50','SMA50',2.5), ('ema20','EMA20',1.5)):
-        val = pd.to_numeric(last.get(col, None), errors='coerce')
-        if pd.notna(val):
-            item = {'label': name, 'value': float(val), 'score': base_score}
-            (raw_sup if float(val) < cur else raw_res).append(item)
+    for i in range(PIVOT_W, n - PIVOT_W):
+        lo_win = lows.iloc[i - PIVOT_W: i + PIVOT_W + 1].dropna()
+        hi_win = highs.iloc[i - PIVOT_W: i + PIVOT_W + 1].dropna()
+        lo = lows.iat[i]
+        hi = highs.iat[i]
 
-    # 2. Swing lows y highs (últimos 80 bars) ──────────────────────────────────
-    lookback = min(len(df), 80)
-    rec      = df.iloc[-lookback:].reset_index(drop=True)
-    nr       = len(rec)
+        if pd.notna(lo) and len(lo_win) >= PIVOT_W and float(lo) <= float(lo_win.min()):
+            # Respetar separación mínima respecto al último pivote
+            if not pivot_lows or (i - pivot_lows[-1][0]) >= MIN_SEP:
+                pivot_lows.append((i, float(lo), dates[i]))
+            elif float(lo) < pivot_lows[-1][1]:
+                # Si está más cerca de lo esperado pero es más bajo, reemplaza
+                pivot_lows[-1] = (i, float(lo), dates[i])
 
-    for i in range(1, nr - 1):
-        lo_p, lo_i, lo_n = rec['low'].iat[i-1], rec['low'].iat[i], rec['low'].iat[i+1]
-        hi_p, hi_i, hi_n = rec['high'].iat[i-1], rec['high'].iat[i], rec['high'].iat[i+1]
+        if pd.notna(hi) and len(hi_win) >= PIVOT_W and float(hi) >= float(hi_win.max()):
+            if not pivot_highs or (i - pivot_highs[-1][0]) >= MIN_SEP:
+                pivot_highs.append((i, float(hi), dates[i]))
+            elif float(hi) > pivot_highs[-1][1]:
+                pivot_highs[-1] = (i, float(hi), dates[i])
 
-        recency = i / nr   # 0 = más antiguo, 1 = más reciente → bonus 0..1.5
+    TOL_TOUCH = 0.012   # 1.2% — el pivote "toca" la linea
+    TOL_VIO   = 0.020   # 2.0% — el pivote rompe la linea (violacion real)
 
-        if pd.notna(lo_i) and pd.notna(lo_p) and pd.notna(lo_n):
-            if lo_i < lo_p and lo_i < lo_n and lo_i < cur:
-                score = 1.0 + recency * 1.5 + min(_count_touches(df, lo_i) * 0.25, 1.5)
-                raw_sup.append({'label': 'Swing low', 'value': float(lo_i), 'score': score})
+    # ── Forzar el lowest low como pivot candidato para soporte ────────────────
+    # El minimo absoluto del periodo (capitulacion) debe ser siempre evaluado
+    # aunque no cumpla la ventana estructural de PIVOT_W barras.
+    _valid_lows = lows.dropna()
+    if len(_valid_lows) > 0:
+        _ll_pos = int(_valid_lows.idxmin())   # posicion absoluta en df
+        _ll_val = float(lows.iat[_ll_pos])
+        _ll_date = dates[_ll_pos]
+        # Verificar si ya esta en pivot_lows (tolerancia 0.5%)
+        _already = any(abs(yk - _ll_val) / _ll_val < 0.005 for _, yk, _ in pivot_lows)
+        if not _already:
+            # Insertar en orden cronologico
+            insert_at = len(pivot_lows)
+            for k, (ik, _, _) in enumerate(pivot_lows):
+                if ik > _ll_pos:
+                    insert_at = k
+                    break
+            pivot_lows.insert(insert_at, (_ll_pos, _ll_val, _ll_date))
+            print(f'[SR] Lowest low forzado como pivot: {_ll_date} @ ${_ll_val:.2f} (bar {_ll_pos})', flush=True)
 
-        if pd.notna(hi_i) and pd.notna(hi_p) and pd.notna(hi_n):
-            if hi_i > hi_p and hi_i > hi_n and hi_i > cur:
-                score = 1.0 + recency * 1.5 + min(_count_touches(df, hi_i) * 0.25, 1.5)
-                raw_res.append({'label': 'Swing high', 'value': float(hi_i), 'score': score})
+    # ── 2. Mejor línea: evalúa todos los pares ────────────────────────────────
+    def _is_broken(i1, y1, slope, price_series, direction) -> bool:
+        """True si los últimos 5 bars cruzan la línea más de TOL_VIO."""
+        for k in range(max(0, n - 5), n):
+            lv = y1 + slope * (k - i1)
+            if lv <= 0:
+                continue
+            v = price_series.iat[k]
+            if pd.isna(v):
+                continue
+            if direction == 'up'   and float(v) < lv * (1 - TOL_VIO):
+                return True
+            if direction == 'down' and float(v) > lv * (1 + TOL_VIO):
+                return True
+        return False
 
-    # 3. Agrupar y asignar fuerza ──────────────────────────────────────────────
-    def _cluster(raw: list[dict], top_n: int = 4) -> list[dict]:
-        if not raw:
-            return []
-        raw_s = sorted(raw, key=lambda x: x['value'])
-        clusters: list[list[dict]] = []
-        cur_cl = [raw_s[0]]
-        for item in raw_s[1:]:
-            if abs(item['value'] - cur_cl[0]['value']) / max(cur_cl[0]['value'], 1e-9) <= 0.01:
-                cur_cl.append(item)
-            else:
-                clusters.append(cur_cl)
-                cur_cl = [item]
-        clusters.append(cur_cl)
+    def _score_pair(i1, y1, i2, y2, pivots, direction) -> tuple[int, int]:
+        """Cuenta toques y violaciones de todos los pivotes respecto a esta línea."""
+        slope = (y2 - y1) / (i2 - i1)
+        touches = violations = 0
+        for ik, yk, _ in pivots:
+            lv = y1 + slope * (ik - i1)
+            if lv <= 0:
+                continue
+            dist = abs(yk - lv) / lv
+            if dist <= TOL_TOUCH:
+                touches += 1
+            elif direction == 'up'   and yk < lv * (1 - TOL_VIO):
+                violations += 1
+            elif direction == 'down' and yk > lv * (1 + TOL_VIO):
+                violations += 1
+        return touches, violations
 
-        result = []
-        for cl in clusters:
-            combined = sum(c['score'] for c in cl) + (len(cl) - 1) * 0.8
-            labels   = list(dict.fromkeys(c['label'] for c in cl))
-            vals     = [c['value'] for c in cl]
-            is_zone  = len(cl) > 1
-            result.append({
-                'label':   ' + '.join(labels[:2]) if is_zone else labels[0],
-                'value':   (min(vals) + max(vals)) / 2,
-                'vmin':    min(vals),
-                'vmax':    max(vals),
-                'fuerza':  _score_to_fuerza(combined),
-                'is_zone': is_zone,
-            })
+    def _best_line(
+        pivots: list[tuple[int, float, str]],
+        direction: str,
+        price_series: pd.Series,
+    ):
+        if len(pivots) < 2:
+            return None
 
-        result.sort(key=lambda x: abs(x['value'] - cur))
-        return result[:top_n]
+        best_score = -999.0
+        best       = None
 
-    sup_dyn = sorted(_cluster(raw_sup), key=lambda x: x['value'], reverse=True)
-    res_dyn = sorted(_cluster(raw_res), key=lambda x: x['value'])
-    return sup_dyn, res_dyn
+        for pi in range(len(pivots)):
+            for pj in range(pi + 1, len(pivots)):
+                i1, y1, t1 = pivots[pi]
+                i2, y2, t2 = pivots[pj]
+
+                # Dirección estricta
+                if direction == 'up'   and y2 <= y1: continue
+                if direction == 'down' and y2 >= y1: continue
+
+                slope = (y2 - y1) / (i2 - i1)
+
+                touches, violations = _score_pair(i1, y1, i2, y2, pivots, direction)
+
+                # Penalizar fuerte las violaciones (2 violaciones = línea descartada)
+                if violations >= 2:
+                    continue
+
+                # Penalizar si la línea ya está rota
+                broken = _is_broken(i1, y1, slope, price_series, direction)
+                broken_penalty = 5 if broken else 0
+
+                # Bonus por longitud: líneas que cubren más del chart son más relevantes
+                span_bonus = (i2 - i1) / n   # 0..1
+
+                score = touches * 3 - violations * 4 - broken_penalty + span_bonus
+
+                if score > best_score:
+                    best_score = score
+                    best = (i1, y1, t1, i2, y2, t2, slope, touches, broken)
+
+        if best is None:
+            return None
+
+        i1, y1, t1, i2, y2, t2, slope, touches, broken = best
+        current_val = y1 + slope * (n - 1 - i1)
+
+        return {
+            'p1':      {'time': t1, 'price': y1, 'idx': i1},
+            'p2':      {'time': t2, 'price': y2, 'idx': i2},
+            'value':   current_val,
+            'slope':   slope,
+            'touches': touches,
+            'status':  'broken' if broken else 'active',
+            'fuerza':  'alta' if touches >= 3 else 'media',
+            'is_zone': False,
+        }
+
+    # ── Selección de soporte: prioriza span + inicio temprano + p1 importante ──
+    def _best_support_line(pivots: list[tuple[int, float, str]]) -> dict | None:
+        """
+        Selección del soporte dominante.
+
+        Criterios (en orden de peso):
+          1. span largo   → línea que cubre más del chart (directriz dominante)
+          2. inicio temprano → cuanto antes empieza, más estructural
+          3. p1 importante  → profundidad del primer low + magnitud del rebote
+          4. toques         → refuerzan validez pero pesan menos que span
+          5. violaciones    → penalizan; 3+ descarta la línea
+          6. broken         → penalización fuerte si los últimos 5 bars rompieron
+        """
+        if len(pivots) < 2:
+            return None
+
+        all_lows_vals = [yk for _, yk, _ in pivots]
+        lo_min = min(all_lows_vals)
+        lo_max = max(all_lows_vals)
+        lo_range = (lo_max - lo_min) if lo_max > lo_min else 1.0
+
+        candidates = []
+
+        for pi in range(len(pivots)):
+            for pj in range(pi + 1, len(pivots)):
+                i1, y1, t1 = pivots[pi]
+                i2, y2, t2 = pivots[pj]
+
+                # Soporte: lows deben ser CRECIENTES (slope > 0)
+                if y2 <= y1:
+                    continue
+
+                slope = (y2 - y1) / (i2 - i1)
+
+                # Contar toques/violaciones con umbral 3% (mas permisivo para soporte)
+                touches = violations = 0
+                for ik, yk, _ in pivots:
+                    lv = y1 + slope * (ik - i1)
+                    if lv <= 0:
+                        continue
+                    dist = abs(yk - lv) / lv
+                    if dist <= TOL_TOUCH:
+                        touches += 1
+                    elif yk < lv * (1 - 0.030):
+                        violations += 1
+
+                # Sin cutoff duro: permitir hasta 9 violaciones antes de descartar
+                if violations >= 10:
+                    continue
+
+                broken = _is_broken(i1, y1, slope, lows, 'up')
+
+                # Span: fraccion del chart cubierta (0..1)
+                span_frac = (i2 - i1) / n
+
+                # Score simplificado: span domina, violaciones penalizan poco
+                # score = span*30 + touches - violations*2 - broken*4
+                broken_penalty = 4.0 if broken else 0.0
+
+                score = (
+                    span_frac * 30.0 +
+                    touches   *  1.0 -
+                    violations * 2.0 -
+                    broken_penalty
+                )
+
+                projected = y1 + slope * (n - 1 - i1)
+                candidates.append({
+                    'i1': i1, 'y1': y1, 't1': t1,
+                    'i2': i2, 'y2': y2, 't2': t2,
+                    'slope': slope, 'touches': touches,
+                    'violations': violations, 'broken': broken,
+                    'span_bars': i2 - i1, 'span_frac': span_frac,
+                    'score': score, 'projected': projected,
+                })
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+
+        # ── Debug: top 3 candidatos ────────────────────────────────────────────
+        print('\n=== SOPORTE - Top candidatos ===')
+        for rank, c in enumerate(candidates[:3], 1):
+            tag = ' <-- ELEGIDA' if rank == 1 else ''
+            print(f'  #{rank}{tag}')
+            print(f'    p1 : {c["t1"]} @ ${c["y1"]:.2f}  (bar {c["i1"]})')
+            print(f'    p2 : {c["t2"]} @ ${c["y2"]:.2f}  (bar {c["i2"]})')
+            print(f'    span: {c["span_bars"]} barras ({c["span_frac"]:.1%})')
+            print(f'    toques={c["touches"]}  violaciones={c["violations"]}  broken={c["broken"]}')
+            print(f'    score={c["score"]:.3f}  projected=${c["projected"]:.2f}')
+        if len(candidates) >= 2:
+            c1, c2 = candidates[0], candidates[1]
+            reasons = []
+            if c1['span_bars'] > c2['span_bars']:
+                reasons.append(f'span mayor (+{c1["span_bars"]-c2["span_bars"]} barras)')
+            if c1['violations'] < c2['violations']:
+                reasons.append(f'menos violaciones ({c1["violations"]} vs {c2["violations"]})')
+            if c1['touches'] > c2['touches']:
+                reasons.append(f'más toques ({c1["touches"]} vs {c2["touches"]})')
+            print(f'  >> #1 gano vs #2: {", ".join(reasons) or "score global mas alto"}')
+        print('================================\n', flush=True)
+        # ──────────────────────────────────────────────────────────────────────
+
+        b = candidates[0]
+        return {
+            'p1':      {'time': b['t1'], 'price': b['y1'], 'idx': b['i1']},
+            'p2':      {'time': b['t2'], 'price': b['y2'], 'idx': b['i2']},
+            'value':   b['projected'],
+            'slope':   b['slope'],
+            'touches': b['touches'],
+            'status':  'broken' if b['broken'] else 'active',
+            'fuerza':  'alta' if b['touches'] >= 3 else 'media',
+            'is_zone': False,
+        }
+
+    sup_line = _best_support_line(pivot_lows)
+    res_line = _best_line(pivot_highs, 'down', highs)
+
+    return ([sup_line] if sup_line else []), ([res_line] if res_line else [])
 
 
 # ── WMA21 / SMA30 crossover ────────────────────────────────────────────────────
@@ -818,40 +1010,117 @@ def get_early_swing_signal(
     )
 
 
-# ── S/R estático ───────────────────────────────────────────────────────────────
+# ── S/R estático: zonas basadas en pivot HIGH/LOW ────────────────────────────
 
-def get_support_resistance(df: pd.DataFrame, window: int = 15, n: int = 4) -> tuple[list, list]:
+def _pivot_sr_zones(
+    df: pd.DataFrame,
+    window: int = 10,
+    tol: float = 0.008,
+    n: int = 4,
+) -> tuple[list[dict], list[dict]]:
     """
-    Detecta soportes y resistencias: mínimos/máximos locales agrupados.
-    Retorna (supports, resistances) — listas de float ordenadas.
-    Público: llamable desde app.py para mostrar valores como texto.
+    Detecta zonas de S/R estático usando pivots HIGH/LOW.
+
+    Pivot low:  low[i] == min(low[i-window..i+window])  → soporte
+    Pivot high: high[i] == max(high[i-window..i+window]) → resistencia
+
+    Agrupa niveles cercanos (±tol) en zonas y cuenta toques reales (velas).
+    Aplica cambio de polaridad: zonas rotas se marcan con role_reversal=True.
+
+    Returns (sup_zones, res_zones) — listas de dict:
+      {'value': float, 'zone_min': float, 'zone_max': float,
+       'touches': int, 'strength': 'weak'|'medium'|'strong',
+       'role_reversal': bool}
     """
-    closes = df['close'].dropna().tolist()
-    if len(closes) < window * 2 + 1:
+    if len(df) < window * 2 + 1:
         return [], []
 
-    supports, resistances = [], []
-    for i in range(window, len(closes) - window):
-        sl = closes[i - window: i + window + 1]
-        if closes[i] == min(sl):
-            supports.append(closes[i])
-        if closes[i] == max(sl):
-            resistances.append(closes[i])
+    highs  = pd.to_numeric(df['high'],  errors='coerce')
+    lows   = pd.to_numeric(df['low'],   errors='coerce')
+    closes = pd.to_numeric(df['close'], errors='coerce')
+    cur    = float(closes.iloc[-1])
 
-    def cluster(lvls):
-        if not lvls:
+    raw_sup: list[float] = []
+    raw_res: list[float] = []
+
+    for i in range(window, len(df) - window):
+        lo = lows.iat[i]
+        hi = highs.iat[i]
+        if pd.isna(lo) or pd.isna(hi):
+            continue
+        lo_win = lows.iloc[i - window: i + window + 1]
+        hi_win = highs.iloc[i - window: i + window + 1]
+        if lo <= lo_win.min():
+            raw_sup.append(float(lo))
+        if hi >= hi_win.max():
+            raw_res.append(float(hi))
+
+    def _cluster_to_zones(levels: list[float]) -> list[dict]:
+        if not levels:
             return []
-        lvls = sorted(set(lvls))
-        out  = [lvls[0]]
-        for lv in lvls[1:]:
-            if abs(lv - out[-1]) / max(out[-1], 1e-9) > 0.018:
-                out.append(lv)
-        return out
+        levels = sorted(levels)
+        zones: list[list[float]] = [[levels[0]]]
+        for lv in levels[1:]:
+            center = sum(zones[-1]) / len(zones[-1])
+            if abs(lv - center) / max(center, 1e-9) <= tol:
+                zones[-1].append(lv)
+            else:
+                zones.append([lv])
+        result = []
+        for zl in zones:
+            z_min, z_max = min(zl), max(zl)
+            z_mid = (z_min + z_max) / 2
+            # Contar velas que tocaron la zona
+            candle_touches = int(
+                ((highs >= z_min * (1 - tol)) & (lows <= z_max * (1 + tol))).sum()
+            )
+            touches  = max(len(zl), candle_touches)
+            strength = 'strong' if touches >= 3 else 'medium' if touches >= 2 else 'weak'
+            result.append({
+                'value':    z_mid,
+                'zone_min': z_min * (1 - tol / 2),
+                'zone_max': z_max * (1 + tol / 2),
+                'touches':  touches,
+                'strength': strength,
+                'role_reversal': False,
+            })
+        return result
 
-    cur = closes[-1]
-    sup = sorted([s for s in cluster(supports)    if s < cur], reverse=True)[:n]
-    res = sorted([r for r in cluster(resistances) if r > cur])[:n]
-    return sup, res
+    sup_zones = _cluster_to_zones(raw_sup)
+    res_zones = _cluster_to_zones(raw_res)
+
+    # Cambio de polaridad: zona de resistencia rota (ahora debajo) → soporte
+    rr_sup = []
+    for z in res_zones:
+        if z['value'] < cur * 0.998:
+            rr_sup.append({**z, 'role_reversal': True})
+    # Cambio de polaridad: zona de soporte rota (ahora encima) → resistencia
+    rr_res = []
+    for z in sup_zones:
+        if z['value'] > cur * 1.002:
+            rr_res.append({**z, 'role_reversal': True})
+
+    final_sup = sorted(
+        [z for z in sup_zones if z['value'] < cur * 0.998] + rr_sup,
+        key=lambda x: x['value'], reverse=True,
+    )[:n]
+
+    final_res = sorted(
+        [z for z in res_zones if z['value'] > cur * 1.002] + rr_res,
+        key=lambda x: x['value'],
+    )[:n]
+
+    return final_sup, final_res
+
+
+def get_support_resistance(df: pd.DataFrame, window: int = 10, n: int = 4) -> tuple[list, list]:
+    """
+    Detecta soportes y resistencias estáticos usando pivots HIGH/LOW.
+    Retorna (supports, resistances) — listas de float (midpoints de zona).
+    Público: llamable desde app.py y estrategias para verificar proximidad.
+    """
+    sup_z, res_z = _pivot_sr_zones(df, window=window, n=n)
+    return [z['value'] for z in sup_z], [z['value'] for z in res_z]
 
 
 def price_chart(df: pd.DataFrame, simbolo: str = '', tf: str = '3M',
@@ -874,8 +1143,10 @@ def price_chart(df: pd.DataFrame, simbolo: str = '', tf: str = '3M',
     Flags show_* permiten activar/desactivar cada capa individualmente.
     candle_freq: 'D'/'W'/'M'/'Y' — se usa para ajustar ticks del eje X.
     """
-    sup, res = (get_support_resistance(df) if (len(df) > 40 and show_static_sr)
-                else ([], []))
+    # Zonas estáticas (necesitamos los dicts completos para renderizar hrect)
+    sup_zones, res_zones = (
+        _pivot_sr_zones(df) if (len(df) > 40 and show_static_sr) else ([], [])
+    )
 
     n_rows     = 2 if show_volume else 1
     row_h      = [0.78, 0.22] if show_volume else [1.0]
@@ -887,52 +1158,63 @@ def price_chart(df: pd.DataFrame, simbolo: str = '', tf: str = '3M',
 
     x0, x1 = df['fecha'].iloc[0], df['fecha'].iloc[-1]
 
-    # ── S/R estático (puntos existentes — sin cambios) ────────────────────────
-    for s in sup:
-        fig.add_shape(type='line', x0=x0, x1=x1,
-                      y0=s, y1=s, line=dict(color=C['green'], width=2, dash='dot'),
-                      row=1, col=1)
-    for r in res:
-        fig.add_shape(type='line', x0=x0, x1=x1,
-                      y0=r, y1=r, line=dict(color=C['red'], width=2, dash='dot'),
-                      row=1, col=1)
+    # ── S/R estático: zonas coloreadas (hrect) ────────────────────────────────
+    for z in sup_zones:
+        alpha  = 0.18 if z['strength'] == 'strong' else 0.10
+        border = C['green'] if not z.get('role_reversal') else C['orange']
+        fig.add_shape(
+            type='rect', x0=x0, x1=x1,
+            y0=z['zone_min'], y1=z['zone_max'],
+            fillcolor=f"rgba(16,185,129,{alpha})",
+            line=dict(color=border, width=0.8),
+            row=1, col=1,
+        )
 
-    # ── S/R dinámico (líneas dash semitransparentes, zonas sombreadas) ────────
-    _MA_LABELS = {'SMA200', 'SMA50', 'EMA20'}  # MAs ya aparecen como líneas de precio
-    _DYN_S = 'rgba(16,185,129,0.6)'             # verde semitransparente
-    _DYN_R = 'rgba(239,68,68,0.6)'              # rojo semitransparente
+    for z in res_zones:
+        alpha  = 0.18 if z['strength'] == 'strong' else 0.10
+        border = C['red'] if not z.get('role_reversal') else C['orange']
+        fig.add_shape(
+            type='rect', x0=x0, x1=x1,
+            y0=z['zone_min'], y1=z['zone_max'],
+            fillcolor=f"rgba(239,68,68,{alpha})",
+            line=dict(color=border, width=0.8),
+            row=1, col=1,
+        )
+
+    # ── S/R dinámico: trendlines diagonales (pivot lows/highs) ───────────────
+    _DYN_S = 'rgba(16,185,129,0.75)'
+    _DYN_R = 'rgba(239,68,68,0.75)'
 
     for item in (dyn_sup or []):
-        if item['label'] in _MA_LABELS:
-            continue                             # ya visible como MA line
-        lw = 1.2 if item['fuerza'] in ('alta', 'muy alta') else 0.7
-        if item['is_zone']:
-            fig.add_shape(type='rect', x0=x0, x1=x1,
-                          y0=item['vmin'], y1=item['vmax'],
-                          fillcolor='rgba(16,185,129,0.06)',
-                          line=dict(color=_DYN_S, width=0.5),
-                          row=1, col=1)
+        if item.get('status') == 'broken':
+            color, dash = 'rgba(16,185,129,0.35)', 'dot'
         else:
-            fig.add_shape(type='line', x0=x0, x1=x1,
-                          y0=item['value'], y1=item['value'],
-                          line=dict(color=_DYN_S, width=lw, dash='dash'),
-                          row=1, col=1)
+            color, dash = _DYN_S, 'dash'
+        lw = 1.5 if item.get('fuerza') == 'alta' else 1.0
+        # Línea desde p1 hasta el último bar (proyectada)
+        p1 = item['p1']
+        fig.add_shape(
+            type='line',
+            x0=p1['time'], y0=p1['price'],
+            x1=x1,        y1=item['value'],
+            line=dict(color=color, width=lw, dash=dash),
+            row=1, col=1,
+        )
 
     for item in (dyn_res or []):
-        if item['label'] in _MA_LABELS:
-            continue
-        lw = 1.2 if item['fuerza'] in ('alta', 'muy alta') else 0.7
-        if item['is_zone']:
-            fig.add_shape(type='rect', x0=x0, x1=x1,
-                          y0=item['vmin'], y1=item['vmax'],
-                          fillcolor='rgba(239,68,68,0.06)',
-                          line=dict(color=_DYN_R, width=0.5),
-                          row=1, col=1)
+        if item.get('status') == 'broken':
+            color, dash = 'rgba(239,68,68,0.35)', 'dot'
         else:
-            fig.add_shape(type='line', x0=x0, x1=x1,
-                          y0=item['value'], y1=item['value'],
-                          line=dict(color=_DYN_R, width=lw, dash='dash'),
-                          row=1, col=1)
+            color, dash = _DYN_R, 'dash'
+        lw = 1.5 if item.get('fuerza') == 'alta' else 1.0
+        p1 = item['p1']
+        fig.add_shape(
+            type='line',
+            x0=p1['time'], y0=p1['price'],
+            x1=x1,        y1=item['value'],
+            line=dict(color=color, width=lw, dash=dash),
+            row=1, col=1,
+        )
 
     # ── Candlestick ───────────────────────────────────────────────────────────
     fig.add_trace(go.Candlestick(

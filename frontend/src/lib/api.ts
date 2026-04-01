@@ -64,6 +64,74 @@ export interface MarketContext {
   market_regime:     number | null
 }
 
+export interface LongtermSupport {
+  symbol:         string
+  timeframe_used: string
+  status:         'ACTIVE' | 'TESTING' | 'BROKEN' | 'NO_SUPPORT'
+  p1?:            { fecha: string; value: number } | null
+  p2?:            { fecha: string; value: number } | null
+  line_points:    { fecha: string; value: number }[]
+  current_value?: number | null
+  distance_pct?:  number | null
+  bars_of_data?:  number
+  touch_count?:   number
+  reading?:       string
+  // Resistencia estructural (v2)
+  resistance_status?:          'ACTIVE' | 'TESTING' | 'BROKEN' | 'NO_SUPPORT'
+  resistance_p1?:              { fecha: string; value: number } | null
+  resistance_p2?:              { fecha: string; value: number } | null
+  resistance_line_points?:     { fecha: string; value: number }[]
+  resistance_current_value?:   number | null
+  resistance_distance_pct?:    number | null
+  resistance_touch_count?:     number
+  resistance_reading?:         string
+  // Active support (v3)
+  active_status?:              'ACTIVE' | 'TESTING' | 'BROKEN' | 'NO_SUPPORT'
+  active_p1?:                  { fecha: string; value: number } | null
+  active_p2?:                  { fecha: string; value: number } | null
+  active_line_points?:         { fecha: string; value: number }[]
+  active_current_value?:       number | null
+  active_distance_pct?:        number | null
+  active_touch_count?:         number
+  active_reading?:             string
+  // Active resistance (v3)
+  active_resistance_status?:          'ACTIVE' | 'TESTING' | 'BROKEN' | 'NO_SUPPORT'
+  active_resistance_p1?:              { fecha: string; value: number } | null
+  active_resistance_p2?:              { fecha: string; value: number } | null
+  active_resistance_line_points?:     { fecha: string; value: number }[]
+  active_resistance_current_value?:   number | null
+  active_resistance_distance_pct?:    number | null
+  active_resistance_touch_count?:     number
+  active_resistance_reading?:         string
+}
+
+export interface HorizontalZone {
+  zone_low:        number
+  zone_high:       number
+  center:          number
+  total_touches:   number
+  recent_touches:  number
+  distance_pct:    number
+  last_touch:      string
+  first_touch:     string
+  score:           number
+  type:            'support' | 'resistance'
+  rank:            'primary' | 'secondary' | 'tertiary'
+  pivots:          { fecha: string; price: number }[]
+}
+
+export interface HorizontalZonesResponse {
+  symbol:           string
+  fecha:            string
+  current_price:    number | null
+  support_zones:    HorizontalZone[]
+  resistance_zones: HorizontalZone[]
+  timeframe:        string
+  status:           string
+  pivot_lows_found:  number
+  pivot_highs_found: number
+}
+
 export interface WmaCrossItem {
   accion_id: number
   simbolo:   string
@@ -96,6 +164,9 @@ export const api = {
   ohlcv: (id: number, days = 400) =>
     get<{ candles: Candle[] }>(`/assets/${id}/ohlcv?days=${days}`),
 
+  ohlcvExtended: (id: number, tf: 'D' | 'W' | 'M' = 'D') =>
+    get<{ candles: Candle[]; tf: string }>(`/assets/${id}/ohlcv-extended?tf=${tf}`),
+
   indicators: (id: number, days = 365) =>
     get<{ indicators: Indicator[] }>(`/assets/${id}/indicators?days=${days}`),
 
@@ -106,4 +177,10 @@ export const api = {
 
   marketContext: () =>
     get<MarketContext>('/market-context'),
+
+  longtermSupport: (id: number, horizon = 'long_term') =>
+    get<LongtermSupport>(`/assets/${id}/longterm-support?horizon=${horizon}`),
+
+  horizontalZones: (id: number) =>
+    get<HorizontalZonesResponse>(`/assets/${id}/horizontal-zones`),
 }

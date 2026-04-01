@@ -10,11 +10,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pymysql
 import pandas as pd
 
-BOLSA_CFG = dict(
-    host='localhost', user='root', password='123456', db='bolsa',
-    charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor,
-    ssl={'ssl_disabled': False},
-)
+from config import DB_CONFIG as _DB_CFG
+
+BOLSA_CFG = _DB_CFG   # unificado — kept for backwards compat within this file
+TA_CFG    = _DB_CFG
 
 USA_MARKETS = ('NASDAQ', 'NYSE', 'NYSE_AMERICAN', 'NYSE_ARCA', 'CBOE_BZX')
 
@@ -176,9 +175,17 @@ def get_asset_table(
                           {s_clause}
                     ) _sub
                     WHERE _rn = 1
-                    ORDER BY ABS(pct_cambio) DESC, simbolo
+                    ORDER BY
+                        CASE WHEN %s IS NOT NULL THEN
+                            CASE
+                                WHEN UPPER(simbolo) = UPPER(%s)        THEN 0
+                                WHEN UPPER(simbolo) LIKE UPPER(%s)     THEN 1
+                                ELSE 2
+                            END
+                        END ASC,
+                        ABS(pct_cambio) DESC, simbolo
                     LIMIT %s OFFSET %s
-                """, base_params + [page_size, page * page_size])
+                """, base_params + [search, search or '', (search + '%') if search else '', page_size, page * page_size])
                 return cur.fetchall(), total
 
             # ── Modo con filtro explícito de mercado ──────────────────────────
@@ -203,7 +210,7 @@ def get_asset_table(
                   AND v1.precio_cierre > 0.5
                   AND v2.precio_cierre > 0.5
                   {m_clause} {s_clause}
-            """, [prev, last] + opt_market + opt_search)
+            """, [last, prev] + opt_market + opt_search)
             total = cur.fetchone()['n']
 
             cur.execute(f"""
@@ -220,10 +227,64 @@ def get_asset_table(
                   AND v1.precio_cierre > 0.5
                   AND v2.precio_cierre > 0.5
                   {m_clause} {s_clause}
-                ORDER BY ABS(v1.precio_cierre / v2.precio_cierre - 1) DESC, a.simbolo
+                ORDER BY
+                    CASE WHEN %s IS NOT NULL THEN
+                        CASE
+                            WHEN UPPER(a.simbolo) = UPPER(%s)    THEN 0
+                            WHEN UPPER(a.simbolo) LIKE UPPER(%s) THEN 1
+                            ELSE 2
+                        END
+                    END ASC,
+                    ABS(v1.precio_cierre / v2.precio_cierre - 1) DESC, a.simbolo
                 LIMIT %s OFFSET %s
-            """, [prev, last] + opt_market + opt_search + [page_size, page * page_size])
+            """, [last, prev] + opt_market + opt_search + [search, search or '', (search + '%') if search else '', page_size, page * page_size])
             return cur.fetchall(), total
+
+
+def _get_universe_matches(search: str) -> list[dict]:
+    """Busca en trading_assist.asset_master + price_history (símbolos del universo)."""
+    if not search:
+        return []
+    try:
+        with pymysql.connect(**TA_CFG) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT MAX(fecha) AS d FROM price_history")
+                last = cur.fetchone()['d']
+                if not last:
+                    return []
+                cur.execute("SELECT MAX(fecha) AS d FROM price_history WHERE fecha < %s", [last])
+                prev = cur.fetchone()['d']
+                if not prev:
+                    return []
+
+                cur.execute("""
+                    SELECT
+                        NULL        AS accion_id,
+                        am.simbolo,
+                        am.nombre,
+                        CASE WHEN am.market = 'US' THEN 'NYSE' ELSE am.market END AS mercado,
+                        ph1.close   AS precio,
+                        ROUND((ph1.close / ph2.close - 1) * 100, 2) AS pct_cambio
+                    FROM asset_master am
+                    JOIN price_history ph1
+                      ON ph1.simbolo = am.simbolo AND ph1.fecha = %s
+                    JOIN price_history ph2
+                      ON ph2.simbolo = am.simbolo AND ph2.fecha = %s
+                    WHERE am.activo = 1
+                      AND (am.simbolo LIKE %s OR am.nombre LIKE %s)
+                    ORDER BY
+                        CASE
+                            WHEN UPPER(am.simbolo) = UPPER(%s)    THEN 0
+                            WHEN UPPER(am.simbolo) LIKE UPPER(%s) THEN 1
+                            ELSE 2
+                        END ASC,
+                        ABS(ph1.close / ph2.close - 1) DESC
+                """, [last, prev,
+                      f'%{search}%', f'%{search}%',
+                      search, search + '%'])
+                return cur.fetchall()
+    except Exception:
+        return []
 
 
 def get_available_markets() -> list[str]:
@@ -290,6 +351,42 @@ def get_asset_prices(accion_id: int, days: int = 400) -> pd.DataFrame:
     # Convertir fecha a string 'YYYY-MM-DD' para que Plotly la interprete bien
     df['fecha'] = df['fecha'].astype(str)
 
+    return df
+
+
+def get_asset_prices_by_symbol(symbol: str, days: int = 400) -> pd.DataFrame:
+    """
+    OHLCV desde trading_assist.price_history (datos Yahoo Finance completos).
+    Incluye sma50, ema20, sma200 calculados en Python.
+    Usar para símbolos del universo donde bolsa.valorhistoricoaccion puede tener
+    high/low nulos.
+    """
+    with pymysql.connect(**TA_CFG) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT fecha, open, high, low, close, volume
+                FROM price_history
+                WHERE simbolo = %s
+                ORDER BY fecha DESC
+                LIMIT %s
+            """, [symbol, days])
+            rows = cur.fetchall()
+
+    if not rows:
+        return pd.DataFrame(columns=['fecha','open','high','low','close','volume',
+                                      'sma50','ema20','sma200'])
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values('fecha').reset_index(drop=True)
+
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    df['sma50']  = df['close'].rolling(50, min_periods=20).mean()
+    df['ema20']  = df['close'].ewm(span=20, adjust=False).mean()
+    df['sma200'] = df['close'].rolling(200, min_periods=100).mean()
+
+    df['fecha'] = df['fecha'].astype(str)
     return df
 
 

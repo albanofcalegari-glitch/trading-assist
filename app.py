@@ -11,6 +11,9 @@ import queries    as q
 import charts     as ch
 import components as cmp
 
+from config import UNIVERSE as _UNIVERSE
+_UNIVERSE_SET = set(_UNIVERSE)
+
 # ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -106,8 +109,12 @@ def cached_markets():
 
 @st.cache_data(ttl=300)
 def cached_prices(accion_id):
-    # Siempre fetcheamos 400 días; el slicing al timeframe se hace en la UI
     return q.get_asset_prices(accion_id, 400)
+
+@st.cache_data(ttl=300)
+def cached_prices_by_symbol(simbolo):
+    # Para símbolos del universo: OHLCV completo desde trading_assist.price_history
+    return q.get_asset_prices_by_symbol(simbolo, 400)
 
 @st.cache_data(ttl=300)
 def cached_indicators(accion_id):
@@ -648,7 +655,7 @@ def _find_sr_overlaps(static_vals: list, dyn_items: list, tol: float = 0.012) ->
         for d in dyn_items:
             if abs(sv - d['value']) / max(abs(sv), 1e-9) <= tol:
                 msgs.append(
-                    f'${sv:,.2f} (estático) ≈ {d["label"]} ${d["value"]:,.2f} (dinámico)'
+                    f'${sv:,.2f} (estático) ≈ ${d["value"]:,.2f} (dinámico)'
                 )
     return msgs
 
@@ -972,7 +979,10 @@ def page_detail():
         st.rerun()
 
     info      = cached_info(accion_id)
-    prices_df = cached_prices(accion_id)   # 400 días completos
+    if simbolo and simbolo in _UNIVERSE_SET:
+        prices_df = cached_prices_by_symbol(simbolo)
+    else:
+        prices_df = cached_prices(accion_id)
     indic_df  = cached_indicators(accion_id)
 
     nombre  = (info.get('nombre')  or '') if info else ''
@@ -1061,20 +1071,32 @@ def page_detail():
     candle_freq = _TF_CHART.get(chart_tf_label, 'D')
     cur_tf      = '1A'   # para ticks diarios
 
-    # Flags derivados de la estrategia seleccionada
-    _flags        = _STRAT_FLAGS.get(chart_strategy, _STRAT_FLAGS['(Seleccionar)'])
-    ind_sma50     = _flags['sma50']
-    ind_sma200    = _flags['sma200']
-    ind_ema20     = _flags['ema20']
-    ind_volume    = True   # siempre
-    ind_dyn_sr    = _flags['dyn_sr']
-    ind_static_sr = _flags['static_sr']
-    ind_wma6      = _flags['wma6']
-    ind_wma30     = _flags['wma30']
-    show_wma      = _flags['wma']        and (candle_freq == 'D')
-    show_swing    = (_flags['wma6'] or _flags['wma30'] or _flags['swing']) and (candle_freq == 'D')
-    _do_buy_conf  = _flags['buy_conf']   and (candle_freq == 'D')
-    _do_early_sw  = _flags['early_swing'] and (candle_freq == 'D')
+    # Flags base derivados de la estrategia seleccionada
+    _flags = _STRAT_FLAGS.get(chart_strategy, _STRAT_FLAGS['(Seleccionar)'])
+
+    # ── Toggles de indicadores ────────────────────────────────────────────────
+    st.markdown(
+        '<div style="margin:6px 0 2px;color:#475569;font-size:0.68rem;'
+        'text-transform:uppercase;letter-spacing:0.07em">Indicadores</div>',
+        unsafe_allow_html=True,
+    )
+    _t = st.columns(10)
+    ind_sma50     = _t[0].checkbox('SMA 50',    value=_flags['sma50'],     key='tog_sma50')
+    ind_sma200    = _t[1].checkbox('SMA 200',   value=_flags['sma200'],    key='tog_sma200')
+    ind_ema20     = _t[2].checkbox('EMA 20',    value=_flags['ema20'],     key='tog_ema20')
+    show_wma_tog  = _t[3].checkbox('WMA 21',    value=_flags['wma'],       key='tog_wma21')
+    ind_wma6      = _t[4].checkbox('WMA 6',     value=_flags['wma6'],      key='tog_wma6')
+    ind_wma30     = _t[5].checkbox('WMA 30',    value=_flags['wma30'],     key='tog_wma30')
+    ind_dyn_sr    = _t[6].checkbox('S/R Din.',  value=_flags['dyn_sr'],    key='tog_dyn_sr')
+    ind_static_sr = _t[7].checkbox('S/R Est.',  value=_flags['static_sr'], key='tog_static_sr')
+    _do_buy_conf  = _t[8].checkbox('Buy Conf.', value=_flags['buy_conf'],  key='tog_buy_conf')
+    _do_early_sw  = _t[9].checkbox('Early SW',  value=_flags['early_swing'], key='tog_early_sw')
+
+    ind_volume    = True
+    show_wma      = show_wma_tog  and (candle_freq == 'D')
+    show_swing    = (ind_wma6 or ind_wma30 or _flags['swing']) and (candle_freq == 'D')
+    _do_buy_conf  = _do_buy_conf  and (candle_freq == 'D')
+    _do_early_sw  = _do_early_sw  and (candle_freq == 'D')
 
     # ── Datos fuente ──────────────────────────────────────────────────────────
     if candle_freq == 'D':

@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { ArrowLeft, TrendingUp, Activity, BarChart2, Tv2 } from 'lucide-react'
-import { api, type AssetDetail as IAsset, type Candle, type Indicator } from '@/lib/api'
+import { api, type AssetDetail as IAsset, type Candle, type Indicator, type LongtermSupport, type HorizontalZonesResponse } from '@/lib/api'
 import { fmtPrice, fmtPct, fmtVol, pctClass, fmt, calcRSI } from '@/lib/utils'
-import PriceChart, { buildIndicatorLines, type TrendlineStatus } from '@/components/detail/PriceChart'
+import PriceChart, { buildIndicatorLines, type TrendlineStatus, type LongtermSupportLayer, type HorizontalZoneData } from '@/components/detail/PriceChart'
 import { SemaphoreBadge } from '@/components/shared/Semaphore'
 import { detectDivergences, type Divergence } from '@/lib/divergence'
 import RSIPanel from '@/components/detail/RSIPanel'
@@ -43,19 +43,43 @@ export default function AssetDetail() {
     resistance: TrendlineStatus | null
   }>({ support: null, resistance: null })
   const [chartMode,           setChartMode]           = useState<'local' | 'tv'>('local')
-
+  const [longtermSupport,  setLongtermSupport]  = useState<LongtermSupport | null>(null)
+  const [midtermSupport,   setMidtermSupport]   = useState<LongtermSupport | null>(null)
+  const [shorttermSupport, setShorttermSupport] = useState<LongtermSupport | null>(null)
+  const [showLongterm,     setShowLongterm]     = useState(true)
+  const [showMidterm,      setShowMidterm]      = useState(true)
+  const [showShortterm,    setShowShortterm]    = useState(false)
+  const [showActiveLayers, setShowActiveLayers] = useState(true)
+  const [hzonesData,       setHzonesData]       = useState<HorizontalZonesResponse | null>(null)
+  const [showHzones,       setShowHzones]       = useState(true)
   useEffect(() => {
     if (!accionId) return
     setLoading(true)
     Promise.allSettled([
       api.asset(accionId),
-      api.ohlcv(accionId, 1800),
+      api.ohlcvExtended(accionId, 'D'),   // histórico completo diario (20 años) — fuente única
       api.indicators(accionId, 365),
-    ]).then(([a, o, ind]) => {
-      if (a.status === 'fulfilled') setAsset(a.value)
-      if (o.status === 'fulfilled') setCandles(o.value.candles)
+    ]).then(([a, od, ind]) => {
+      if (a.status === 'fulfilled')   setAsset(a.value)
+      if (od.status === 'fulfilled')  setCandles(od.value.candles)
       if (ind.status === 'fulfilled') setIndicators(ind.value.indicators)
     }).finally(() => setLoading(false))
+
+    // Fetch soportes estructurales en paralelo (no bloquean el render del chart)
+    Promise.allSettled([
+      api.longtermSupport(accionId, 'long_term'),
+      api.longtermSupport(accionId, 'mid_term'),
+      api.longtermSupport(accionId, 'short_term'),
+    ]).then(([lt, mt, st]) => {
+      setLongtermSupport(lt.status === 'fulfilled' ? lt.value : null)
+      setMidtermSupport(mt.status === 'fulfilled' ? mt.value : null)
+      setShorttermSupport(st.status === 'fulfilled' ? st.value : null)
+    })
+
+    // Fetch zonas horizontales
+    api.horizontalZones(accionId)
+      .then(data => setHzonesData(data))
+      .catch(() => setHzonesData(null))
   }, [accionId])
 
   const rsiValues   = candles.length ? calcRSI(candles.map(c => Number(c.close))) : []
@@ -65,6 +89,58 @@ export default function AssetDetail() {
   const currentRsiCalc = rsiValues.length ? (rsiValues[rsiValues.length - 1] ?? null) : null
 
   const indicatorLines = buildIndicatorLines(candles, strategy)
+
+  function toLayer(s: LongtermSupport | null): LongtermSupportLayer | null {
+    if (!s) return null
+    return { line_points: s.line_points, status: s.status, timeframe_used: s.timeframe_used }
+  }
+  function toResistanceLayer(s: LongtermSupport | null): LongtermSupportLayer | null {
+    if (!s || !s.resistance_line_points?.length) return null
+    return {
+      line_points:    s.resistance_line_points,
+      status:         s.resistance_status ?? 'NO_SUPPORT',
+      timeframe_used: s.timeframe_used,
+    }
+  }
+  function toActiveLayer(s: LongtermSupport | null): LongtermSupportLayer | null {
+    if (!s || !s.active_line_points?.length) return null
+    return {
+      line_points:    s.active_line_points,
+      status:         s.active_status ?? 'NO_SUPPORT',
+      timeframe_used: s.timeframe_used,
+    }
+  }
+  function toActiveResistanceLayer(s: LongtermSupport | null): LongtermSupportLayer | null {
+    if (!s || !s.active_resistance_line_points?.length) return null
+    return {
+      line_points:    s.active_resistance_line_points,
+      status:         s.active_resistance_status ?? 'NO_SUPPORT',
+      timeframe_used: s.timeframe_used,
+    }
+  }
+  const longtermLayer           = showLongterm  ? toLayer(longtermSupport)  : null
+  const longtermResistanceLayer = showLongterm  ? toResistanceLayer(longtermSupport) : null
+  const midtermLayer            = showMidterm   ? toLayer(midtermSupport)   : null
+  const shorttermLayer          = showShortterm ? toLayer(shorttermSupport) : null
+  const activeLayer             = showActiveLayers ? toActiveLayer(longtermSupport) : null
+  const activeResistanceLayer   = showActiveLayers ? toActiveResistanceLayer(longtermSupport) : null
+
+  // Zonas horizontales: unir soporte + resistencia en un solo array para el chart
+  const horizontalZones: HorizontalZoneData[] | null = showHzones && hzonesData?.status === 'OK'
+    ? [
+        ...hzonesData.support_zones.map(z => ({
+          zone_low: z.zone_low, zone_high: z.zone_high, center: z.center,
+          total_touches: z.total_touches, recent_touches: z.recent_touches,
+          score: z.score, type: 'support' as const, rank: z.rank,
+        })),
+        ...hzonesData.resistance_zones.map(z => ({
+          zone_low: z.zone_low, zone_high: z.zone_high, center: z.center,
+          total_touches: z.total_touches, recent_touches: z.recent_touches,
+          score: z.score, type: 'resistance' as const, rank: z.rank,
+        })),
+      ]
+    : null
+
 
   // Último indicador disponible
   const lastInd = indicators.length ? indicators[indicators.length - 1] : null
@@ -233,6 +309,69 @@ export default function AssetDetail() {
           )}
         </div>
 
+        {/* Soportes estructurales (motor long-term) */}
+        <div className="flex items-center gap-2">
+          <StructuralToggle
+            label="L"
+            title="Soporte largo plazo"
+            active={showLongterm}
+            activeColor="#5b6cf6"
+            support={longtermSupport}
+            onToggle={() => setShowLongterm(v => !v)}
+          />
+          <StructuralToggle
+            label="M"
+            title="Soporte medio plazo"
+            active={showMidterm}
+            activeColor="#60a5fa"
+            support={midtermSupport}
+            onToggle={() => setShowMidterm(v => !v)}
+          />
+          <StructuralToggle
+            label="C"
+            title="Soporte corto plazo"
+            active={showShortterm}
+            activeColor="#22d3ee"
+            support={shorttermSupport}
+            onToggle={() => setShowShortterm(v => !v)}
+          />
+          {/* Toggle capas activas (soporte operativo + resistencia operativa) */}
+          <button
+            title="Soporte/Resistencia operativa activa (ultimos 7 anos)"
+            className={`px-2.5 py-1.5 text-xs rounded-md border transition-colors font-mono font-semibold ${
+              showActiveLayers
+                ? 'border-transparent text-white'
+                : 'border-border text-text-muted hover:text-text-secondary'
+            }`}
+            style={showActiveLayers ? { backgroundColor: '#84cc16', borderColor: '#84cc16' } : {}}
+            onClick={() => setShowActiveLayers(v => !v)}
+          >
+            A
+          </button>
+          {showActiveLayers && (
+            <span className="text-2xs text-text-muted font-mono">activo</span>
+          )}
+
+          {/* Toggle zonas horizontales */}
+          <button
+            title="Zonas horizontales de soporte/resistencia"
+            className={`px-2.5 py-1.5 text-xs rounded-md border transition-colors font-mono font-semibold ${
+              showHzones
+                ? 'border-transparent text-white'
+                : 'border-border text-text-muted hover:text-text-secondary'
+            }`}
+            style={showHzones ? { backgroundColor: '#26a69a', borderColor: '#26a69a' } : {}}
+            onClick={() => setShowHzones(v => !v)}
+          >
+            Z
+          </button>
+          {showHzones && hzonesData?.status === 'OK' && (
+            <span className="text-2xs text-text-muted font-mono">
+              {hzonesData.support_zones.length}S/{hzonesData.resistance_zones.length}R
+            </span>
+          )}
+        </div>
+
         {/* Leyenda de líneas activas */}
         {indicatorLines.length > 0 && (
           <div className="flex items-center gap-3 ml-2">
@@ -291,6 +430,13 @@ export default function AssetDetail() {
             debugSegmentOnly={false}
             height={480}
             onTrendlineResult={(sup, res) => setTrendlineStatus({ support: sup, resistance: res })}
+            longtermLayer={longtermLayer}
+            longtermResistanceLayer={longtermResistanceLayer}
+            midtermLayer={midtermLayer}
+            shorttermLayer={shorttermLayer}
+            activeLayer={activeLayer}
+            activeResistanceLayer={activeResistanceLayer}
+            horizontalZones={horizontalZones}
           />
         ) : (
           <div className="h-80 flex items-center justify-center">
@@ -344,7 +490,7 @@ function tvSymbol(asset: IAsset): string {
 
 const TRENDLINE_BADGE: Record<TrendlineStatus, { label: string; cls: string }> = {
   ACTIVE_SUPPORT:           { label: 'Activo',          cls: 'text-[#26a69a] bg-[#26a69a]/10 border-[#26a69a]/30' },
-  TESTING_SUPPORT:          { label: 'En test',         cls: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30' },
+  TESTING_SUPPORT:          { label: 'En test',         cls: 'text-green-400 bg-green-400/10 border-green-400/30' },
   BROKEN_SUPPORT:           { label: 'Roto',            cls: 'text-red-400 bg-red-400/10 border-red-400/30' },
   NO_VALID_ACTIVE_SUPPORT:  { label: 'Sin estructura',  cls: 'text-text-muted bg-surface border-border' },
   ACTIVE_RESISTANCE:        { label: 'Activa',          cls: 'text-orange-400 bg-orange-400/10 border-orange-400/30' },
@@ -359,6 +505,56 @@ function TrendlineBadge({ status }: { status: TrendlineStatus }) {
     <span className={`text-xs font-medium px-2 py-0.5 rounded border ${cls}`}>
       {label}
     </span>
+  )
+}
+
+// ── StructuralToggle ───────────────────────────────────────────────────────────
+
+const STRUCTURAL_STATUS: Record<string, { label: string; cls: string }> = {
+  ACTIVE:     { label: 'Activo',   cls: 'text-up bg-up/10 border-up/30' },
+  TESTING:    { label: 'Test',     cls: 'text-warn bg-warn/10 border-warn/30' },
+  BROKEN:     { label: 'Roto',     cls: 'text-down bg-down/10 border-down/30' },
+  NO_SUPPORT: { label: 'Sin estr', cls: 'text-text-muted bg-surface border-border' },
+}
+
+function StructuralToggle({
+  label, title, active, activeColor, support, onToggle,
+}: {
+  label:       string
+  title:       string
+  active:      boolean
+  activeColor: string
+  support:     LongtermSupport | null
+  onToggle:    () => void
+}) {
+  const st = support ? (STRUCTURAL_STATUS[support.status] ?? STRUCTURAL_STATUS.NO_SUPPORT) : null
+  const tf = support?.timeframe_used ?? null
+
+  return (
+    <div className="flex items-center gap-1">
+      <button
+        title={title}
+        className={`px-2.5 py-1.5 text-xs rounded-md border transition-colors font-mono font-semibold ${
+          active
+            ? 'border-transparent text-white'
+            : 'border-border text-text-muted hover:text-text-secondary'
+        }`}
+        style={active ? { backgroundColor: activeColor, borderColor: activeColor } : {}}
+        onClick={onToggle}
+      >
+        {label}
+      </button>
+      {/* tf badge */}
+      {tf && (
+        <span className="text-2xs text-text-muted font-mono">{tf}</span>
+      )}
+      {/* status badge — solo cuando el toggle está activo */}
+      {active && st && support?.status !== 'NO_SUPPORT' && (
+        <span className={`text-2xs font-medium px-1.5 py-0.5 rounded border ${st.cls}`}>
+          {st.label}
+        </span>
+      )}
+    </div>
   )
 }
 
