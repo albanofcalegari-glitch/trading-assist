@@ -71,11 +71,14 @@ export function resampleOHLCV(candles: Candle[], freq: 'W' | 'M'): Candle[] {
   let bucket: Candle[] = []
 
   const key = (d: string) => {
-    const dt = new Date(d)
-    if (freq === 'M') return `${dt.getFullYear()}-${dt.getMonth()}`
-    // Semana: número de semana ISO
-    const tmp = new Date(dt)
-    tmp.setHours(0, 0, 0, 0)
+    // Parsear como LOCAL time — new Date("YYYY-MM-DD") da UTC midnight,
+    // que en zonas horarias negativas (ej. UTC-3 Argentina) desplaza
+    // getDay() al día anterior, rompiendo los límites de semana ISO.
+    const [yr, mo, dy] = d.split('-').map(Number)
+    const dt = new Date(yr, mo - 1, dy)
+    if (freq === 'M') return `${yr}-${mo}`
+    // Semana ISO: semanas comienzan en lunes
+    const tmp = new Date(yr, mo - 1, dy)
     tmp.setDate(tmp.getDate() + 4 - (tmp.getDay() || 7))
     const y = tmp.getFullYear()
     const w = Math.ceil(((tmp.getTime() - new Date(y, 0, 1).getTime()) / 86400000 + 1) / 7)

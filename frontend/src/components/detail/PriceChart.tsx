@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import {
-  createChart, ColorType, CrosshairMode, LineStyle, PriceScaleMode,
+  createChart, ColorType, LineStyle, PriceScaleMode,
   type IChartApi, type CandlestickSeriesOptions,
 } from 'lightweight-charts'
 import { calcWMA, calcSMA, resampleOHLCV, type Candle } from '@/lib/utils'
@@ -393,7 +393,7 @@ export default function PriceChart({
   candles, freq, indicators,
   showTrendline = true, showResistanceTrend = true,
   debugSegmentOnly = false,
-  height = 440,
+  height = 550,
   onTrendlineResult,
   longtermLayer           = null,
   longtermResistanceLayer = null,
@@ -422,15 +422,6 @@ export default function PriceChart({
                : freq === 'W' ? resampleOHLCV(candles, 'W')
                :                resampleOHLCV(candles, 'M')
 
-    // ── [DATA CHECK] ──────────────────────────────────────────────────────────
-    console.log(
-      '[DATA CHECK]\n' +
-      `timeframe=${freq}\n` +
-      `candles_count=${data.length}\n` +
-      `first_date=${data[0]?.fecha ?? 'n/a'}\n` +
-      `last_date=${data[data.length - 1]?.fecha ?? 'n/a'}`
-    )
-
     // ── Chart — opciones idénticas al look TradingView dark ───────────────────
     const chart = createChart(el, {
       width:  el.clientWidth,
@@ -443,11 +434,11 @@ export default function PriceChart({
         fontSize:   12,
       },
       grid: {
-        vertLines: { color: 'rgba(42,46,57,0.4)', style: 0 },
-        horzLines: { color: 'rgba(42,46,57,0.4)', style: 0 },
+        vertLines: { color: 'rgba(42,46,57,0.15)' },
+        horzLines: { color: 'rgba(42,46,57,0.15)' },
       },
       crosshair: {
-        mode:     CrosshairMode.Normal,
+        mode: 0,
         vertLine: {
           color:                COLORS.xhair,
           width:                1,
@@ -461,22 +452,39 @@ export default function PriceChart({
           labelBackgroundColor: COLORS.border,
         },
       },
+      handleScroll: {
+        mouseWheel:      true,
+        pressedMouseMove: true,
+      },
+      handleScale: {
+        axisPressedMouseMove: true,
+        mouseWheel:           true,
+        pinch:                true,
+      },
       rightPriceScale: {
-        borderColor:  COLORS.border,
+        autoScale:    true,
+        borderVisible: false,
         textColor:    COLORS.text,
-        // Escala logarítmica: price(t) = exp(m·t + b) aparece como recta perfecta.
-        mode:         PriceScaleMode.Logarithmic,
-        scaleMargins: { top: 0.08, bottom: 0.20 },
+        mode:         PriceScaleMode.Normal,
+        scaleMargins: { top: 0.02, bottom: 0.02 },
       },
       timeScale: {
-        borderColor:    COLORS.border,
-        timeVisible:    true,
-        secondsVisible: false,
-        tickMarkFormatter: (t: any) => {
+        borderColor:           COLORS.border,
+        timeVisible:           false,
+        secondsVisible:        false,
+        rightBarStaysOnScroll: true,
+        rightOffset:           12,
+        barSpacing:            7,
+        fixLeftEdge:           true,
+        tickMarkFormatter: (t: any, tickMarkType: number) => {
           const str = typeof t === 'string' ? t : new Date(t * 1000).toISOString().slice(0, 10)
           const [y, m, d] = str.split('-').map(Number)
           const date = new Date(y, m - 1, d)
+          // tickMarkType: 0=Year 1=Month 2=DayOfMonth 3=Time
+          if (tickMarkType === 0) return String(date.getFullYear())
           if (freq === 'M') return date.toLocaleDateString('es', { month: 'short', year: '2-digit' })
+          if (freq === 'W') return date.toLocaleDateString('es', { month: 'short' })
+          if (tickMarkType === 1) return date.toLocaleDateString('es', { month: 'short' })
           return date.toLocaleDateString('es', { day: 'numeric', month: 'short' })
         },
       },
@@ -504,7 +512,7 @@ export default function PriceChart({
       borderDownColor:  COLORS.down,
       wickUpColor:      COLORS.up,
       wickDownColor:    COLORS.down,
-      priceLineVisible: false,
+      priceLineVisible: true,
       lastValueVisible: true,
     } as Partial<CandlestickSeriesOptions>)
 
@@ -524,22 +532,6 @@ export default function PriceChart({
       }
     })
 
-    // ── [CANDLE DEBUG] últimas 10 velas ───────────────────────────────────────
-    console.group('[CANDLE DEBUG] últimas 10 velas')
-    ohlcData.slice(-10).forEach(c => {
-      const isUp = c.close >= c.open
-      console.log(
-        `date=${c.time}  open=${c.open}  close=${c.close}  ` +
-        `isUp=${isUp}  renderColor=${isUp ? 'GREEN (#26a69a)' : 'RED (#ef5350)'}`
-      )
-    })
-    console.groupEnd()
-
-    // ── [RENDER DATA] debug ───────────────────────────────────────────────────
-    console.log(
-      `[RENDER DATA]\nfirst=${ohlcData[0]?.time ?? 'n/a'}\nlast=${ohlcData[ohlcData.length - 1]?.time ?? 'n/a'}\ncount=${ohlcData.length}`
-    )
-
     candleSeries.setData(ohlcData)
 
     // ── Volumen — histograma en la zona inferior (20%) ─────────────────────────
@@ -558,6 +550,16 @@ export default function PriceChart({
       value: Number(c.volume),
       color: Number(c.close) >= Number(c.open) ? COLORS.volUp : COLORS.volDown,
     })))
+
+    // Helper: crea line series EXCLUIDA del autoscale (solo las velas lo controlan)
+    // Retornar { priceRange: null } le dice a LW charts "no contribuyo al rango Y"
+    // (≠ retornar null, que significa "usá el default" y SÍ afecta el eje Y)
+    // Se pasa en las creation options para que aplique desde el primer render.
+    const addOverlay = (opts: Parameters<typeof chart.addLineSeries>[0]) =>
+      chart.addLineSeries({
+        ...opts,
+        autoscaleInfoProvider: () => ({ priceRange: null }),
+      } as any)
 
     // ── Soporte / Resistencia dinámica ───────────────────────────────────────
     type Marker = { time: any; position: 'belowBar' | 'aboveBar'; color: string; shape: 'circle'; text: string; size: number }
@@ -602,7 +604,7 @@ export default function PriceChart({
         // Color según estado — capa secundaria (demoted): fino y transparente
         const supportColor = tl.meta?.status === 'TESTING_SUPPORT'
           ? 'rgba(74,222,128,0.45)' : 'rgba(38,166,154,0.40)'
-        const tlSeries = chart.addLineSeries({
+        const tlSeries = addOverlay({
           color:                  supportColor,
           lineWidth:              1,
           lineStyle:              LineStyle.Dashed,
@@ -648,7 +650,7 @@ export default function PriceChart({
         // Color según estado — capa secundaria (demoted): fino y transparente
         const resistanceColor = tr.meta?.status === 'TESTING_RESISTANCE'
           ? 'rgba(250,204,21,0.45)' : 'rgba(249,115,22,0.40)'
-        const trSeries = chart.addLineSeries({
+        const trSeries = addOverlay({
           color:                  resistanceColor,
           lineWidth:              1,
           lineStyle:              LineStyle.Dashed,
@@ -724,7 +726,7 @@ export default function PriceChart({
 
       if (pts.length < 2) return
 
-      const series = chart.addLineSeries({
+      const series = addOverlay({
         color,
         lineWidth,
         lineStyle,
@@ -767,7 +769,7 @@ export default function PriceChart({
         const style     = isPrimary ? LineStyle.Solid : LineStyle.Dashed
 
         // zone_high line
-        const hi = chart.addLineSeries({
+        const hi = addOverlay({
           color: `rgba(${baseClr},${alpha})`,
           lineWidth: width, lineStyle: style,
           priceLineVisible: false, lastValueVisible: false,
@@ -779,7 +781,7 @@ export default function PriceChart({
         ])
 
         // zone_low line
-        const lo = chart.addLineSeries({
+        const lo = addOverlay({
           color: `rgba(${baseClr},${alpha})`,
           lineWidth: width, lineStyle: style,
           priceLineVisible: false, lastValueVisible: false,
@@ -806,7 +808,7 @@ export default function PriceChart({
 
     // ── Indicadores (WMA, SMA, etc.) ──────────────────────────────────────────
     for (const ind of indicators) {
-      const series = chart.addLineSeries({
+      const series = addOverlay({
         color:                  ind.color,
         lineWidth:              1,
         priceLineVisible:       false,
@@ -826,9 +828,9 @@ export default function PriceChart({
     ro.observe(el)
     // Bars visibles por defecto según timeframe:
     //   D → 365  (~1.5 años de diario)
-    //   W → 520  (~10 años de semanal — muestra la estructura de largo plazo)
-    //   M → 240  (~20 años de mensual)
-    const DEFAULT_BARS = freq === 'W' ? 520 : freq === 'M' ? 240 : 365
+    //   W → 250  (~5 años de semanal — rango amplio como TradingView)
+    //   M → 120  (~10 años de mensual)
+    const DEFAULT_BARS = freq === 'W' ? 250 : freq === 'M' ? 120 : 365
     if (data.length > DEFAULT_BARS) {
       chart.timeScale().setVisibleLogicalRange({
         from: data.length - DEFAULT_BARS - 0.5,
