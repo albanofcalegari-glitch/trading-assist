@@ -1,2 +1,10 @@
 pymysql>=1.1.0
 requests>=2.31.0
+flask>=3.0.0
+flask-cors>=4.0.0
+bcrypt>=4.0.0
+pyjwt>=2.8.0
+gunicorn>=22.0.0
+numpy>=1.26.0
+pandas>=2.1.0
+yfinance>=0.2.40

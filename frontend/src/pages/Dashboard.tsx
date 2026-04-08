@@ -25,7 +25,9 @@ export default function Dashboard() {
   const [draft,   setDraft]   = useState('')
   const [loading, setLoading] = useState(false)
   const [mLoading, setMLoading] = useState(false)
-  const [ctx,      setCtx]      = useState<MarketContext | null>(null)
+  const [ctx,         setCtx]         = useState<MarketContext | null>(null)
+  const [ctxLoading,  setCtxLoading]  = useState(false)
+  const [ctxUpdated,  setCtxUpdated]  = useState<Date | null>(null)
 
   // Movers
   const loadMovers = useCallback(async () => {
@@ -40,6 +42,19 @@ export default function Dashboard() {
       setMovers({ usaUp: uU.items, usaDown: uD.items, bymaUp: bU.items, bymaDown: bD.items })
     } finally {
       setMLoading(false)
+    }
+  }, [])
+
+  // Market context — fetch + auto-refresh cada 3 min
+  const loadCtx = useCallback(async () => {
+    setCtxLoading(true)
+    try {
+      const c = await api.marketContext()
+      setCtx(c)
+      // Preferir updated_at del server (epoch unix s); si no viene, fallback a now()
+      setCtxUpdated(c.updated_at ? new Date(c.updated_at * 1000) : new Date())
+    } catch {} finally {
+      setCtxLoading(false)
     }
   }, [])
 
@@ -58,8 +73,22 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadMovers()
-    api.marketContext().then(setCtx).catch(() => {})
   }, [loadMovers])
+
+  // Indicadores: fetch inmediato + auto-refresh cada 3 min
+  // (también re-fetchea cuando la pestaña vuelve a estar visible)
+  useEffect(() => {
+    loadCtx()
+    const id = setInterval(loadCtx, 3 * 60 * 1000)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') loadCtx()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(id)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [loadCtx])
 
   useEffect(() => {
     setPage(0)
@@ -86,18 +115,18 @@ export default function Dashboard() {
         </div>
         <button
           className="btn-ghost text-xs gap-1.5"
-          onClick={() => { loadMovers(); loadAssets(market, search, page) }}
+          onClick={() => { loadCtx(); loadMovers(); loadAssets(market, search, page) }}
         >
-          <RefreshCw size={13} />
+          <RefreshCw size={13} className={ctxLoading || mLoading ? 'animate-spin' : ''} />
           Actualizar
         </button>
       </div>
 
       {/* Market Context */}
-      {ctx && <MarketBar ctx={ctx} />}
+      {ctx && <MarketBar ctx={ctx} updatedAt={ctxUpdated} loading={ctxLoading} />}
 
-      {/* Movers 2×2 */}
-      <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
+      {/* Movers — 1 col móvil, 2 cols sm, 4 cols xl */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 md:gap-4">
         <MoverBlock title="Top alza — USA"  items={movers.usaUp}   isUp loading={mLoading} />
         <MoverBlock title="Top baja — USA"  items={movers.usaDown} isUp={false} loading={mLoading} />
         <MoverBlock title="Top alza — BYMA" items={movers.bymaUp}  isUp loading={mLoading} />
@@ -106,8 +135,8 @@ export default function Dashboard() {
 
       {/* Filtros + tabla */}
       <div className="space-y-3">
-        <div className="flex items-center gap-3">
-          <div className="flex-1 max-w-xs relative">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex-1 min-w-[160px] max-w-xs relative">
             <Filter size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted" />
             <input
               className="input pl-8 h-8 text-xs"
@@ -155,16 +184,30 @@ const REGIME_COLOR: Record<number, string> = {
   2: 'text-down',
 }
 
-function MarketBar({ ctx }: { ctx: MarketContext }) {
+function MarketBar({ ctx, updatedAt, loading }: {
+  ctx: MarketContext; updatedAt: Date | null; loading: boolean
+}) {
   const vix      = ctx.vix_level ?? 0
   const redFlag  = vix > 30
   const vixPct   = ctx.vix_percentile_1y != null ? Math.round(ctx.vix_percentile_1y * 100) : null
   const regime   = ctx.market_regime ?? 0
 
+  // Frescura: > 5 min sin update O fallback de DB → stale
+  const ageMs   = updatedAt ? Date.now() - updatedAt.getTime() : null
+  const ageMin  = ageMs != null ? Math.floor(ageMs / 60_000) : null
+  const isStale = ctx.source === 'db_fallback' || ageMs == null || ageMs > 5 * 60 * 1000
+  const ageLbl  = ageMin == null
+    ? '—'
+    : ageMin < 1 ? 'recién'
+    : ageMin < 60 ? `hace ${ageMin} min`
+    : `hace ${Math.floor(ageMin / 60)}h`
+
   return (
     <div className={`flex flex-wrap items-center gap-3 px-4 py-3 rounded-lg border text-xs ${
       redFlag
         ? 'bg-down/10 border-down/40'
+        : isStale
+        ? 'bg-surface border-yellow-500/40'
         : 'bg-surface border-border'
     }`}>
 
@@ -220,7 +263,26 @@ function MarketBar({ ctx }: { ctx: MarketContext }) {
         </span>
       </div>
 
-      <div className="ml-auto text-text-muted">{ctx.fecha}</div>
+      <div className="ml-auto flex items-center gap-2">
+        {loading && <RefreshCw size={11} className="animate-spin text-text-muted" />}
+        {isStale && (
+          <span
+            className="flex items-center gap-1 text-2xs px-1.5 py-0.5 rounded
+                       bg-yellow-500/15 text-yellow-400 border border-yellow-500/30 font-medium"
+            title={ctx.source === 'db_fallback'
+              ? 'Yahoo Finance no respondió — mostrando último valor de DB'
+              : `Datos atrasados (${ageMin ?? '?'} min sin actualizar)`}
+          >
+            <AlertTriangle size={10} /> stale
+          </span>
+        )}
+        <span
+          className="text-text-muted"
+          title={updatedAt ? updatedAt.toLocaleString('es-AR') : ''}
+        >
+          {ageLbl}
+        </span>
+      </div>
     </div>
   )
 }

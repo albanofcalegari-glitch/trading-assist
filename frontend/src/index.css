@@ -2,18 +2,96 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ─── Theme tokens (dark = default, light = override) ──────────────────────── */
+
+:root {
+  /* Backgrounds & surfaces */
+  --c-bg:              11 13 17;        /* #0b0d11 */
+  --c-surface:         17 21 32;        /* #111520 */
+  --c-elevated:        28 34 48;        /* #1c2230 — un poco más arriba para contraste */
+  --c-border:          48 58 80;        /* #303a50 — más visible sobre el bg */
+  --c-border-subtle:   34 41 58;        /* #22293a */
+
+  /* Text — contraste subido para legibilidad nocturna */
+  --c-text-primary:    234 240 248;     /* #eaf0f8 */
+  --c-text-secondary:  158 172 192;     /* #9eacc0 — antes #7c8ca1 */
+  --c-text-muted:      108 124 146;     /* #6c7c92 — antes #3f4f63 */
+
+  /* Brand & semantic */
+  --c-accent:          79 121 232;      /* #4f79e8 */
+  --c-accent-hover:    59 102 214;      /* #3b66d6 */
+  --c-up:              34 197 94;       /* #22c55e */
+  --c-up-muted:        20 83 45;        /* #14532d */
+  --c-down:            239 68 68;       /* #ef4444 */
+  --c-down-muted:      69 10 10;        /* #450a0a */
+  --c-warn:            245 158 11;      /* #f59e0b */
+  --c-warn-muted:      69 26 3;         /* #451a03 */
+  --c-signal:          167 139 250;     /* #a78bfa */
+  --c-signal-muted:    46 16 101;       /* #2e1065 */
+  --c-neutral:         71 85 105;       /* #475569 */
+  --c-neutral-muted:   30 41 59;        /* #1e293b */
+
+  /* Shadows */
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, .4), 0 0 0 1px rgba(255, 255, 255, .03);
+  --shadow-glow: 0 0 12px rgba(79, 121, 232, .25);
+
+  color-scheme: dark;
+}
+
+:root.light {
+  --c-bg:              247 248 250;     /* #f7f8fa */
+  --c-surface:         255 255 255;     /* #ffffff */
+  --c-elevated:        241 243 247;     /* #f1f3f7 */
+  --c-border:          222 227 235;     /* #dee3eb */
+  --c-border-subtle:   234 238 244;     /* #eaeef4 */
+
+  --c-text-primary:    15 23 42;        /* slate-900 */
+  --c-text-secondary:  71 85 105;       /* slate-600 */
+  --c-text-muted:      148 163 184;     /* slate-400 */
+
+  --c-accent:          59 102 214;      /* un poco más oscuro para contraste */
+  --c-accent-hover:    37 78 184;
+  --c-up:              22 163 74;       /* green-600 */
+  --c-up-muted:        220 252 231;     /* green-100 */
+  --c-down:            220 38 38;       /* red-600 */
+  --c-down-muted:      254 226 226;     /* red-100 */
+  --c-warn:            217 119 6;       /* amber-600 */
+  --c-warn-muted:      254 243 199;     /* amber-100 */
+  --c-signal:          124 58 237;      /* violet-600 */
+  --c-signal-muted:    237 233 254;     /* violet-100 */
+  --c-neutral:         100 116 139;     /* slate-500 */
+  --c-neutral-muted:   226 232 240;     /* slate-200 */
+
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, .07), 0 0 0 1px rgba(15, 23, 42, .04);
+  --shadow-glow: 0 0 12px rgba(59, 102, 214, .25);
+
+  color-scheme: light;
+}
+
 @layer base {
   * {
     box-sizing: border-box;
   }
 
-  html {
-    color-scheme: dark;
-  }
-
   body {
     @apply bg-bg text-text-primary font-sans antialiased;
     font-size: 13px;
+  }
+
+  /* Cursor pointer global en elementos interactivos: button nativo, role="button",
+     enlaces, summary, label asociado a control, y selects.
+     Evita que se nos olvide poner cursor-pointer en cada componente nuevo. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  a[href],
+  summary,
+  select,
+  label[for],
+  input[type="checkbox"],
+  input[type="radio"],
+  input[type="submit"],
+  input[type="button"] {
+    cursor: pointer;
   }
 
   ::-webkit-scrollbar {

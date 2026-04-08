@@ -1,9 +1,42 @@
 const BASE = '/api'
 
+function authHeaders(): Record<string, string> {
+  const token = localStorage.getItem('token')
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(BASE + path)
+  const res = await fetch(BASE + path, { headers: authHeaders() })
+  if (res.status === 401) {
+    localStorage.removeItem('token')
+    localStorage.removeItem('username')
+    window.location.href = '/'
+    throw new Error('Sesión expirada')
+  }
   if (!res.ok) throw new Error(`API error ${res.status}: ${path}`)
   return res.json()
+}
+
+export async function changePassword(current: string, newPassword: string) {
+  const res = await fetch(BASE + '/auth/change-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ current, new_password: newPassword }),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al cambiar contraseña')
+  return data
+}
+
+export async function setInvestorProfileApi(profile: 'conservador' | 'moderado' | 'agresivo') {
+  const res = await fetch(BASE + '/auth/profile', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ profile }),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al guardar perfil')
+  return data as { ok: boolean; investor_profile: 'conservador' | 'moderado' | 'agresivo' }
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -54,14 +87,57 @@ export interface Indicator {
   volume_ratio_20d: number | null
 }
 
-export interface MarketContext {
+export interface TrendPullbackSignal {
   fecha:             string
+  simbolo:           string
+  trend_score:       number
+  pullback_score:    number
+  setup_state:       string
+  context_alignment: string
+  decision:          string  // 'BUY_CANDIDATE' | 'WATCHLIST' | 'NO_ACTION' | 'AVOID'
+  confidence_level:  string
+  allow_trade:       0 | 1
+  reading:           string
+  price:             number | null
+  gap_pct:           number | null
+}
+
+export interface Fundamentals {
+  symbol:              string
+  market_cap:          number | null
+  currency:            string | null
+  revenue_ttm:         number | null
+  gross_margin:        number | null
+  operating_margin:    number | null
+  profit_margin:       number | null
+  net_income_ttm:      number | null
+  total_cash:          number | null
+  total_debt:          number | null
+  debt_to_equity:      number | null
+  revenue_growth_yoy:  number | null
+  earnings_growth_yoy: number | null
+  trailing_pe:         number | null
+  forward_pe:          number | null
+  price_to_book:       number | null
+  ev_to_ebitda:        number | null
+  dividend_yield:      number | null
+  dividend_rate:       number | null
+  last_earnings_date:  string | null
+  next_earnings_date:  string | null
+  updated_at:          number | null
+}
+
+export interface MarketContext {
+  fecha:             string | null
   vix_level:         number | null
   vix_percentile_1y: number | null
   spy_return_5d:     number | null
   spy_return_20d:    number | null
   yield_10y:         number | null
   market_regime:     number | null
+  // Nuevos: epoch unix segundos del último fetch live, y origen
+  updated_at?:       number | null
+  source?:           'live' | 'db_fallback'
 }
 
 export interface LongtermSupport {
@@ -132,6 +208,67 @@ export interface HorizontalZonesResponse {
   pivot_highs_found: number
 }
 
+export interface Notification {
+  id:           number
+  batch_run_id: number | null
+  kind:         string            // 'close' | 'pre_market' | 'opening' | 'midday' | 'weekly_rank'
+  title:        string
+  body:         string
+  data:         any | null
+  created_at:   string
+  read_at:      string | null
+}
+
+export interface CompanyInfo {
+  symbol: string
+  status: 'OK' | 'NO_DATA'
+  profile?: {
+    long_name?:   string | null
+    sector?:      string | null
+    industry?:    string | null
+    website?:     string | null
+    country?:     string | null
+    employees?:   number | null
+    description?: string | null
+  }
+  health?: {
+    score?:          number | null
+    label?:          string | null
+    profit_margin?:  number | null
+    roe?:            number | null
+    debt_to_equity?: number | null
+    current_ratio?:  number | null
+    free_cashflow?:  number | null
+    total_cash?:     number | null
+    total_debt?:     number | null
+  }
+  growth?: {
+    revenue_growth?:  number | null
+    earnings_growth?: number | null
+  }
+  valuation?: {
+    trailing_pe?:   number | null
+    forward_pe?:    number | null
+    peg_ratio?:     number | null
+    price_to_book?: number | null
+    market_cap?:    number | null
+  }
+  analyst?: {
+    recommendation?:      string | null
+    target_mean_price?:   number | null
+    number_of_analysts?:  number | null
+  }
+  earnings_yearly?: { year: number | string | null; revenue: number | null; earnings: number | null }[]
+  income_statements?: {
+    end_date:         string | null
+    total_revenue:    number | null
+    gross_profit:     number | null
+    operating_income: number | null
+    net_income:       number | null
+    ebit:             number | null
+  }[]
+}
+
 export interface WmaCrossItem {
   accion_id: number
   simbolo:   string
@@ -183,4 +320,30 @@ export const api = {
 
   horizontalZones: (id: number) =>
     get<HorizontalZonesResponse>(`/assets/${id}/horizontal-zones`),
+
+  companyInfo: (id: number) =>
+    get<CompanyInfo>(`/assets/${id}/company-info`),
+
+  trendPullbackSignal: (id: number) =>
+    get<TrendPullbackSignal | null>(`/assets/${id}/trend-pullback-signal`),
+
+  fundamentals: (id: number) =>
+    get<Fundamentals>(`/assets/${id}/fundamentals`),
+
+  notifications: (kind = '', limit = 50) =>
+    get<{ items: Notification[] }>(
+      `/notifications?limit=${limit}${kind ? `&kind=${encodeURIComponent(kind)}` : ''}`
+    ),
+
+  notificationsUnread: () =>
+    get<{ unread: number }>('/notifications/unread-count'),
+}
+
+export async function markNotificationRead(id: number) {
+  const res = await fetch(BASE + `/notifications/${id}/read`, {
+    method: 'POST',
+    headers: authHeaders(),
+  })
+  if (!res.ok) throw new Error(`Error al marcar leída: ${res.status}`)
+  return res.json()
 }

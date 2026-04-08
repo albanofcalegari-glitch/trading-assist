@@ -19,11 +19,14 @@ import sys
 import argparse
 import datetime
 import decimal
+import functools
 import json
 import os
 import threading
 import time
 
+import bcrypt
+import jwt
 import pymysql
 import pymysql.cursors
 
@@ -87,6 +90,239 @@ _MARKET_PRIORITY = """
 app = Flask(__name__)
 CORS(app)
 
+JWT_SECRET = os.environ.get('JWT_SECRET', 'tr4d1ng-4ss1st-s3cr3t-k3y-2026')
+JWT_EXP_HOURS = 24
+
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+
+def _hash_pw(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+
+
+def _check_pw(plain: str, hashed: str) -> bool:
+    return bcrypt.checkpw(plain.encode(), hashed.encode())
+
+
+def _make_token(user_id: int, username: str) -> str:
+    payload = {
+        # PyJWT >= 2.10 exige que 'sub' sea string. Casteamos al firmar y
+        # revertimos a int al decodificar (ver _decode_token), de modo que los
+        # consumidores que esperan int siguen funcionando.
+        'sub': str(user_id),
+        'user': username,
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=JWT_EXP_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+
+
+def _decode_token(token: str):
+    payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+    sub = payload.get('sub')
+    if isinstance(sub, str) and sub.isdigit():
+        payload['sub'] = int(sub)
+    return payload
+
+
+def login_required(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get('Authorization', '')
+        if not auth.startswith('Bearer '):
+            return jsonify({'error': 'Token requerido'}), 401
+        try:
+            payload = _decode_token(auth[7:])
+            request.user = payload
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expirado'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Token inválido'}), 401
+        return f(*args, **kwargs)
+    return wrapper
+
+
+VALID_INVESTOR_PROFILES = ('conservador', 'moderado', 'agresivo')
+
+
+def _ensure_batch_tables():
+    """Tablas para el sistema de batches/notificaciones (idempotente)."""
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS batch_run (
+                    id           INT AUTO_INCREMENT PRIMARY KEY,
+                    batch_name   VARCHAR(50) NOT NULL,
+                    started_at   DATETIME    NOT NULL,
+                    finished_at  DATETIME    NULL,
+                    status       VARCHAR(20) NOT NULL DEFAULT 'RUNNING',
+                    payload_json LONGTEXT    NULL,
+                    error        TEXT        NULL,
+                    INDEX idx_batch_started (batch_name, started_at)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS notification (
+                    id           INT AUTO_INCREMENT PRIMARY KEY,
+                    batch_run_id INT          NULL,
+                    kind         VARCHAR(40)  NOT NULL,
+                    title        VARCHAR(255) NOT NULL,
+                    body         TEXT         NOT NULL,
+                    data_json    LONGTEXT     NULL,
+                    created_at   DATETIME     NOT NULL,
+                    read_at      DATETIME     NULL,
+                    INDEX idx_notif_created (created_at),
+                    INDEX idx_notif_kind    (kind)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS rotation_state (
+                    id              INT AUTO_INCREMENT PRIMARY KEY,
+                    week_end        DATE         NOT NULL,
+                    action          VARCHAR(20)  NOT NULL,
+                    symbol          VARCHAR(20)  NULL,
+                    prev_symbol     VARCHAR(20)  NULL,
+                    score           DECIMAL(10,4) NULL,
+                    equity          DECIMAL(14,2) NULL,
+                    spy_equity      DECIMAL(14,2) NULL,
+                    note            TEXT         NULL,
+                    UNIQUE KEY uq_rotation_week (week_end)
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ensure_users_table():
+    """Crea la tabla users si no existe e inserta usuarios iniciales."""
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(50) UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("SELECT COUNT(*) AS cnt FROM users")
+            if cur.fetchone()['cnt'] == 0:
+                pw = _hash_pw('12345678')
+                cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s)", ('albano', pw))
+                cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s)", ('julian', pw))
+                print(' * Usuarios iniciales creados: albano, julian')
+
+            # Migración idempotente: agregar columna investor_profile si no existe
+            cur.execute("""
+                SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'users'
+                  AND COLUMN_NAME = 'investor_profile'
+            """)
+            if cur.fetchone()['cnt'] == 0:
+                cur.execute("ALTER TABLE users ADD COLUMN investor_profile VARCHAR(20) NULL")
+                print(' * Columna users.investor_profile creada')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Auth endpoints ────────────────────────────────────────────────────────────
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    body = request.get_json(silent=True) or {}
+    username = (body.get('username') or '').strip().lower()
+    password = body.get('password') or ''
+    if not username or not password:
+        return jsonify({'error': 'Usuario y contraseña requeridos'}), 400
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, password_hash, investor_profile FROM users WHERE username = %s",
+                (username,),
+            )
+            user = cur.fetchone()
+    finally:
+        conn.close()
+    if not user or not _check_pw(password, user['password_hash']):
+        return jsonify({'error': 'Credenciales incorrectas'}), 401
+    token = _make_token(user['id'], user['username'])
+    return jsonify({
+        'token': token,
+        'username': user['username'],
+        'investor_profile': user.get('investor_profile'),
+    })
+
+
+@app.route('/api/auth/me', methods=['GET'])
+@login_required
+def auth_me():
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT username, investor_profile FROM users WHERE id = %s",
+                (request.user['sub'],),
+            )
+            row = cur.fetchone() or {}
+    finally:
+        conn.close()
+    return jsonify({
+        'username': row.get('username') or request.user['user'],
+        'investor_profile': row.get('investor_profile'),
+    })
+
+
+@app.route('/api/auth/profile', methods=['POST'])
+@login_required
+def auth_set_profile():
+    body = request.get_json(silent=True) or {}
+    profile = (body.get('profile') or '').strip().lower()
+    if profile not in VALID_INVESTOR_PROFILES:
+        return jsonify({
+            'error': f'Perfil inválido. Debe ser uno de: {", ".join(VALID_INVESTOR_PROFILES)}'
+        }), 400
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET investor_profile = %s WHERE id = %s",
+                (profile, request.user['sub']),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'ok': True, 'investor_profile': profile})
+
+
+@app.route('/api/auth/change-password', methods=['POST'])
+@login_required
+def auth_change_password():
+    body = request.get_json(silent=True) or {}
+    current = body.get('current') or ''
+    new_pw = body.get('new_password') or ''
+    if not current or not new_pw:
+        return jsonify({'error': 'Contraseña actual y nueva requeridas'}), 400
+    if len(new_pw) < 6:
+        return jsonify({'error': 'La nueva contraseña debe tener al menos 6 caracteres'}), 400
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT password_hash FROM users WHERE id = %s", (request.user['sub'],))
+            user = cur.fetchone()
+            if not user or not _check_pw(current, user['password_hash']):
+                return jsonify({'error': 'Contraseña actual incorrecta'}), 401
+            cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
+                        (_hash_pw(new_pw), request.user['sub']))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'ok': True, 'message': 'Contraseña actualizada'})
+
 
 # ── JSON serializer (Decimal, date) ────────────────────────────────────────────
 
@@ -115,9 +351,42 @@ def _conn():
     return pymysql.connect(**MYSQL_CONFIG)
 
 
-def _last_two_dates(cur):
-    # Usar fechas con cobertura real (>= 5000 activos) para evitar
-    # que un update parcial excluya activos con datos válidos.
+def _last_two_dates(cur, market: str | None = None):
+    # Cuando se especifica un mercado, calculamos las 2 últimas fechas RESTRINGIDAS
+    # a ese mercado. Esto es crítico para BYMA: el cron de USA puede haber corrido
+    # antes que el de BYMA y la fecha global más reciente puede no existir en BYMA,
+    # rompiendo el JOIN v1+v2.
+    if market == 'BYMA':
+        cur.execute("""
+            SELECT v.fecha
+            FROM valorhistoricoaccion v
+            JOIN accion a  ON a.id = v.accion_id
+            JOIN mercado m ON m.id = a.mercado_id
+            WHERE m.descripcion = 'BYMA'
+            GROUP BY v.fecha
+            HAVING COUNT(*) >= 30
+            ORDER BY v.fecha DESC LIMIT 2
+        """)
+        rows = cur.fetchall()
+        if len(rows) >= 2:
+            return rows[0]['fecha'], rows[1]['fecha']
+    elif market == 'USA':
+        ph = ','.join(['%s'] * len(USA_MARKETS))
+        cur.execute(f"""
+            SELECT v.fecha
+            FROM valorhistoricoaccion v
+            JOIN accion a  ON a.id = v.accion_id
+            JOIN mercado m ON m.id = a.mercado_id
+            WHERE m.descripcion IN ({ph})
+            GROUP BY v.fecha
+            HAVING COUNT(*) >= 5000
+            ORDER BY v.fecha DESC LIMIT 2
+        """, list(USA_MARKETS))
+        rows = cur.fetchall()
+        if len(rows) >= 2:
+            return rows[0]['fecha'], rows[1]['fecha']
+
+    # Default global: cobertura real (>= 5000 activos) para evitar updates parciales
     cur.execute("""
         SELECT fecha FROM valorhistoricoaccion
         GROUP BY fecha HAVING COUNT(*) >= 5000
@@ -218,7 +487,10 @@ def get_assets():
 
     with _conn() as conn:
         with conn.cursor() as cur:
-            last, prev = _last_two_dates(cur)
+            # Pasar market para que las fechas se calculen sobre ese mercado.
+            # Sin esto, BYMA usa la última fecha global (que sólo tiene USA) y
+            # el JOIN v1+v2 devuelve vacío.
+            last, prev = _last_two_dates(cur, market or None)
 
             # ── Todos (dedup) ──────────────────────────────────────────────────
             if not market:
@@ -330,7 +602,10 @@ def get_asset(accion_id: int):
             if not info:
                 return _jresp({'error': 'Not found'}, 404)
 
-            last, prev = _last_two_dates(cur)
+            # Detectar mercado del propio asset para no usar fecha global
+            # (rompe BYMA cuando USA tiene un día más cargado).
+            mkt_hint = 'BYMA' if info.get('mercado') == 'BYMA' else 'USA'
+            last, prev = _last_two_dates(cur, mkt_hint)
             cur.execute("""
                 SELECT v1.precio_cierre AS precio, v1.volumen,
                        ROUND((v1.precio_cierre / v2.precio_cierre - 1) * 100, 2) AS pct_cambio
@@ -621,24 +896,137 @@ def _execute_scan(market: str) -> dict:
 
 
 # ── /api/market-context ────────────────────────────────────────────────────────
+#
+# Devuelve VIX, SPY 5d/20d, T10Y y régimen con datos near-real-time.
+# Estrategia:
+#   1. yfinance live (^VIX, SPY, ^TNX) — cache de 90s en memoria.
+#   2. DB (indicadormercado) — para vix_percentile_1y y market_regime,
+#      que requieren histórico nuestro y se calculan en el batch diario.
+#   3. Fallback puro a DB si Yahoo está caído.
+#
+# Response shape:
+#   { fecha, vix_level, vix_percentile_1y, spy_return_5d, spy_return_20d,
+#     yield_10y, market_regime, updated_at, source }
+#
+# updated_at = epoch unix segundos del último fetch live (None si fallback)
+# source     = 'live' | 'db_fallback'
+
+_MARKET_CTX_CACHE: dict | None = None
+_MARKET_CTX_CACHE_TS: float    = 0.0
+_MARKET_CTX_TTL                = 90  # segundos
+
+
+def _fetch_live_market_context() -> dict:
+    """Fetch directo a Yahoo. ~300-800ms p50. Sólo se llama si el cache expiró."""
+    import yfinance as yf
+    syms = yf.Tickers('^VIX SPY ^TNX')
+
+    vix_info = syms.tickers['^VIX'].fast_info
+    tnx_info = syms.tickers['^TNX'].fast_info
+
+    # SPY 5d/20d returns: 1 sola request al history
+    spy_hist = syms.tickers['SPY'].history(period='30d', interval='1d')
+    closes   = spy_hist['Close'].tolist() if hasattr(spy_hist, 'empty') and not spy_hist.empty else []
+    spy_5d   = (closes[-1] / closes[-6]  - 1) * 100 if len(closes) >= 6  else None
+    spy_20d  = (closes[-1] / closes[-21] - 1) * 100 if len(closes) >= 21 else None
+
+    return {
+        'vix_level':     float(vix_info.last_price) if vix_info.last_price else None,
+        'spy_return_5d': round(spy_5d, 2) if spy_5d is not None else None,
+        'spy_return_20d': round(spy_20d, 2) if spy_20d is not None else None,
+        # ^TNX viene en décimas de % (ej. 42.5 = 4.25%)
+        'yield_10y':     round(float(tnx_info.last_price) / 10.0, 2) if tnx_info.last_price else None,
+        'updated_at':    int(time.time()),
+        'source':        'live',
+    }
+
 
 @app.route('/api/market-context')
 def get_market_context():
+    global _MARKET_CTX_CACHE, _MARKET_CTX_CACHE_TS
+    now = time.time()
+
+    # 1) DB → percentil VIX + market_regime + fecha del batch
+    db_row = None
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT fecha, vix_level, vix_percentile_1y,
+                           spy_return_5d, spy_return_20d,
+                           yield_10y, market_regime
+                    FROM indicadormercado
+                    ORDER BY fecha DESC
+                    LIMIT 1
+                """)
+                db_row = cur.fetchone()
+    except Exception as e:
+        print(f'[market_context] db read failed: {e}')
+
+    # 2) Live → con cache 90s
+    if _MARKET_CTX_CACHE and (now - _MARKET_CTX_CACHE_TS) < _MARKET_CTX_TTL:
+        live = _MARKET_CTX_CACHE
+    else:
+        try:
+            live = _fetch_live_market_context()
+            _MARKET_CTX_CACHE    = live
+            _MARKET_CTX_CACHE_TS = now
+        except Exception as e:
+            print(f'[market_context] live fetch failed: {type(e).__name__}: {e}')
+            # Fallback puro a DB
+            if not db_row:
+                return _jresp({'error': 'no data'}, 404)
+            db_row['fecha']      = str(db_row['fecha'])
+            db_row['updated_at'] = None
+            db_row['source']     = 'db_fallback'
+            return _jresp(db_row)
+
+    # 3) Merge: live para precios, DB para regime/percentil/fecha
+    out = {
+        'fecha':             str(db_row['fecha']) if db_row else None,
+        'vix_level':         live.get('vix_level'),
+        'vix_percentile_1y': db_row.get('vix_percentile_1y') if db_row else None,
+        'spy_return_5d':     live.get('spy_return_5d'),
+        'spy_return_20d':    live.get('spy_return_20d'),
+        'yield_10y':         live.get('yield_10y'),
+        'market_regime':     db_row.get('market_regime') if db_row else None,
+        'updated_at':        live.get('updated_at'),
+        'source':            'live',
+    }
+    return _jresp(out)
+
+
+# ── /api/assets/<id>/trend-pullback-signal ────────────────────────────────────
+#
+# Devuelve la última señal trend_pullback para un activo. Incluye gap_pct
+# para que el frontend pueda aplicar el filtro GAP configurable por usuario.
+# Tabla puede no existir todavía (primer deploy) → devolver null sin error.
+
+@app.route('/api/assets/<int:accion_id>/trend-pullback-signal')
+def get_trend_pullback_signal(accion_id: int):
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT fecha, vix_level, vix_percentile_1y,
-                       spy_return_5d, spy_return_20d,
-                       yield_10y, market_regime
-                FROM indicadormercado
-                ORDER BY fecha DESC
-                LIMIT 1
-            """)
+            cur.execute("SELECT simbolo FROM accion WHERE id=%s", [accion_id])
             row = cur.fetchone()
-    if not row:
-        return _jresp({'error': 'no data'}, 404)
-    row['fecha'] = str(row['fecha'])
-    return _jresp(row)
+            if not row:
+                return _jresp({'error': 'asset not found'}, 404)
+            try:
+                cur.execute("""
+                    SELECT fecha, simbolo, trend_score, pullback_score, setup_state,
+                           context_alignment, decision, confidence_level,
+                           allow_trade, reading, price, gap_pct
+                    FROM trend_pullback_signals
+                    WHERE simbolo=%s
+                    ORDER BY fecha DESC LIMIT 1
+                """, [row['simbolo']])
+                sig = cur.fetchone()
+            except Exception:
+                # Tabla no existe todavía
+                return _jresp(None)
+    if not sig:
+        return _jresp(None)
+    sig['fecha'] = str(sig['fecha'])
+    return _jresp(sig)
 
 
 @app.route('/api/scan/wma-cross')
@@ -768,6 +1156,473 @@ def get_horizontal_zones(accion_id: int):
     return _jresp(result)
 
 
+# ── /api/assets/<id>/company-info ─────────────────────────────────────────────
+#
+# Información fundamental de la empresa: perfil, salud financiera, crecimiento,
+# último balance.  Fuente: Yahoo Finance quoteSummary (sin API key).
+# Cache en memoria con TTL 6h para no abusar del endpoint público.
+
+_company_cache: dict = {}        # symbol → {'data': dict, 'ts': float}
+_company_lock = threading.Lock()
+_COMPANY_TTL  = 6 * 3600         # 6 horas
+
+_YF_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/120.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'application/json',
+}
+
+_YF_MODULES = (
+    'summaryProfile,financialData,defaultKeyStatistics,'
+    'earnings,incomeStatementHistory,price'
+)
+
+
+def _yf_quote_summary(symbol: str) -> dict | None:
+    """Llama al endpoint público quoteSummary de Yahoo Finance."""
+    import requests
+    url = f'https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}'
+    try:
+        resp = requests.get(
+            url,
+            params={'modules': _YF_MODULES},
+            headers=_YF_HEADERS,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        result = payload.get('quoteSummary', {}).get('result') or []
+        return result[0] if result else None
+    except Exception:
+        return None
+
+
+def _yf_num(node, key):
+    """Yahoo devuelve {'raw': X, 'fmt': 'X%'} o números planos. Normaliza a float|None."""
+    if node is None:
+        return None
+    val = node.get(key)
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        return val.get('raw')
+    return val
+
+
+def _build_company_info(symbol: str, raw: dict | None) -> dict:
+    if not raw:
+        return {'symbol': symbol, 'status': 'NO_DATA'}
+
+    profile = raw.get('summaryProfile') or {}
+    fin     = raw.get('financialData') or {}
+    keys    = raw.get('defaultKeyStatistics') or {}
+    earn    = raw.get('earnings') or {}
+    income  = raw.get('incomeStatementHistory') or {}
+    price_m = raw.get('price') or {}
+
+    # Earnings yearly (último balance anual)
+    yearly_chart = (earn.get('financialsChart') or {}).get('yearly') or []
+    yearly = [
+        {
+            'year':    y.get('date'),
+            'revenue': _yf_num(y, 'revenue'),
+            'earnings': _yf_num(y, 'earnings'),
+        }
+        for y in yearly_chart
+    ]
+
+    # Income statements (últimos 4 balances)
+    statements_raw = income.get('incomeStatementHistory') or []
+    statements = []
+    for s in statements_raw[:4]:
+        statements.append({
+            'end_date':         (s.get('endDate') or {}).get('fmt'),
+            'total_revenue':    _yf_num(s, 'totalRevenue'),
+            'gross_profit':     _yf_num(s, 'grossProfit'),
+            'operating_income': _yf_num(s, 'operatingIncome'),
+            'net_income':       _yf_num(s, 'netIncome'),
+            'ebit':             _yf_num(s, 'ebit'),
+        })
+
+    # Health score heurístico simple (0–100)
+    profit_margin = _yf_num(fin, 'profitMargins')
+    roe           = _yf_num(fin, 'returnOnEquity')
+    debt_eq       = _yf_num(fin, 'debtToEquity')
+    current_ratio = _yf_num(fin, 'currentRatio')
+    rev_growth    = _yf_num(fin, 'revenueGrowth')
+    earn_growth   = _yf_num(fin, 'earningsGrowth')
+
+    score = 0
+    score_pts = 0
+    def _bump(cond_pts, total_pts):
+        nonlocal score, score_pts
+        score += cond_pts
+        score_pts += total_pts
+    if profit_margin is not None:
+        _bump(20 if profit_margin >= 0.10 else (10 if profit_margin > 0 else 0), 20)
+    if roe is not None:
+        _bump(20 if roe >= 0.15 else (10 if roe > 0 else 0), 20)
+    if debt_eq is not None:
+        # debtToEquity en yahoo viene en %, ej. 50 = 0.5x
+        norm = debt_eq / 100 if debt_eq > 5 else debt_eq
+        _bump(20 if norm < 1 else (10 if norm < 2 else 0), 20)
+    if current_ratio is not None:
+        _bump(20 if current_ratio >= 1.5 else (10 if current_ratio >= 1 else 0), 20)
+    if rev_growth is not None:
+        _bump(20 if rev_growth >= 0.10 else (10 if rev_growth > 0 else 0), 20)
+
+    health_score = round(score / score_pts * 100) if score_pts else None
+    if health_score is None:
+        health_label = 'sin datos'
+    elif health_score >= 70:
+        health_label = 'sólida'
+    elif health_score >= 45:
+        health_label = 'aceptable'
+    else:
+        health_label = 'débil'
+
+    return {
+        'symbol': symbol,
+        'status': 'OK',
+        'profile': {
+            'long_name':    price_m.get('longName') or profile.get('longBusinessSummary', '')[:80],
+            'sector':       profile.get('sector'),
+            'industry':     profile.get('industry'),
+            'website':      profile.get('website'),
+            'country':      profile.get('country'),
+            'employees':    profile.get('fullTimeEmployees'),
+            'description':  profile.get('longBusinessSummary'),
+        },
+        'health': {
+            'score':         health_score,
+            'label':         health_label,
+            'profit_margin': profit_margin,
+            'roe':           roe,
+            'debt_to_equity': debt_eq,
+            'current_ratio': current_ratio,
+            'free_cashflow': _yf_num(fin, 'freeCashflow'),
+            'total_cash':    _yf_num(fin, 'totalCash'),
+            'total_debt':    _yf_num(fin, 'totalDebt'),
+        },
+        'growth': {
+            'revenue_growth':  rev_growth,
+            'earnings_growth': earn_growth,
+        },
+        'valuation': {
+            'trailing_pe':  _yf_num(keys, 'trailingPE') or _yf_num(fin, 'trailingPE'),
+            'forward_pe':   _yf_num(keys, 'forwardPE'),
+            'peg_ratio':    _yf_num(keys, 'pegRatio'),
+            'price_to_book': _yf_num(keys, 'priceToBook'),
+            'market_cap':   _yf_num(price_m, 'marketCap'),
+        },
+        'analyst': {
+            'recommendation':    fin.get('recommendationKey'),
+            'target_mean_price': _yf_num(fin, 'targetMeanPrice'),
+            'number_of_analysts': _yf_num(fin, 'numberOfAnalystOpinions'),
+        },
+        'earnings_yearly': yearly,
+        'income_statements': statements,
+    }
+
+
+@app.route('/api/assets/<int:accion_id>/company-info')
+def get_company_info(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _company_lock:
+        entry = _company_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _COMPANY_TTL:
+            return _jresp(entry['data'])
+
+    raw  = _yf_quote_summary(symbol)
+    data = _build_company_info(symbol, raw)
+
+    with _company_lock:
+        _company_cache[symbol] = {'data': data, 'ts': time.time()}
+
+    return _jresp(data)
+
+
+# ── /api/assets/<id>/fundamentals ─────────────────────────────────────────────
+#
+# Métricas financieras puras (separadas de company-info que es perfil + scoring).
+# Foco: revenue/earnings TTM, márgenes, deuda, growth, valuación, dividendos,
+# fechas próximas de earnings.  Cache 6h.
+
+_fund_cache: dict = {}        # symbol → {'data': dict, 'ts': float}
+_fund_lock  = threading.Lock()
+_FUND_TTL   = 6 * 3600
+
+_FUND_MODULES = (
+    'financialData,defaultKeyStatistics,summaryDetail,price,calendarEvents'
+)
+
+
+def _yf_fundamentals(symbol: str) -> dict | None:
+    """quoteSummary con módulos financieros + calendar."""
+    import requests
+    url = f'https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}'
+    try:
+        resp = requests.get(
+            url,
+            params={'modules': _FUND_MODULES},
+            headers=_YF_HEADERS,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        result  = payload.get('quoteSummary', {}).get('result') or []
+        return result[0] if result else None
+    except Exception:
+        return None
+
+
+def _build_fundamentals(symbol: str, raw: dict | None) -> dict:
+    base = {
+        'symbol': symbol,
+        'market_cap': None, 'currency': None,
+        'revenue_ttm': None, 'gross_margin': None,
+        'operating_margin': None, 'profit_margin': None,
+        'net_income_ttm': None,
+        'total_cash': None, 'total_debt': None, 'debt_to_equity': None,
+        'revenue_growth_yoy': None, 'earnings_growth_yoy': None,
+        'trailing_pe': None, 'forward_pe': None,
+        'price_to_book': None, 'ev_to_ebitda': None,
+        'dividend_yield': None, 'dividend_rate': None,
+        'last_earnings_date': None, 'next_earnings_date': None,
+        'updated_at': int(time.time()),
+    }
+    if not raw:
+        return base
+
+    fin     = raw.get('financialData')        or {}
+    keys    = raw.get('defaultKeyStatistics') or {}
+    summ    = raw.get('summaryDetail')        or {}
+    price_m = raw.get('price')                or {}
+    cal     = raw.get('calendarEvents')       or {}
+
+    base['currency']    = price_m.get('currency')
+    base['market_cap']  = _yf_num(price_m, 'marketCap') or _yf_num(summ, 'marketCap')
+    base['revenue_ttm'] = _yf_num(fin, 'totalRevenue')
+    base['gross_margin']     = _yf_num(fin, 'grossMargins')
+    base['operating_margin'] = _yf_num(fin, 'operatingMargins')
+    base['profit_margin']    = _yf_num(fin, 'profitMargins')
+    base['net_income_ttm']   = _yf_num(keys, 'netIncomeToCommon')
+    base['total_cash']       = _yf_num(fin, 'totalCash')
+    base['total_debt']       = _yf_num(fin, 'totalDebt')
+
+    debt_eq = _yf_num(fin, 'debtToEquity')
+    if debt_eq is not None and debt_eq > 5:
+        debt_eq = debt_eq / 100   # yahoo a veces lo da en %
+    base['debt_to_equity'] = debt_eq
+
+    base['revenue_growth_yoy']  = _yf_num(fin, 'revenueGrowth')
+    base['earnings_growth_yoy'] = _yf_num(fin, 'earningsGrowth')
+
+    base['trailing_pe']  = _yf_num(summ, 'trailingPE')  or _yf_num(keys, 'trailingPE')
+    base['forward_pe']   = _yf_num(summ, 'forwardPE')   or _yf_num(keys, 'forwardPE')
+    base['price_to_book'] = _yf_num(keys, 'priceToBook')
+    base['ev_to_ebitda']  = _yf_num(keys, 'enterpriseToEbitda')
+
+    base['dividend_yield'] = _yf_num(summ, 'dividendYield')
+    base['dividend_rate']  = _yf_num(summ, 'dividendRate')
+
+    # Fechas earnings
+    earnings = cal.get('earnings') or {}
+    earn_dates = earnings.get('earningsDate') or []
+    if isinstance(earn_dates, list) and earn_dates:
+        first = earn_dates[0]
+        if isinstance(first, dict) and first.get('fmt'):
+            base['next_earnings_date'] = first['fmt']
+    last_earn = keys.get('lastFiscalYearEnd') or {}
+    if isinstance(last_earn, dict) and last_earn.get('fmt'):
+        base['last_earnings_date'] = last_earn['fmt']
+
+    return base
+
+
+@app.route('/api/assets/<int:accion_id>/fundamentals')
+def get_fundamentals(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _fund_lock:
+        entry = _fund_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _FUND_TTL:
+            return _jresp(entry['data'])
+
+    raw  = _yf_fundamentals(symbol)
+    data = _build_fundamentals(symbol, raw)
+
+    with _fund_lock:
+        _fund_cache[symbol] = {'data': data, 'ts': time.time()}
+
+    return _jresp(data)
+
+
+# ── /api/notifications ────────────────────────────────────────────────────────
+#
+# Feed unificado de notificaciones generadas por los batches.
+#  GET  /api/notifications?limit=50&kind=close
+#  POST /api/notifications/<id>/read
+
+@app.route('/api/notifications')
+@login_required
+def get_notifications():
+    limit = min(int(request.args.get('limit', 50)), 200)
+    kind  = request.args.get('kind', '').strip()
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            if kind:
+                cur.execute("""
+                    SELECT id, batch_run_id, kind, title, body, data_json, created_at, read_at
+                    FROM notification
+                    WHERE kind = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, [kind, limit])
+            else:
+                cur.execute("""
+                    SELECT id, batch_run_id, kind, title, body, data_json, created_at, read_at
+                    FROM notification
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, [limit])
+            rows = cur.fetchall()
+
+    # Parsear data_json para que el frontend reciba un objeto, no un string
+    for r in rows:
+        if r.get('data_json'):
+            try:
+                r['data'] = json.loads(r['data_json'])
+            except Exception:
+                r['data'] = None
+        else:
+            r['data'] = None
+        r.pop('data_json', None)
+
+    return _jresp({'items': rows})
+
+
+@app.route('/api/notifications/<int:notif_id>/read', methods=['POST'])
+@login_required
+def mark_notification_read(notif_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE notification SET read_at = NOW() WHERE id = %s AND read_at IS NULL",
+                [notif_id],
+            )
+        conn.commit()
+    return _jresp({'ok': True})
+
+
+@app.route('/api/notifications/unread-count')
+@login_required
+def get_unread_count():
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM notification WHERE read_at IS NULL")
+            n = cur.fetchone()['n']
+    return _jresp({'unread': n})
+
+
+# ── Backtest: rotación semanal ────────────────────────────────────────────────
+
+@app.route('/api/backtest/rotation')
+@login_required
+def get_backtest_rotation():
+    """
+    Backtest de la estrategia de rotación semanal vs SPY buy & hold.
+
+    Query params (todos opcionales):
+        start          ISO date (YYYY-MM-DD), default = end - 365 días
+        end            ISO date, default = hoy
+        capital        float, default 10000
+        fee            float (ratio), default 0.0005
+        max_universe   int, default 500 — top N por liquidez (perf)
+        top_keep       int, default 10
+        rotate_diff    float, default 15.0
+        mode           'top1' | 'top3_equal', default 'top1'
+        regime_filter  bool, default true (filtra cuando SPY < SMA200)
+        min_price      float, default 10.0
+        min_avg_vol    float, default 1_000_000
+
+    Devuelve dict completo con config, period, history, equity_curve,
+    metrics y summary. Pensado para alimentar /backtest/rotation en frontend.
+    """
+    from strategies.rotation import RotationBacktest, VALID_MODES
+
+    def _qd(name):
+        v = request.args.get(name)
+        if not v:
+            return None
+        try:
+            return datetime.datetime.strptime(v, '%Y-%m-%d').date()
+        except ValueError:
+            return None
+
+    def _qf(name, default):
+        v = request.args.get(name)
+        try:
+            return float(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    def _qi(name, default):
+        v = request.args.get(name)
+        try:
+            return int(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    def _qb(name, default):
+        v = request.args.get(name)
+        if v is None:
+            return default
+        return v.strip().lower() in ('1', 'true', 'yes', 'on', 't')
+
+    mode = (request.args.get('mode') or 'top1').strip().lower()
+    if mode not in VALID_MODES:
+        return _jresp({'error': f'mode inválido. Válidos: {list(VALID_MODES)}'}, 400)
+
+    bt = RotationBacktest(
+        initial_capital=_qf('capital', 10000.0),
+        fee_rate       =_qf('fee',     0.0005),
+        top_keep       =_qi('top_keep', 10),
+        rotate_diff    =_qf('rotate_diff', 15.0),
+        max_universe   =_qi('max_universe', 500),
+        mode           =mode,
+        regime_filter  =_qb('regime_filter', True),
+        min_price      =_qf('min_price', 10.0),
+        min_avg_vol    =_qf('min_avg_vol', 1_000_000),
+    )
+    try:
+        result = bt.run(_qd('start'), _qd('end'))
+    except Exception as e:
+        return _jresp({'error': str(e)}, 500)
+    return _jresp(result)
+
+
 # ── Pre-calentado del caché en background ─────────────────────────────────────
 
 def _warm_cache():
@@ -780,6 +1635,16 @@ def _warm_cache():
         print(' * Caché WMA listo.')
     except Exception as e:
         print(f' * WARN precalentado: {e}')
+
+
+# ── Bootstrap (corre al import del módulo, ej. bajo gunicorn) ─────────────────
+# Las migraciones son idempotentes (CREATE TABLE IF NOT EXISTS / ALTER ... IF
+# NOT COLUMN), así que es seguro ejecutarlas en cada arranque/worker.
+try:
+    _ensure_users_table()
+    _ensure_batch_tables()
+except Exception as _bootstrap_err:
+    print(f' * WARN bootstrap migrations: {_bootstrap_err}')
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

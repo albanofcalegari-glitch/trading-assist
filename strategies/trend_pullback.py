@@ -438,6 +438,27 @@ def _make_decision(
 # Análisis por símbolo
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _today_gap_pct(rows: list[dict]) -> Optional[float]:
+    """Gap de apertura del día = (open_today / close_yesterday - 1) * 100.
+
+    Se usa para etiquetar señales BUY como 'gap-blocked' en el cliente. NO
+    filtra hard en el backend: el frontend tiene un selector global con el
+    threshold preferido del usuario y aplica la transformación visual.
+    """
+    if len(rows) < 2:
+        return None
+    today = rows[-1]
+    prev  = rows[-2]
+    open_t = today.get('open')
+    close_y = prev.get('close')
+    if not open_t or not close_y:
+        return None
+    try:
+        return round((float(open_t) / float(close_y) - 1) * 100, 2)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
 def analyze_symbol(symbol: str, fecha: Optional[date] = None) -> Optional[dict]:
     """
     Analiza el setup Trend+Pullback de un símbolo en una fecha dada.
@@ -453,6 +474,7 @@ def analyze_symbol(symbol: str, fecha: Optional[date] = None) -> Optional[dict]:
     closes  = [float(r['close'])  for r in rows]
     volumes = [float(r['volume']) for r in rows]
     price   = closes[-1]
+    gap_pct = _today_gap_pct(rows)
 
     # Indicadores
     ema20_val  = ema(closes, 20)
@@ -506,6 +528,8 @@ def analyze_symbol(symbol: str, fecha: Optional[date] = None) -> Optional[dict]:
         'mom20':             mom20_val,
         'mom60':             mom60_val,
         'vol_ratio':         vol_r,
+        # Gap de apertura del día — el cliente decide si lo usa como filtro
+        'gap_pct':           gap_pct,
         # metadata de debug
         '_trend_det':        trend_det,
         '_pull_det':         pull_det,
@@ -558,6 +582,7 @@ CREATE TABLE IF NOT EXISTS trend_pullback_signals (
     mom20            DECIMAL(8,4)  DEFAULT NULL,
     mom60            DECIMAL(8,4)  DEFAULT NULL,
     vol_ratio        DECIMAL(6,3)  DEFAULT NULL,
+    gap_pct          DECIMAL(6,2)  DEFAULT NULL,
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                      ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
@@ -565,22 +590,34 @@ CREATE TABLE IF NOT EXISTS trend_pullback_signals (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
+# Migración idempotente para agregar gap_pct a tablas existentes.
+# MySQL 8 no soporta `IF NOT EXISTS` en ADD COLUMN, así que verificamos
+# information_schema antes de ejecutar.
+_ADD_GAP_PCT_SQL = """
+SELECT COUNT(*) AS n FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND table_name   = 'trend_pullback_signals'
+  AND column_name  = 'gap_pct'
+"""
+
 _UPSERT_SQL = """
 INSERT INTO trend_pullback_signals
     (fecha, simbolo, trend_score, pullback_score, setup_state,
      context_alignment, decision, confidence_level, allow_trade, reading,
-     price, ema20, sma50, sma200, rsi14, mom20, mom60, vol_ratio)
+     price, ema20, sma50, sma200, rsi14, mom20, mom60, vol_ratio, gap_pct)
 VALUES
     (%(fecha)s, %(simbolo)s, %(trend_score)s, %(pullback_score)s, %(setup_state)s,
      %(context_alignment)s, %(decision)s, %(confidence_level)s, %(allow_trade)s, %(reading)s,
-     %(price)s, %(ema20)s, %(sma50)s, %(sma200)s, %(rsi14)s, %(mom20)s, %(mom60)s, %(vol_ratio)s)
+     %(price)s, %(ema20)s, %(sma50)s, %(sma200)s, %(rsi14)s, %(mom20)s, %(mom60)s, %(vol_ratio)s,
+     %(gap_pct)s)
 ON DUPLICATE KEY UPDATE
     trend_score=VALUES(trend_score), pullback_score=VALUES(pullback_score),
     setup_state=VALUES(setup_state), context_alignment=VALUES(context_alignment),
     decision=VALUES(decision), confidence_level=VALUES(confidence_level),
     allow_trade=VALUES(allow_trade), reading=VALUES(reading),
     price=VALUES(price), ema20=VALUES(ema20), sma50=VALUES(sma50), sma200=VALUES(sma200),
-    rsi14=VALUES(rsi14), mom20=VALUES(mom20), mom60=VALUES(mom60), vol_ratio=VALUES(vol_ratio)
+    rsi14=VALUES(rsi14), mom20=VALUES(mom20), mom60=VALUES(mom60), vol_ratio=VALUES(vol_ratio),
+    gap_pct=VALUES(gap_pct)
 """
 
 
@@ -589,6 +626,15 @@ def ensure_table() -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(_ENSURE_TABLE_SQL)
+            # Migración idempotente: agregar gap_pct si la tabla ya existía
+            cur.execute(_ADD_GAP_PCT_SQL)
+            row = cur.fetchone()
+            n = row['n'] if isinstance(row, dict) else row[0]
+            if n == 0:
+                cur.execute(
+                    "ALTER TABLE trend_pullback_signals "
+                    "ADD COLUMN gap_pct DECIMAL(6,2) DEFAULT NULL AFTER vol_ratio"
+                )
     finally:
         conn.close()
 
