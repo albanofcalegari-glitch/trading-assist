@@ -13,5 +13,5 @@ start "Trading Assist UI" cmd /k "cd frontend && npm run dev"
 
 echo.
 echo API:      http://localhost:8000
-echo Frontend: http://localhost:3000
+echo Frontend: http://localhost:3001
 echo.

@@ -69,7 +69,7 @@ export default function Screener() {
             Cruces y setups de corto plazo{fecha && ` · ${fecha}`}
           </p>
         </div>
-        <button className="btn-ghost text-xs gap-1.5" onClick={load}>
+        <button className="btn-ghost text-xs gap-1.5" onClick={() => load()}>
           <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
           Actualizar
         </button>

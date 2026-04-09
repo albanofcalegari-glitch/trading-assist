@@ -123,6 +123,84 @@ export function resampleOHLCV(candles: Candle[], freq: 'W' | 'M'): Candle[] {
   return out
 }
 
+/** ADX — Average Directional Index (período 14 por defecto)
+ *  Retorna { adx, plusDI, minusDI } arrays alineados con candles.
+ */
+export function calcADX(
+  candles: Candle[],
+  period = 14,
+): { adx: (number | null)[]; plusDI: (number | null)[]; minusDI: (number | null)[] } {
+  const len = candles.length
+  const adx:     (number | null)[] = new Array(len).fill(null)
+  const plusDI:  (number | null)[] = new Array(len).fill(null)
+  const minusDI: (number | null)[] = new Array(len).fill(null)
+  if (len < period * 2 + 1) return { adx, plusDI, minusDI }
+
+  // True Range, +DM, -DM raw
+  const tr:  number[] = [0]
+  const pdm: number[] = [0]
+  const ndm: number[] = [0]
+
+  for (let i = 1; i < len; i++) {
+    const h  = Number(candles[i].high)
+    const l  = Number(candles[i].low)
+    const pc = Number(candles[i - 1].close)
+    tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)))
+
+    const upMove   = h - Number(candles[i - 1].high)
+    const downMove = Number(candles[i - 1].low) - l
+    pdm.push(upMove > downMove && upMove > 0 ? upMove : 0)
+    ndm.push(downMove > upMove && downMove > 0 ? downMove : 0)
+  }
+
+  // Wilder smoothing para ATR, +DM14, -DM14
+  let atr14 = 0, pdm14 = 0, ndm14 = 0
+  for (let i = 1; i <= period; i++) {
+    atr14 += tr[i]; pdm14 += pdm[i]; ndm14 += ndm[i]
+  }
+
+  const smooth = (prev: number, cur: number) => prev - prev / period + cur
+
+  // Primer valor de DI en index = period
+  let pdi = atr14 > 0 ? (pdm14 / atr14) * 100 : 0
+  let ndi = atr14 > 0 ? (ndm14 / atr14) * 100 : 0
+  plusDI[period]  = pdi
+  minusDI[period] = ndi
+
+  const dxArr: number[] = []
+  const sumPdiNdi = pdi + ndi
+  dxArr.push(sumPdiNdi > 0 ? (Math.abs(pdi - ndi) / sumPdiNdi) * 100 : 0)
+
+  for (let i = period + 1; i < len; i++) {
+    atr14 = smooth(atr14, tr[i])
+    pdm14 = smooth(pdm14, pdm[i])
+    ndm14 = smooth(ndm14, ndm[i])
+
+    pdi = atr14 > 0 ? (pdm14 / atr14) * 100 : 0
+    ndi = atr14 > 0 ? (ndm14 / atr14) * 100 : 0
+    plusDI[i]  = pdi
+    minusDI[i] = ndi
+
+    const s = pdi + ndi
+    dxArr.push(s > 0 ? (Math.abs(pdi - ndi) / s) * 100 : 0)
+  }
+
+  // ADX = Wilder smooth de DX (necesita otro período de warm-up)
+  if (dxArr.length < period) return { adx, plusDI, minusDI }
+
+  let adxVal = 0
+  for (let i = 0; i < period; i++) adxVal += dxArr[i]
+  adxVal /= period
+  adx[period * 2] = adxVal
+
+  for (let i = period; i < dxArr.length; i++) {
+    adxVal = (adxVal * (period - 1) + dxArr[i]) / period
+    adx[period + i] = adxVal
+  }
+
+  return { adx, plusDI, minusDI }
+}
+
 /** RSI de Wilder (período 14 por defecto) */
 export function calcRSI(closes: number[], period = 14): (number | null)[] {
   const result: (number | null)[] = new Array(closes.length).fill(null)

@@ -12,13 +12,14 @@ interface Props {
   loading?: boolean
 }
 
+// `hideOnMobile` oculta la columna en pantallas chicas usando `hidden md:table-cell`
 const COLS = [
-  { key: 'simbolo',    label: 'Símbolo',  cls: 'w-28' },
-  { key: 'nombre',     label: 'Empresa',  cls: 'min-w-0' },
-  { key: 'mercado',    label: 'Mercado',  cls: 'w-28 text-center' },
-  { key: 'precio',     label: 'Precio',   cls: 'w-24 text-right' },
-  { key: 'pct_cambio', label: 'Cambio',   cls: 'w-24 text-right' },
-  { key: 'volumen',    label: 'Volumen',  cls: 'w-24 text-right' },
+  { key: 'simbolo',    label: 'Símbolo',  cls: 'w-20 md:w-28',                    hideOnMobile: false },
+  { key: 'nombre',     label: 'Empresa',  cls: 'min-w-0 hidden md:table-cell',    hideOnMobile: true  },
+  { key: 'mercado',    label: 'Mercado',  cls: 'w-20 md:w-28 text-center hidden sm:table-cell', hideOnMobile: true },
+  { key: 'precio',     label: 'Precio',   cls: 'w-20 md:w-24 text-right',         hideOnMobile: false },
+  { key: 'pct_cambio', label: 'Cambio',   cls: 'w-20 md:w-24 text-right',         hideOnMobile: false },
+  { key: 'volumen',    label: 'Volumen',  cls: 'w-24 text-right hidden lg:table-cell', hideOnMobile: true },
 ]
 
 export default function AssetTable({ items, total, page, pages, onPage, loading }: Props) {
@@ -62,33 +63,34 @@ export default function AssetTable({ items, total, page, pages, onPage, loading 
                   className="table-row cursor-pointer group"
                   onClick={() => navigate(`/asset/${a.accion_id}`)}
                 >
-                  {/* Símbolo */}
-                  <td className="px-4 py-2.5">
+                  {/* Símbolo + (en móvil) nombre debajo */}
+                  <td className="px-2 md:px-4 py-2.5">
                     <span className="font-mono font-semibold text-sm text-text-primary
                                      group-hover:text-accent transition-colors">
                       {a.simbolo}
                     </span>
+                    <p className="md:hidden text-2xs text-text-muted truncate">{a.nombre}</p>
                   </td>
-                  {/* Empresa */}
-                  <td className="px-4 py-2.5 max-w-0">
+                  {/* Empresa — desktop */}
+                  <td className="px-4 py-2.5 max-w-0 hidden md:table-cell">
                     <p className="text-sm text-text-secondary truncate">{a.nombre}</p>
                   </td>
-                  {/* Mercado */}
-                  <td className="px-4 py-2.5 text-center">
+                  {/* Mercado — sm+ */}
+                  <td className="px-4 py-2.5 text-center hidden sm:table-cell">
                     <span className="badge badge-neutral">{a.mercado}</span>
                   </td>
                   {/* Precio */}
-                  <td className="px-4 py-2.5 text-right">
+                  <td className="px-2 md:px-4 py-2.5 text-right">
                     <span className="font-mono text-sm text-text-primary">{fmtPrice(a.precio)}</span>
                   </td>
                   {/* Cambio */}
-                  <td className="px-4 py-2.5 text-right">
+                  <td className="px-2 md:px-4 py-2.5 text-right">
                     <span className={`font-mono text-sm font-medium ${pctClass(a.pct_cambio)}`}>
                       {fmtPct(a.pct_cambio)}
                     </span>
                   </td>
-                  {/* Volumen */}
-                  <td className="px-4 py-2.5 text-right">
+                  {/* Volumen — lg+ */}
+                  <td className="px-4 py-2.5 text-right hidden lg:table-cell">
                     <span className="font-mono text-xs text-text-secondary">
                       {fmtVol(a.volumen)}
                     </span>
