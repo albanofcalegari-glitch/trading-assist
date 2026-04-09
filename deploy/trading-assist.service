@@ -1,0 +1,18 @@
+[Unit]
+Description=Trading Assist API
+After=network.target mysql.service
+
+[Service]
+User=www-data
+WorkingDirectory=/opt/trading-assist
+ExecStart=/opt/trading-assist/venv/bin/gunicorn \
+    --bind 127.0.0.1:8000 \
+    --workers 2 \
+    --timeout 300 \
+    api:app
+Restart=always
+RestartSec=5
+Environment="JWT_SECRET=CAMBIAME_POR_ALGO_SEGURO"
+
+[Install]
+WantedBy=multi-user.target
