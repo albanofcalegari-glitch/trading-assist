@@ -1,25 +1,36 @@
 /** @type {import('tailwindcss').Config} */
+//
+// Los colores se mapean a CSS variables para soportar dark / light theme
+// sin tocar las clases de los componentes. Los valores reales viven en
+// `src/index.css` (`:root` = dark, `:root.light` = overrides light).
+//
+const rgb = (v) => `rgb(var(${v}) / <alpha-value>)`
+
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
+  darkMode: 'class',
   theme: {
     extend: {
       colors: {
-        bg:       '#0b0d11',
-        surface:  '#111520',
-        elevated: '#181d28',
-        border:   '#1e2535',
-        'border-subtle': '#161b27',
+        bg:              rgb('--c-bg'),
+        surface:         rgb('--c-surface'),
+        elevated:        rgb('--c-elevated'),
+        border:          rgb('--c-border'),
+        'border-subtle': rgb('--c-border-subtle'),
         text: {
-          primary:   '#e2e8f0',
-          secondary: '#7c8ca1',
-          muted:     '#3f4f63',
+          primary:   rgb('--c-text-primary'),
+          secondary: rgb('--c-text-secondary'),
+          muted:     rgb('--c-text-muted'),
         },
-        accent:  { DEFAULT: '#4f79e8', hover: '#3b66d6' },
-        up:      { DEFAULT: '#22c55e', muted: '#14532d' },
-        down:    { DEFAULT: '#ef4444', muted: '#450a0a' },
-        warn:    { DEFAULT: '#f59e0b', muted: '#451a03' },
-        signal:  { DEFAULT: '#a78bfa', muted: '#2e1065' },
-        neutral: { DEFAULT: '#475569', muted: '#1e293b' },
+        accent: {
+          DEFAULT: rgb('--c-accent'),
+          hover:   rgb('--c-accent-hover'),
+        },
+        up:      { DEFAULT: rgb('--c-up'),      muted: rgb('--c-up-muted') },
+        down:    { DEFAULT: rgb('--c-down'),    muted: rgb('--c-down-muted') },
+        warn:    { DEFAULT: rgb('--c-warn'),    muted: rgb('--c-warn-muted') },
+        signal:  { DEFAULT: rgb('--c-signal'),  muted: rgb('--c-signal-muted') },
+        neutral: { DEFAULT: rgb('--c-neutral'), muted: rgb('--c-neutral-muted') },
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
@@ -37,8 +48,8 @@ export default {
         xl:  '12px',
       },
       boxShadow: {
-        card: '0 1px 3px rgba(0,0,0,.4), 0 0 0 1px rgba(255,255,255,.03)',
-        glow: '0 0 12px rgba(79,121,232,.25)',
+        card: 'var(--shadow-card)',
+        glow: 'var(--shadow-glow)',
       },
     },
   },
