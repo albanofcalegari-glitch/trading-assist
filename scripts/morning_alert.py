@@ -19,6 +19,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, 'scripts'))
 
 from datetime import date
 import requests
@@ -30,6 +31,7 @@ from context.sector_regime  import run_sector_regime,  get_latest_sector_regimes
 from strategies.trend_pullback import run_universe as run_trend_pullback
 from strategies.reversal       import run_universe as run_reversal
 from strategies.support_zones  import run_universe as run_support_zones
+from backfill_history import backfill_symbol, ensure_table, _ALL_SYMBOLS
 
 # ── Credenciales Telegram (mismas que morning_scan.py de finanzas_personales) ──
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_BOT_TOKEN',  '8254793386:AAExpnwxEpnWqDqyJmRsN9MZmE3lea6_lis')
@@ -52,6 +54,24 @@ def step_update_prices():
             sector_map=SECTOR_MAP,
         )
         print('  OK')
+    except Exception as e:
+        print(f'  ERROR: {e}')
+
+
+# =============================================================================
+#  PASO 1b — Actualizar ohlcv_extended (datos faltantes)
+# =============================================================================
+def step_update_ohlcv_extended():
+    print('\n[1b/5] Actualizando ohlcv_extended...')
+    try:
+        ensure_table()
+        updated = 0
+        for sym in _ALL_SYMBOLS:
+            for tf in ['D', 'W', 'M']:
+                r = backfill_symbol(sym, tf, update_only=True)
+                if not r.get('skipped'):
+                    updated += r.get('inserted', 0) + r.get('updated', 0)
+        print(f'  OK — {updated} registros actualizados')
     except Exception as e:
         print(f'  ERROR: {e}')
 
@@ -256,6 +276,7 @@ def main():
 
     if not args.skip_update:
         step_update_prices()
+        step_update_ohlcv_extended()
 
     step_context()
     short      = step_short_term(hoy)
