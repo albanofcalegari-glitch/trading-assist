@@ -49,6 +49,12 @@ _hzones_cache: dict = {}         # symbol → {'data': dict, 'ts': float}
 _hzones_lock = threading.Lock()
 _HZONES_TTL  = 3600              # 1 hora
 
+# ── Caché para channel-detection ──────────────────────────────────────────────
+
+_channel_cache: dict = {}        # symbol → {'data': dict, 'ts': float}
+_channel_lock = threading.Lock()
+_CHANNEL_TTL  = 3600             # 1 hora
+
 # ── Optionals ──────────────────────────────────────────────────────────────────
 try:
     from flask import Flask, jsonify, request
@@ -1152,6 +1158,43 @@ def get_horizontal_zones(accion_id: int):
 
     with _hzones_lock:
         _hzones_cache[symbol] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/assets/<id>/channel ──────────────────────────────────────────────────
+#
+# Detección de canal paralelo (ascendente, descendente, horizontal) sobre datos
+# semanales.  Retorna tipo, soporte/resistencia, posición dentro del canal,
+# y datos de líneas para plotting.
+
+@app.route('/api/assets/<int:accion_id>/channel')
+def get_channel(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _channel_lock:
+        entry = _channel_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _CHANNEL_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        from strategies.channel_detection import detect_channels_multi
+        channels = detect_channels_multi(symbol, datetime.date.today())
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    result = {'symbol': symbol, 'channels': channels}
+
+    with _channel_lock:
+        _channel_cache[symbol] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 

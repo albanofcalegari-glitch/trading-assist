@@ -196,6 +196,35 @@ export interface HorizontalZone {
   pivots:          { fecha: string; price: number }[]
 }
 
+export interface ChannelItem {
+  simbolo:          string
+  fecha:            string
+  channel_type:     'ASCENDING' | 'DESCENDING' | 'HORIZONTAL' | null
+  upper_now:        number
+  lower_now:        number
+  width_pct:        number
+  position:         number
+  containment:      number
+  slope_annual_pct: number
+  decision:         string
+  reading:          string
+  pivot_highs_count: number
+  pivot_lows_count:  number
+  low_touches:      number
+  up_touches:       number
+  score:            number
+  line_origin:      string
+  line_slope:       number
+  line_ic_lower:    number
+  line_ic_upper:    number
+  horizon:          'long' | 'medium' | 'short'
+}
+
+export interface ChannelData {
+  symbol:   string
+  channels: ChannelItem[]
+}
+
 export interface HorizontalZonesResponse {
   symbol:           string
   fecha:            string
@@ -320,6 +349,9 @@ export const api = {
 
   horizontalZones: (id: number) =>
     get<HorizontalZonesResponse>(`/assets/${id}/horizontal-zones`),
+
+  channel: (id: number) =>
+    get<ChannelData>(`/assets/${id}/channel`),
 
   companyInfo: (id: number) =>
     get<CompanyInfo>(`/assets/${id}/company-info`),

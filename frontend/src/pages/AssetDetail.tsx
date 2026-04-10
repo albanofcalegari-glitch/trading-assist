@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { ArrowLeft, TrendingUp, Activity, BarChart2, Tv2, AlertTriangle } from 'lucide-react'
-import { api, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal } from '@/lib/api'
+import { api, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem } from '@/lib/api'
 import { fmtPrice, fmtPct, pctClass, fmt, calcRSI, calcADX } from '@/lib/utils'
 import PriceChart, { buildIndicatorLines } from '@/components/detail/PriceChart'
 import { SemaphoreBadge } from '@/components/shared/Semaphore'
@@ -45,6 +45,8 @@ export default function AssetDetail() {
   const [companyInfo,    setCompanyInfo]    = useState<CompanyInfo | null>(null)
   const [companyLoading, setCompanyLoading] = useState(true)
   const [tpSignal,       setTpSignal]       = useState<TrendPullbackSignal | null>(null)
+  const [channelData,    setChannelData]    = useState<ChannelData | null>(null)
+  const [showChannels,   setShowChannels]   = useState(true)
 
   useEffect(() => {
     if (!accionId) return
@@ -71,6 +73,11 @@ export default function AssetDetail() {
     api.trendPullbackSignal(accionId)
       .then(setTpSignal)
       .catch(() => setTpSignal(null))
+
+    // Fetch channel detection
+    api.channel(accionId)
+      .then(setChannelData)
+      .catch(() => setChannelData(null))
   }, [accionId])
 
   const rsiValues   = candles.length ? calcRSI(candles.map(c => Number(c.close))) : []
@@ -82,6 +89,49 @@ export default function AssetDetail() {
 
   const activeStrategies = [strategyA, strategyB].filter(s => s !== '(Ninguna)')
   const indicatorLines = buildIndicatorLines(candles, activeStrategies)
+
+  // Build channel overlay lines — multiple horizons with different colors
+  // Log-scale chart → exp() lines appear as straight lines (same as PDF/TradingView)
+  const channelColors: Record<string, { line: string; mid: string }> = {
+    long:   { line: '#00e5ff', mid: 'rgba(0,229,255,0.25)' },
+    medium: { line: '#FFD700', mid: 'rgba(255,215,0,0.2)' },
+    short:  { line: '#00ff88', mid: 'rgba(0,255,136,0.2)' },
+  }
+  const channelItems: ChannelItem[] = showChannels ? (channelData?.channels ?? []) : []
+  for (const ch of channelItems) {
+    if (!ch.channel_type || !candles.length) continue
+    const originMs = new Date(ch.line_origin).getTime()
+    const slope = ch.line_slope
+    const icLow = ch.line_ic_lower
+    const icUp = ch.line_ic_upper
+    const colors = channelColors[ch.horizon] ?? channelColors.long
+    const dates: string[] = []
+    const upperVals: (number | null)[] = []
+    const lowerVals: (number | null)[] = []
+    const midVals: (number | null)[] = []
+    for (const c of candles) {
+      const ms = new Date(c.fecha).getTime()
+      dates.push(c.fecha)
+      if (ms < originMs) {
+        upperVals.push(null)
+        lowerVals.push(null)
+        midVals.push(null)
+        continue
+      }
+      const days = (ms - originMs) / 86400000
+      const u = Math.exp(slope * days + icUp)
+      const l = Math.exp(slope * days + icLow)
+      upperVals.push(u)
+      lowerVals.push(l)
+      midVals.push(Math.sqrt(u * l))
+    }
+    const label = ch.horizon === 'long' ? 'LP' : ch.horizon === 'medium' ? 'MP' : 'CP'
+    indicatorLines.push(
+      { dates, values: upperVals, color: colors.line, label: `Canal ${label} Upper` },
+      { dates, values: lowerVals, color: colors.line, label: `Canal ${label} Lower` },
+      { dates, values: midVals,   color: colors.mid,  label: `Canal ${label} Mid` },
+    )
+  }
   const rsiDivergenceActive = activeStrategies.includes('RSI Divergence — Señal')
 
   // Último indicador disponible
@@ -267,6 +317,17 @@ export default function AssetDetail() {
           onClick={() => setChartMode('tv')}
         >
           <Tv2 size={12} /> TradingView Live
+        </button>
+        <span className="mx-1 border-l border-border h-5" />
+        <button
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
+            showChannels
+              ? 'bg-[#00e5ff]/20 text-[#00e5ff] border-[#00e5ff]/40'
+              : 'border-border text-text-muted hover:text-text-secondary'
+          }`}
+          onClick={() => setShowChannels(v => !v)}
+        >
+          <TrendingUp size={12} /> Canales
         </button>
       </div>
 

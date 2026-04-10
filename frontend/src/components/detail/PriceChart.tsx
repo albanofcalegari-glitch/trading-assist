@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import {
   createChart, ColorType, LineStyle, PriceScaleMode,
-  type IChartApi, type CandlestickSeriesOptions,
+  type IChartApi, type ISeriesApi, type CandlestickSeriesOptions,
 } from 'lightweight-charts'
 import { calcWMA, calcSMA, resampleOHLCV, type Candle } from '@/lib/utils'
 
@@ -40,9 +40,12 @@ export default function PriceChart({
   candles, freq, indicators,
   height = 550,
 }: Props) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const chartRef     = useRef<IChartApi | null>(null)
+  const containerRef  = useRef<HTMLDivElement>(null)
+  const chartRef      = useRef<IChartApi | null>(null)
+  const overlayRef    = useRef<ISeriesApi<'Line'>[]>([])
+  const chartDatesRef = useRef<Set<string>>(new Set())
 
+  // ── Effect 1: Chart lifecycle (candles, freq, height) ─────────────────────
   useEffect(() => {
     if (!containerRef.current || !candles.length) return
 
@@ -50,16 +53,17 @@ export default function PriceChart({
       chartRef.current.remove()
       chartRef.current = null
     }
+    overlayRef.current = []
 
     const el = containerRef.current
 
-    // Resample según temporalidad desde datos diarios (ohlcv_extended D = 20 años).
-    // D: sin resample. W: agrega diario→semanal. M: agrega diario→mensual.
     const data = freq === 'D' ? candles
                : freq === 'W' ? resampleOHLCV(candles, 'W')
                :                resampleOHLCV(candles, 'M')
 
-    // ── Chart — opciones idénticas al look TradingView dark ───────────────────
+    // Store chart dates so Effect 2 can filter overlays to matching dates only
+    chartDatesRef.current = new Set(data.map(c => c.fecha))
+
     const chart = createChart(el, {
       width:  el.clientWidth,
       height,
@@ -69,8 +73,6 @@ export default function PriceChart({
         textColor:  COLORS.text,
         fontFamily: "'Trebuchet MS', Arial, sans-serif",
         fontSize:   12,
-        // Oculta el logo de TradingView en versiones recientes de lightweight-charts.
-        // Si la versión instalada no lo soporta, el fallback DOM-hide más abajo lo cubre.
         attributionLogo: false,
       } as any,
       grid: {
@@ -92,7 +94,6 @@ export default function PriceChart({
           labelBackgroundColor: COLORS.border,
         },
       },
-      // Scroll horizontal con rueda + drag con click; zoom con rueda y pinch
       handleScroll: {
         mouseWheel:           true,
         pressedMouseMove:     true,
@@ -108,7 +109,7 @@ export default function PriceChart({
         autoScale:    true,
         borderVisible: false,
         textColor:    COLORS.text,
-        mode:         PriceScaleMode.Normal,
+        mode:         PriceScaleMode.Logarithmic,
         scaleMargins: { top: 0.02, bottom: 0.02 },
       },
       timeScale: {
@@ -123,7 +124,6 @@ export default function PriceChart({
           const str = typeof t === 'string' ? t : new Date(t * 1000).toISOString().slice(0, 10)
           const [y, m, d] = str.split('-').map(Number)
           const date = new Date(y, m - 1, d)
-          // tickMarkType: 0=Year 1=Month 2=DayOfMonth 3=Time
           if (tickMarkType === 0) return String(date.getFullYear())
           if (freq === 'M') return date.toLocaleDateString('es', { month: 'short', year: '2-digit' })
           if (freq === 'W') return date.toLocaleDateString('es', { month: 'short' })
@@ -135,8 +135,7 @@ export default function PriceChart({
 
     chartRef.current = chart
 
-    // Fallback: en versiones viejas de lightweight-charts attributionLogo no existe
-    // y el logo se inyecta como <a href="tradingview...">. Lo ocultamos por DOM.
+    // Fallback: hide TradingView logo
     const hideLogo = () => {
       el.querySelectorAll('a').forEach(a => {
         if (a.href.includes('tradingview')) (a as HTMLElement).style.display = 'none'
@@ -145,7 +144,7 @@ export default function PriceChart({
     hideLogo()
     setTimeout(hideLogo, 200)
 
-    // ── Velas — colores exactos TradingView ───────────────────────────────────
+    // ── Velas ─────────────────────────────────────────────────────────────────
     const candleSeries = chart.addCandlestickSeries({
       upColor:          COLORS.up,
       downColor:        COLORS.down,
@@ -175,7 +174,7 @@ export default function PriceChart({
 
     candleSeries.setData(ohlcData)
 
-    // ── Volumen — histograma en la zona inferior (18%) ─────────────────────────
+    // ── Volumen ───────────────────────────────────────────────────────────────
     const volSeries = chart.addHistogramSeries({
       priceFormat:      { type: 'volume' },
       priceScaleId:     'vol',
@@ -191,32 +190,24 @@ export default function PriceChart({
       color: Number(c.close) >= Number(c.open) ? COLORS.volUp : COLORS.volDown,
     })))
 
-    // Helper: line series excluida del autoscale (solo las velas mandan en el eje Y)
-    const addOverlay = (opts: Parameters<typeof chart.addLineSeries>[0]) =>
-      chart.addLineSeries({
-        ...opts,
-        autoscaleInfoProvider: () => ({ priceRange: null }),
-      } as any)
-
-    // ── Indicadores (WMA, SMA, etc.) ──────────────────────────────────────────
-    for (const ind of indicators) {
-      const series = addOverlay({
-        color:                  ind.color,
+    // ── Overlay pool: series pre-creadas, nunca se agregan ni eliminan ────────
+    // Esto garantiza que toggle de canales/indicadores no altere el layout.
+    const POOL_SIZE = 20
+    const pool: ISeriesApi<'Line'>[] = []
+    for (let i = 0; i < POOL_SIZE; i++) {
+      pool.push(chart.addLineSeries({
+        color:                  '#ffffff',
         lineWidth:              1,
         priceLineVisible:       false,
         lastValueVisible:       false,
         crosshairMarkerVisible: false,
-      })
-      const lineData = ind.dates
-        .map((d, i) => ({ time: d as any, value: ind.values[i] }))
-        .filter(p => p.value != null) as { time: any; value: number }[]
-      series.setData(lineData)
+        visible:                false,
+        autoscaleInfoProvider:  () => ({ priceRange: null }),
+      } as any))
     }
+    overlayRef.current = pool
 
     // ── Vista por defecto según timeframe ─────────────────────────────────────
-    //   D → 365   (~1.5 años de diario)
-    //   W → 250   (~5 años de semanal)
-    //   M → 120   (~10 años de mensual)
     const DEFAULT_BARS = freq === 'W' ? 250 : freq === 'M' ? 120 : 365
     if (data.length > DEFAULT_BARS) {
       chart.timeScale().setVisibleLogicalRange({
@@ -240,9 +231,7 @@ export default function PriceChart({
     }
     el.addEventListener('dblclick', onDblClick)
 
-    // ── Region zoom (Ctrl+drag, estilo TradingView) ──────────────────────────
-    // Drag horizontal con Ctrl presionado define un rango temporal a hacer zoom.
-    // Se dibuja un overlay translúcido sobre el chart durante el drag.
+    // ── Region zoom (Ctrl+drag) ──────────────────────────────────────────────
     el.style.position = 'relative'
     const zoomBox = document.createElement('div')
     Object.assign(zoomBox.style, {
@@ -328,8 +317,33 @@ export default function PriceChart({
       if (zoomBox.parentNode) zoomBox.parentNode.removeChild(zoomBox)
       chart.remove()
       chartRef.current = null
+      overlayRef.current = []
     }
-  }, [candles, freq, indicators, height])
+  }, [candles, freq, height])
+
+  // ── Effect 2: Update overlay data/visibility (never add/remove series) ────
+  useEffect(() => {
+    const pool = overlayRef.current
+    if (!pool.length) return
+
+    // Only use dates that exist in the chart's candle series (weekly/monthly)
+    // to avoid expanding the time scale with daily data points
+    const validDates = chartDatesRef.current
+
+    for (let i = 0; i < pool.length; i++) {
+      if (i < indicators.length) {
+        const ind = indicators[i]
+        const lineData = ind.dates
+          .map((d, j) => ({ time: d as any, value: ind.values[j] }))
+          .filter(p => p.value != null && validDates.has(p.time as string)) as { time: any; value: number }[]
+        pool[i].applyOptions({ color: ind.color, visible: true } as any)
+        pool[i].setData(lineData)
+      } else {
+        pool[i].applyOptions({ visible: false } as any)
+        pool[i].setData([])
+      }
+    }
+  }, [indicators])
 
   return (
     <div

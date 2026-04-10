@@ -25,7 +25,7 @@ DB_CONFIG = MYSQL_CONFIG
 UNIVERSE = [
     'A', 'AAPL', 'ABBV', 'ABT', 'ACN', 'ADBE', 'ADP', 'ADSK', 'AEP', 'AIG',
     'ALL', 'AMAT', 'AMD', 'AMGN', 'AMZN', 'ANET', 'AON', 'APD', 'APH', 'AVGO',
-    'AXP', 'BA', 'BABA', 'BAC', 'BIDU', 'BIIB', 'BKNG', 'BLK', 'BMA', 'BMY',
+    'AXP', 'B', 'BA', 'BABA', 'BAC', 'BIDU', 'BIIB', 'BKNG', 'BLK', 'BMA', 'BMY',
     'BSX', 'BX', 'C', 'CARR', 'CAT', 'CB', 'CDNS', 'CI', 'CL', 'CME',
     'CMI', 'COP', 'COST', 'CRESY', 'CRM', 'CSCO', 'CSX', 'CTAS', 'CTSH', 'CVX',
     'D', 'DE', 'DHR', 'DIS', 'DLR', 'DLTR', 'DOW', 'DUK', 'DXCM', 'ECL',
@@ -41,7 +41,7 @@ UNIVERSE = [
     'PLD', 'PM', 'PNC', 'PRU', 'PSA', 'PSX', 'PYPL', 'QCOM', 'REGN', 'ROP',
     'ROST', 'RTX', 'SBUX', 'SCHW', 'SHW', 'SLB', 'SNPS', 'SO', 'SPG', 'SPGI',
     'SRE', 'SYK', 'T', 'TEL', 'TER', 'TFC', 'TGS', 'TGT', 'TJX', 'TMO',
-    'TRV', 'TSLA', 'TT', 'TXN', 'UNH', 'UNP', 'UPS', 'URI', 'USB', 'V',
+    'TRV', 'TSLA', 'TT', 'TXN', 'UBER', 'UNH', 'UNP', 'UPS', 'URI', 'USB', 'V',
     'VIST', 'VLO', 'VRTX', 'VZ', 'WBD', 'WELL', 'WFC', 'WM', 'WMT', 'XEL',
     'XOM', 'YPF', 'YUM', 'ZTS',
 ]
