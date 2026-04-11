@@ -31,7 +31,7 @@ export default function Header({ onOpenSidebar }: HeaderProps = {}) {
 
   useEffect(() => {
     clearTimeout(timer.current)
-    if (query.length < 2) { setResults([]); setOpen(false); return }
+    if (query.trim().length < 1) { setResults([]); setOpen(false); return }
     setLoading(true)
     timer.current = setTimeout(async () => {
       try {
