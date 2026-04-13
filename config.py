@@ -2,6 +2,7 @@
 trading-assist — configuración central
 """
 import pymysql.cursors
+from pathlib import Path
 
 # ── Base de datos ─────────────────────────────────────────────────────────────
 MYSQL_CONFIG = dict(
@@ -18,33 +19,50 @@ MYSQL_CONFIG = dict(
 DB_CONFIG = MYSQL_CONFIG
 
 # ── Universo de activos ───────────────────────────────────────────────────────
-# 203 símbolos validados contra la BD de prod (>=252 barras disponibles).
-# Incluye S&P 100 + NASDAQ-100 esenciales + sectoriales clave + LATAM (GGAL,
-# BMA, CRESY, EDN, PAM, TGS, YPF, MELI, NU, VIST).
-# Excluidos por falta de data en la BD: BRK-B, MMC, WBA.
-UNIVERSE = [
-    'A', 'AAPL', 'ABBV', 'ABT', 'ACN', 'ADBE', 'ADP', 'ADSK', 'AEP', 'AIG',
-    'ALL', 'AMAT', 'AMD', 'AMGN', 'AMZN', 'ANET', 'AON', 'APD', 'APH', 'AVGO',
-    'AXP', 'B', 'BA', 'BABA', 'BAC', 'BIDU', 'BIIB', 'BKNG', 'BLK', 'BMA', 'BMY',
-    'BSX', 'BX', 'C', 'CARR', 'CAT', 'CB', 'CDNS', 'CI', 'CL', 'CME',
-    'CMI', 'COP', 'COST', 'CRESY', 'CRM', 'CSCO', 'CSX', 'CTAS', 'CTSH', 'CVX',
-    'D', 'DE', 'DHR', 'DIS', 'DLR', 'DLTR', 'DOW', 'DUK', 'DXCM', 'ECL',
-    'EDN', 'ELV', 'EMR', 'EOG', 'EQIX', 'ETN', 'EW', 'EXC', 'F', 'FAST',
-    'FCX', 'FDX', 'FIS', 'FTNT', 'GD', 'GE', 'GGAL', 'GILD', 'GIS', 'GLW',
-    'GOOG', 'GOOGL', 'GS', 'HCA', 'HD', 'HON', 'HRL', 'HSY', 'HUM', 'IBM',
-    'ICE', 'IDXX', 'INTC', 'INTU', 'ISRG', 'ITW', 'JD', 'JNJ', 'JPM', 'KHC',
-    'KKR', 'KLAC', 'KMB', 'KMI', 'KO', 'LIN', 'LLY', 'LMT', 'LOW', 'LRCX',
-    'MA', 'MAR', 'MCD', 'MCHP', 'MCK', 'MDLZ', 'MDT', 'MELI', 'MET', 'META',
-    'MMM', 'MNST', 'MO', 'MPC', 'MRK', 'MRNA', 'MS', 'MSFT', 'MSI', 'NDAQ',
-    'NEE', 'NEM', 'NFLX', 'NIO', 'NOW', 'NSC', 'NU', 'NVDA', 'NXPI', 'ORCL',
-    'ORLY', 'OXY', 'PAM', 'PAYX', 'PCAR', 'PCG', 'PDD', 'PEP', 'PFE', 'PG',
-    'PLD', 'PM', 'PNC', 'PRU', 'PSA', 'PSX', 'PYPL', 'QCOM', 'REGN', 'ROP',
-    'ROST', 'RTX', 'SBUX', 'SCHW', 'SHW', 'SLB', 'SNPS', 'SO', 'SPG', 'SPGI',
-    'SRE', 'SYK', 'T', 'TEL', 'TER', 'TFC', 'TGS', 'TGT', 'TJX', 'TMO',
-    'TRV', 'TSLA', 'TT', 'TXN', 'UBER', 'UNH', 'UNP', 'UPS', 'URI', 'USB', 'V',
-    'VIST', 'VLO', 'VRTX', 'VZ', 'WBD', 'WELL', 'WFC', 'WM', 'WMT', 'XEL',
-    'XOM', 'YPF', 'YUM', 'ZTS',
-]
+# Se carga desde data/universe.txt (generado por scripts/fetch_universe.py).
+# Si el archivo no existe, usa la lista legacy de 203 símbolos como fallback.
+
+_UNIVERSE_FILE = Path(__file__).resolve().parent / 'data' / 'universe.txt'
+
+def _load_universe() -> list[str]:
+    """Carga tickers desde data/universe.txt. Fallback a lista hardcodeada."""
+    if _UNIVERSE_FILE.exists():
+        tickers = []
+        with open(_UNIVERSE_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                tickers.append(line)
+        if tickers:
+            return tickers
+
+    # Fallback: lista legacy curada (203 símbolos)
+    return [
+        'A', 'AAPL', 'ABBV', 'ABT', 'ACN', 'ADBE', 'ADP', 'ADSK', 'AEP', 'AIG',
+        'ALL', 'AMAT', 'AMD', 'AMGN', 'AMZN', 'ANET', 'AON', 'APD', 'APH', 'AVGO',
+        'AXP', 'B', 'BA', 'BABA', 'BAC', 'BIDU', 'BIIB', 'BKNG', 'BLK', 'BMA', 'BMY',
+        'BSX', 'BX', 'C', 'CARR', 'CAT', 'CB', 'CDNS', 'CI', 'CL', 'CME',
+        'CMI', 'COP', 'COST', 'CRESY', 'CRM', 'CSCO', 'CSX', 'CTAS', 'CTSH', 'CVX',
+        'D', 'DE', 'DHR', 'DIS', 'DLR', 'DLTR', 'DOW', 'DUK', 'DXCM', 'ECL',
+        'EDN', 'ELV', 'EMR', 'EOG', 'EQIX', 'ETN', 'EW', 'EXC', 'F', 'FAST',
+        'FCX', 'FDX', 'FIS', 'FTNT', 'GD', 'GE', 'GGAL', 'GILD', 'GIS', 'GLW',
+        'GOOG', 'GOOGL', 'GS', 'HCA', 'HD', 'HON', 'HRL', 'HSY', 'HUM', 'IBM',
+        'ICE', 'IDXX', 'INTC', 'INTU', 'ISRG', 'ITW', 'JD', 'JNJ', 'JPM', 'KHC',
+        'KKR', 'KLAC', 'KMB', 'KMI', 'KO', 'LIN', 'LLY', 'LMT', 'LOW', 'LRCX',
+        'MA', 'MAR', 'MCD', 'MCHP', 'MCK', 'MDLZ', 'MDT', 'MELI', 'MET', 'META',
+        'MMM', 'MNST', 'MO', 'MPC', 'MRK', 'MRNA', 'MS', 'MSFT', 'MSI', 'NDAQ',
+        'NEE', 'NEM', 'NFLX', 'NIO', 'NOW', 'NSC', 'NU', 'NVDA', 'NXPI', 'ORCL',
+        'ORLY', 'OXY', 'PAM', 'PAYX', 'PCAR', 'PCG', 'PDD', 'PEP', 'PFE', 'PG',
+        'PLD', 'PM', 'PNC', 'PRU', 'PSA', 'PSX', 'PYPL', 'QCOM', 'REGN', 'ROP',
+        'ROST', 'RTX', 'SBUX', 'SCHW', 'SHW', 'SLB', 'SNPS', 'SO', 'SPG', 'SPGI',
+        'SRE', 'SYK', 'T', 'TEL', 'TER', 'TFC', 'TGS', 'TGT', 'TJX', 'TMO',
+        'TRV', 'TSLA', 'TT', 'TXN', 'UBER', 'UNH', 'UNP', 'UPS', 'URI', 'USB', 'V',
+        'VIST', 'VLO', 'VRTX', 'VZ', 'WBD', 'WELL', 'WFC', 'WM', 'WMT', 'XEL',
+        'XOM', 'YPF', 'YUM', 'ZTS',
+    ]
+
+UNIVERSE = _load_universe()
 
 # Sector + ETF de referencia por símbolo.
 # Símbolos NO listados acá heredan sector='NEUTRAL' en la lógica de
