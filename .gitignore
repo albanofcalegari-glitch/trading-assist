@@ -12,6 +12,9 @@ output/
 # Local-only scripts con credenciales hard-coded (deploy/diagnóstico)
 _deploy.py
 _diag_*.py
+_*.py
+_*.png
+_bk/
 
 # Reportes/PDFs generados
 *.pdf
