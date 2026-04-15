@@ -1012,14 +1012,8 @@ def get_longterm_support(
     print(f'          first_date={first_date}')
     print(f'          last_date={last_date}', flush=True)
 
-    # Validacion: para W se requieren +1000 barras con historia desde <=2005
-    if used_tf == 'W':
-        if n < 1000:
-            print(f'[DATASET] ABORT: candles_count={n} < 1000 -- dataset insuficiente para calculo estructural', flush=True)
-            return None
-        if first_date > '2005-12-31':
-            print(f'[DATASET] ABORT: first_date={first_date} > 2005 -- faltan datos historicos en ohlcv_extended', flush=True)
-            return None
+    # Validacion relajada: solo se requiere min_bars (52 para long_term).
+    # Activos mas nuevos (post-2015) igual se procesan con los datos disponibles.
 
     # ── Soporte historico ─────────────────────────────────────────────────────
     tl = _find_historical_support(lows, highs, closes, dates, used_tf)

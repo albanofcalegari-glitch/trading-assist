@@ -32,6 +32,15 @@ _PULLBACK_VALID_MIN      = 6    # pullback_score >= este valor → PULLBACK_VALI
 _IN_PULLBACK_MOM_MAX     = -1.5 # mom20 < este % para considerar que hay pullback
 _IN_PULLBACK_MOM60_MIN   = -15  # mom60 por encima de este % (tendencia no destruida)
 
+# Regla Julian (2026-04-15): una alerta de compra de corto plazo solo vale si
+# (a) el precio cerro arriba del soporte dinamico short y dentro del 10% del piso
+# (b) queda al menos 15% de recorrido hasta el maximo historico (ATH).
+# Ejemplo: $100 → cae → soporte en $70 → rebota a $78.  78 esta 11% arriba del
+# soporte y tiene 28% upside al previo ATH $100 → alerta valida.  NVDA hoy $181,
+# soporte $167 (8.7% arriba OK) y ATH $212 → 17% upside, PASA con 15% (no con 20%).
+BUY_SUPPORT_MAX_ABOVE_PCT = 10.0
+BUY_MIN_UPSIDE_TO_ATH_PCT = 15.0
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Carga de datos
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,7 +56,7 @@ def _load_ohlcv(symbol: str, fecha: date, n: int = 300) -> list[dict]:
                    ORDER BY fecha DESC LIMIT %s""",
                 (symbol, fecha, n)
             )
-            rows = cur.fetchall()
+            rows = list(cur.fetchall())
         rows.reverse()
         return rows
     finally:
@@ -435,6 +444,63 @@ def _make_decision(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Filtro Julian: soporte dinamico + upside al ATH (corto plazo)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _short_term_buy_gate(
+    symbol: str,
+    fecha: date,
+    price: float,
+) -> Optional[str]:
+    """
+    Valida una senal BUY_CANDIDATE contra las 3 reglas de Julian (2026-04-15).
+    Devuelve None si pasa, o un string corto con la razon de rechazo.
+
+    Reglas:
+      1. Existe tier `short` en dynamic_supports (soporte nuevo detectado).
+      2. Precio cerro arriba del piso del soporte.
+      3. Precio a lo sumo BUY_SUPPORT_MAX_ABOVE_PCT arriba del piso.
+      4. Queda al menos BUY_MIN_UPSIDE_TO_ATH_PCT de recorrido al ATH.
+    """
+    # Imports locales para evitar coste en paths que no son BUY_CANDIDATE.
+    from strategies.dynamic_supports import get_dynamic_supports
+    from strategies.historical_highs   import analyze_symbol as _highs_analyze
+
+    try:
+        dyn = get_dynamic_supports(symbol, fecha)
+    except Exception:
+        return 'sin soportes dinamicos'
+    short_tier = (dyn or {}).get('short') if dyn else None
+    if not short_tier:
+        return 'sin soporte short nuevo'
+
+    floor = short_tier.get('current_value')
+    if not floor or floor <= 0:
+        return 'soporte invalido'
+
+    if price <= floor:
+        return f'precio ${price:.2f} debajo del soporte ${floor:.2f}'
+
+    above_pct = (price / floor - 1) * 100
+    if above_pct > BUY_SUPPORT_MAX_ABOVE_PCT:
+        return f'{above_pct:.1f}% arriba del soporte (>{BUY_SUPPORT_MAX_ABOVE_PCT:.0f}%)'
+
+    try:
+        highs_r = _highs_analyze(symbol, fecha)
+    except Exception:
+        highs_r = None
+    ath = (highs_r or {}).get('high_all')
+    if not ath or ath <= 0:
+        return 'sin dato de maximo historico'
+
+    upside_pct = (ath / price - 1) * 100
+    if upside_pct < BUY_MIN_UPSIDE_TO_ATH_PCT:
+        return f'solo {upside_pct:.1f}% al ATH (<{BUY_MIN_UPSIDE_TO_ATH_PCT:.0f}%)'
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Análisis por símbolo
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -506,7 +572,18 @@ def analyze_symbol(symbol: str, fecha: Optional[date] = None) -> Optional[dict]:
     confidence = _make_confidence(state, trend_sc, pull_sc, alignment)
     decision   = _make_decision(state, alignment, confidence, trend_sc)
     reading    = _make_reading(state, alignment, trend_sc, pull_sc)
-    allow      = decision == 'BUY_CANDIDATE'
+
+    # Gate Julian (2026-04-15): una alerta de compra corto plazo exige que el
+    # precio haya rebotado en un soporte dinamico nuevo (ascending o zona
+    # horizontal), este dentro del 10% arriba del piso, y tenga >=20% de
+    # recorrido al ATH.  Si no pasa, degrada a WATCHLIST y agrega razon.
+    if decision == 'BUY_CANDIDATE':
+        reject = _short_term_buy_gate(symbol, fecha, price)
+        if reject:
+            decision = 'WATCHLIST'
+            reading  = f'{reading} [compra bloqueada: {reject}]'
+
+    allow = decision == 'BUY_CANDIDATE'
 
     return {
         'fecha':             fecha,
