@@ -12,16 +12,21 @@
  */
 
 import { useEffect, useState } from 'react'
-import { DollarSign, Percent, Scale, BarChart3, CalendarClock } from 'lucide-react'
+import { DollarSign, Percent, Scale, BarChart3, CalendarClock, ChevronDown, ChevronRight } from 'lucide-react'
 import { api, type Fundamentals } from '@/lib/api'
+
+const COLLAPSE_KEY = 'ta:fundamentals:collapsed'
 
 interface Props {
   accionId: number
 }
 
 export default function FundamentalsPanel({ accionId }: Props) {
-  const [data, setData]       = useState<Fundamentals | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [data, setData]           = useState<Fundamentals | null>(null)
+  const [loading, setLoading]     = useState(true)
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try { return localStorage.getItem(COLLAPSE_KEY) !== '0' } catch { return true }
+  })
 
   useEffect(() => {
     if (!accionId) return
@@ -33,30 +38,61 @@ export default function FundamentalsPanel({ accionId }: Props) {
       .finally(() => setLoading(false))
   }, [accionId])
 
+  const toggle = () => {
+    setCollapsed(v => {
+      const next = !v
+      try { localStorage.setItem(COLLAPSE_KEY, next ? '1' : '0') } catch {}
+      return next
+    })
+  }
+
+  // Header compartido — siempre clickeable, muestra chevron según estado
+  const Header = ({ rightSlot }: { rightSlot?: React.ReactNode }) => (
+    <button
+      type="button"
+      onClick={toggle}
+      className="w-full flex items-center gap-2 text-left hover:bg-elevated/40 rounded-sm px-1 -mx-1 py-0.5 transition-colors"
+    >
+      {collapsed ? <ChevronRight size={14} className="text-text-muted" />
+                 : <ChevronDown  size={14} className="text-text-muted" />}
+      <BarChart3 size={14} className="text-accent" />
+      <h3 className="text-sm font-semibold text-text-primary">Fundamentals</h3>
+      {rightSlot && <span className="ml-auto">{rightSlot}</span>}
+    </button>
+  )
+
   if (loading) {
     return (
-      <div className="card p-4">
-        <p className="text-xs text-text-muted">Cargando fundamentals...</p>
+      <div className="card p-3">
+        <Header />
+        {!collapsed && <p className="text-xs text-text-muted mt-2">Cargando fundamentals...</p>}
       </div>
     )
   }
 
   if (!data) {
     return (
-      <div className="card p-4">
-        <p className="text-xs text-text-muted">Sin datos fundamentales disponibles</p>
+      <div className="card p-3">
+        <Header />
+        {!collapsed && <p className="text-xs text-text-muted mt-2">Sin datos fundamentales disponibles</p>}
       </div>
     )
   }
 
   const cur = data.currency || 'USD'
 
+  if (collapsed) {
+    return (
+      <div className="card p-3">
+        <Header rightSlot={<span className="text-2xs text-text-muted">{cur}</span>} />
+      </div>
+    )
+  }
+
   return (
     <div className="card p-4 md:p-5">
-      <div className="flex items-center gap-2 mb-3">
-        <BarChart3 size={14} className="text-accent" />
-        <h3 className="text-sm font-semibold text-text-primary">Fundamentals</h3>
-        <span className="text-2xs text-text-muted ml-auto">{cur}</span>
+      <div className="mb-3">
+        <Header rightSlot={<span className="text-2xs text-text-muted">{cur}</span>} />
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
