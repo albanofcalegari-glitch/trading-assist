@@ -43,6 +43,11 @@ _HEADERS = {
 
 _BASE_URL = 'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}'
 
+
+def _yf_symbol(symbol: str) -> str:
+    # Yahoo Finance usa guiones en lugar de puntos para sub-clases (PBR.A -> PBR-A, BRK.B -> BRK-B).
+    return symbol.replace('.', '-')
+
 # ── Configuración por timeframe ───────────────────────────────────────────────
 # tf -> (intervalo Yahoo Finance, años de historia objetivo)
 
@@ -102,7 +107,7 @@ def _fetch(
 
     period2 = int(datetime.now().timestamp())
 
-    url = _BASE_URL.format(symbol=symbol)
+    url = _BASE_URL.format(symbol=_yf_symbol(symbol))
     params = {
         'interval': yf_interval,
         'period1':  period1,
