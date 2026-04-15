@@ -80,6 +80,7 @@ INSERT INTO ml_signals (
     rsi_14, adx_14, dist_sma200, ret_5d, ret_20d, rs_vs_spy,
     atr14_rel, vs_52w_high, rs_sector, pullback_score,
     dist_to_support, dist_to_resistance,
+    has_dyn_short, dyn_short_dist_pct, dist_to_ath_pct,
     market_regime, vix_percentile, spy_return_20d,
     return_1d, return_5d, return_10d, max_drawdown_5d, label_5d_strong
 ) VALUES (
@@ -88,6 +89,7 @@ INSERT INTO ml_signals (
     %(rsi_14)s, %(adx_14)s, %(dist_sma200)s, %(ret_5d)s, %(ret_20d)s, %(rs_vs_spy)s,
     %(atr14_rel)s, %(vs_52w_high)s, %(rs_sector)s, %(pullback_score)s,
     %(dist_to_support)s, %(dist_to_resistance)s,
+    %(has_dyn_short)s, %(dyn_short_dist_pct)s, %(dist_to_ath_pct)s,
     %(market_regime)s, %(vix_percentile)s, %(spy_return_20d)s,
     %(return_1d)s, %(return_5d)s, %(return_10d)s, %(max_drawdown_5d)s, %(label_5d_strong)s
 )
@@ -100,6 +102,9 @@ ON DUPLICATE KEY UPDATE
     atr14_rel=VALUES(atr14_rel), vs_52w_high=VALUES(vs_52w_high),
     rs_sector=VALUES(rs_sector), pullback_score=VALUES(pullback_score),
     dist_to_support=VALUES(dist_to_support), dist_to_resistance=VALUES(dist_to_resistance),
+    has_dyn_short=VALUES(has_dyn_short),
+    dyn_short_dist_pct=VALUES(dyn_short_dist_pct),
+    dist_to_ath_pct=VALUES(dist_to_ath_pct),
     market_regime=VALUES(market_regime), vix_percentile=VALUES(vix_percentile),
     spy_return_20d=VALUES(spy_return_20d),
     return_1d=VALUES(return_1d), return_5d=VALUES(return_5d), return_10d=VALUES(return_10d),
@@ -142,46 +147,53 @@ def build_dataset(
                 print(f'[ ] {len(tdays)} trading days en {start} → {end}')
                 print(f'[ ] {len(list(symbols))} símbolos')
 
+            stats['errors'] = 0
             t0 = time.time()
             for sym in symbols:
-                for d in tdays:
-                    stats['analyzed'] += 1
-                    sig = analyze_symbol(sym, d)
-                    if sig is None:
-                        stats['skipped_nodata'] += 1
-                        continue
-                    setup = sig.get('setup_state', 'NO_SETUP')
-                    if setup not in INTERESTING_SETUPS:
-                        stats['skipped_setup'] += 1
-                        continue
+                try:
+                    for d in tdays:
+                        stats['analyzed'] += 1
+                        sig = analyze_symbol(sym, d)
+                        if sig is None:
+                            stats['skipped_nodata'] += 1
+                            continue
+                        setup = sig.get('setup_state', 'NO_SETUP')
+                        if setup not in INTERESTING_SETUPS:
+                            stats['skipped_setup'] += 1
+                            continue
 
-                    feats = extract_features(cur, sym, d)
-                    if feats is None:
-                        stats['skipped_feat'] += 1
-                        continue
+                        feats = extract_features(cur, sym, d)
+                        if feats is None:
+                            stats['skipped_feat'] += 1
+                            continue
 
-                    labs = compute_labels(cur, sym, d)
+                        labs = compute_labels(cur, sym, d)
 
-                    row = {
-                        'symbol':       sym,
-                        'fecha':        d,
-                        'strategy':     STRATEGY_NAME,
-                        'variant':      setup,                       # subtipo de la señal
-                        'signal_score': float(sig['trend_score']),
-                        'pullback_score': float(sig['pullback_score']),
-                        **feats,
-                        **labs,
-                    }
-                    _upsert(cur, row)
-                    stats['inserted'] += 1
-                    if labs['label_5d_strong'] is not None:
-                        stats['with_label'] += 1
+                        row = {
+                            'symbol':       sym,
+                            'fecha':        d,
+                            'strategy':     STRATEGY_NAME,
+                            'variant':      setup,                       # subtipo de la señal
+                            'signal_score': float(sig['trend_score']),
+                            'pullback_score': float(sig['pullback_score']),
+                            **feats,
+                            **labs,
+                        }
+                        _upsert(cur, row)
+                        stats['inserted'] += 1
+                        if labs['label_5d_strong'] is not None:
+                            stats['with_label'] += 1
+                except Exception as e:
+                    stats['errors'] += 1
+                    if verbose:
+                        print(f'  · {sym:6} ERROR — {type(e).__name__}: {e}')
+                    continue
 
                 if verbose:
                     elapsed = time.time() - t0
                     rate = stats['analyzed'] / elapsed if elapsed > 0 else 0
                     print(f'  · {sym:6} hecho — analyzed={stats["analyzed"]} '
-                          f'inserted={stats["inserted"]} ({rate:.1f}/s)')
+                          f'inserted={stats["inserted"]} errs={stats["errors"]} ({rate:.1f}/s)')
     finally:
         conn.close()
     return stats

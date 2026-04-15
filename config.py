@@ -104,6 +104,8 @@ SECTOR_MAP = {
     'GLW':   {'sector': 'Technology',             'benchmark': 'XLK'},
     'MSI':   {'sector': 'Technology',             'benchmark': 'XLK'},
     'FIS':   {'sector': 'Technology',             'benchmark': 'XLK'},
+    'PLTR':  {'sector': 'Technology',             'benchmark': 'XLK'},
+    'SHOP':  {'sector': 'Technology',             'benchmark': 'XLK'},
     # Communication Services (XLC)
     'GOOGL': {'sector': 'Communication Services', 'benchmark': 'XLC'},
     'GOOG':  {'sector': 'Communication Services', 'benchmark': 'XLC'},

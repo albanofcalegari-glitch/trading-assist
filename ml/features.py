@@ -9,15 +9,55 @@ Para una (symbol, fecha) trae:
 NO computa nada que dependa del futuro. Todo es snapshot al cierre del día t0.
 """
 from __future__ import annotations
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 from db.connection import get_conn
+from strategies.dynamic_supports import get_dynamic_supports
 
 
 # ── Resolución de accion_id (cache simple, hay duplicados en `accion`) ───────
 
 _ACCION_ID_CACHE: dict[str, Optional[int]] = {}
+
+# Cache semanal para get_dynamic_supports: los soportes se basan en weekly
+# pivots, cambian poco dentro de la misma semana calendario. Reduce las
+# llamadas al backfill (29k rows) de ~200ms cada una a <5ms en cache-hit.
+_DYN_SUPPORTS_CACHE: dict[tuple[str, date], dict] = {}
+
+
+def _week_key(fecha: date) -> date:
+    # lunes de la semana
+    return fecha - timedelta(days=fecha.weekday())
+
+
+def _get_dyn_supports_cached(symbol: str, fecha: date) -> dict:
+    key = (symbol, _week_key(fecha))
+    r = _DYN_SUPPORTS_CACHE.get(key)
+    if r is None:
+        r = get_dynamic_supports(symbol, fecha)
+        _DYN_SUPPORTS_CACHE[key] = r
+    return r
+
+
+def _load_ath(cur, symbol: str, fecha: date) -> Optional[float]:
+    """All-time-high hasta `fecha` inclusive. None si no hay datos."""
+    cur.execute(
+        """SELECT MAX(high) AS ath FROM ohlcv_extended
+           WHERE simbolo=%s AND timeframe='D' AND fecha<=%s""",
+        (symbol, fecha),
+    )
+    row = cur.fetchone()
+    if row and row.get('ath') is not None:
+        return float(row['ath'])
+    # fallback a price_history si no hay ohlcv_extended
+    cur.execute(
+        """SELECT MAX(high) AS ath FROM price_history
+           WHERE simbolo=%s AND fecha<=%s""",
+        (symbol, fecha),
+    )
+    row = cur.fetchone()
+    return float(row['ath']) if row and row.get('ath') is not None else None
 
 
 def resolve_accion_id(cur, symbol: str) -> Optional[int]:
@@ -136,6 +176,30 @@ def extract_features(cur, symbol: str, fecha: date) -> Optional[dict]:
     # indicadortecnico ya guarda dist_sma200_pct (en %); lo normalizamos a fracción
     dist_sma200 = (float(tech['dist_sma200_pct']) / 100.0) if tech['dist_sma200_pct'] is not None else None
 
+    # ── Dynamic support short (tier cyan) ─────────────────────────────────────
+    # has_dyn_short:       1 si la estrategia detecta soporte short (horizontal o diagonal)
+    # dyn_short_dist_pct:  (price/floor - 1) * 100 — % ARRIBA del piso del short
+    #                      (positivo = price encima del soporte; negativo = roto)
+    has_dyn_short = 0
+    dyn_short_dist_pct: Optional[float] = None
+    try:
+        dyn = _get_dyn_supports_cached(symbol, fecha)
+        short_tier = dyn.get('short')
+        if short_tier is not None:
+            floor = float(short_tier.get('current_value') or 0)
+            if floor > 0 and price > 0:
+                has_dyn_short = 1
+                dyn_short_dist_pct = round((price / floor - 1) * 100, 3)
+    except Exception:
+        pass
+
+    # ── Distancia al ATH (all-time-high) ──────────────────────────────────────
+    # dist_to_ath_pct: (price/ath - 1) * 100 — típicamente negativo (precio debajo de ATH).
+    dist_to_ath_pct: Optional[float] = None
+    ath = _load_ath(cur, symbol, fecha)
+    if ath and ath > 0 and price > 0:
+        dist_to_ath_pct = round((price / ath - 1) * 100, 3)
+
     return {
         'price':          round(price, 4),
         'volume_ratio':   round(float(tech['volume_ratio_20d']), 4) if tech['volume_ratio_20d'] is not None else None,
@@ -153,6 +217,10 @@ def extract_features(cur, symbol: str, fecha: date) -> Optional[dict]:
         # zonas: nullable (Fase 2 las enchufa)
         'dist_to_support':    None,
         'dist_to_resistance': None,
+        # dynamic_supports (2026-04-15)
+        'has_dyn_short':        has_dyn_short,
+        'dyn_short_dist_pct':   dyn_short_dist_pct,
+        'dist_to_ath_pct':      dist_to_ath_pct,
         # macro
         'market_regime':  int(macro['market_regime']) if macro.get('market_regime') is not None else None,
         'vix_percentile': round(float(macro['vix_percentile_1y']), 4) if macro.get('vix_percentile_1y') is not None else None,

@@ -35,6 +35,10 @@ FEATURE_COLS: list[str] = [
     'market_regime',
     'vix_percentile',
     'spy_return_20d',
+    # dynamic_supports / ATH (agregadas 2026-04-15)
+    'has_dyn_short',
+    'dyn_short_dist_pct',
+    'dist_to_ath_pct',
 ]
 
 LABEL_COL = 'label_5d_strong'

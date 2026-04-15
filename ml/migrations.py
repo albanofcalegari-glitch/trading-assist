@@ -67,12 +67,30 @@ CREATE TABLE IF NOT EXISTS ml_signals (
 """
 
 
+# Columnas extra (agregadas 2026-04-15) — features basadas en dynamic_supports
+# y ATH. Se agregan con ALTER TABLE idempotente para no romper datasets viejos.
+_EXTRA_COLUMNS = [
+    ('has_dyn_short',      "TINYINT       DEFAULT NULL"),
+    ('dyn_short_dist_pct', "DECIMAL(7,3)  DEFAULT NULL"),
+    ('dist_to_ath_pct',    "DECIMAL(8,3)  DEFAULT NULL"),
+]
+
+
 def ensure_schema() -> None:
-    """Crea ml_signals si no existe. Idempotente."""
+    """Crea ml_signals si no existe. Idempotente. Agrega columnas faltantes."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(_CREATE_ML_SIGNALS)
+            # agregar columnas faltantes (MySQL 8.0.29+ soporta IF NOT EXISTS)
+            cur.execute(
+                """SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+                   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='ml_signals'"""
+            )
+            existing = {r['COLUMN_NAME'] for r in cur.fetchall()}
+            for col, ddl in _EXTRA_COLUMNS:
+                if col not in existing:
+                    cur.execute(f"ALTER TABLE ml_signals ADD COLUMN {col} {ddl}")
     finally:
         conn.close()
 
