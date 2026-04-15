@@ -834,6 +834,16 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None) -> dict:
     if long_tl and _tier_is_invalidated_by_trend(long_tl, rows): long_tl = None
     if mid_tl  and _tier_is_invalidated_by_trend(mid_tl,  rows): mid_tl  = None
 
+    # Regla Julian (2026-04-15): una sola diagonal ascendente dominante.
+    # Si mid comparte anchor1 con long (dentro de 8 bars por distinto pivot
+    # window), es la misma "familia" de lineas — dropear mid para evitar
+    # redundancia visual. Mid solo vale la pena si es un sub-rally reciente
+    # con anchor1 CLARAMENTE posterior al del long (ej. GOOGL 2025-04 sobre
+    # el rally long 2022-2025 — anchors distintos).
+    if long_tl is not None and mid_tl is not None:
+        if abs(mid_tl['anchors'][0] - long_tl['anchors'][0]) <= 8:
+            mid_tl = None
+
     return {
         'symbol':         symbol,
         'timeframe_used': tf,
