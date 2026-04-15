@@ -23,19 +23,23 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from batches.closing        import ClosingBatch
-from batches.premarket      import PremarketBatch
-from batches.opening        import OpeningBatch
-from batches.weekly_ranking import WeeklyRankingBatch
+from batches.closing              import ClosingBatch
+from batches.premarket            import PremarketBatch
+from batches.opening              import OpeningBatch
+from batches.weekly_ranking       import WeeklyRankingBatch
+from batches.historical_lows_batch import HistoricalLowsBatch
+from batches.historical_highs_batch import HistoricalHighsBatch
 # Conforme se vayan implementando, importar acá:
 # from batches.midday          import MiddayBatch
 
 
 REGISTRY = {
-    'closing':        ClosingBatch,
-    'premarket':      PremarketBatch,
-    'opening':        OpeningBatch,
-    'weekly_ranking': WeeklyRankingBatch,
+    'closing':         ClosingBatch,
+    'premarket':       PremarketBatch,
+    'opening':         OpeningBatch,
+    'weekly_ranking':  WeeklyRankingBatch,
+    'historical_lows': HistoricalLowsBatch,
+    'historical_highs': HistoricalHighsBatch,
     # 'midday':          MiddayBatch,
 }
 

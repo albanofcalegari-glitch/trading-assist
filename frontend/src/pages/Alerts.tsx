@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Bell, RefreshCw, Sunrise, DoorOpen, Sun, Moon, Trophy, Activity, ChevronRight,
+  TrendingDown, TrendingUp,
 } from 'lucide-react'
 import { api, markNotificationRead, type Notification } from '@/lib/api'
 
@@ -11,15 +12,19 @@ const KIND_FILTERS = [
   { value: 'opening',    label: 'Apertura',  icon: DoorOpen },
   { value: 'midday',     label: 'Mediodía',  icon: Sun },
   { value: 'close',      label: 'Cierre',    icon: Moon },
-  { value: 'weekly_rank', label: 'Semanal',  icon: Trophy },
+  { value: 'weekly_rank',     label: 'Semanal',  icon: Trophy },
+  { value: 'historical_lows', label: 'Mínimos',  icon: TrendingDown },
+  { value: 'historical_highs', label: 'Máximos', icon: TrendingUp },
 ]
 
 const KIND_META: Record<string, { color: string; icon: any; label: string }> = {
-  pre_market:  { color: '#f59e0b', icon: Sunrise, label: 'Premarket' },
-  opening:     { color: '#06b6d4', icon: DoorOpen, label: 'Apertura' },
-  midday:      { color: '#facc15', icon: Sun,      label: 'Mediodía' },
-  close:       { color: '#8b5cf6', icon: Moon,     label: 'Cierre' },
-  weekly_rank: { color: '#22c55e', icon: Trophy,   label: 'Semanal' },
+  pre_market:       { color: '#f59e0b', icon: Sunrise,      label: 'Premarket' },
+  opening:          { color: '#06b6d4', icon: DoorOpen,     label: 'Apertura' },
+  midday:           { color: '#facc15', icon: Sun,          label: 'Mediodía' },
+  close:            { color: '#8b5cf6', icon: Moon,         label: 'Cierre' },
+  weekly_rank:      { color: '#22c55e', icon: Trophy,       label: 'Semanal' },
+  historical_lows:  { color: '#ef4444', icon: TrendingDown, label: 'Mínimos' },
+  historical_highs: { color: '#22c55e', icon: TrendingUp,   label: 'Máximos' },
 }
 
 export default function Alerts() {
@@ -157,7 +162,7 @@ function NotificationRow({ notif, onClick }: { notif: Notification; onClick: () 
         </p>
         <p className="text-xs text-text-muted mt-0.5 line-clamp-2">{notif.body}</p>
 
-        {/* Top movers chips: closing/premarket/opening usan pct, weekly_rank usa score */}
+        {/* Top movers chips: closing/premarket/opening usan pct, weekly_rank usa score, historical_lows usa dist */}
         {notif.data?.top_up?.length ? (
           <div className="flex flex-wrap gap-1.5 mt-2">
             {notif.data.top_up.slice(0, 10).map((m: any) => (
@@ -166,8 +171,8 @@ function NotificationRow({ notif, onClick }: { notif: Notification; onClick: () 
                 symbol={m.symbol}
                 pct={m.pct}
                 accionId={m.accion_id}
-                up
-                mode={notif.kind === 'weekly_rank' ? 'score' : 'pct'}
+                up={notif.kind !== 'historical_lows'}
+                mode={notif.kind === 'weekly_rank' ? 'score' : notif.kind === 'historical_lows' ? 'dist' : notif.kind === 'historical_highs' ? 'dist_high' : 'pct'}
               />
             ))}
             {notif.data.top_down?.slice(0, 5).map((m: any) => (
@@ -176,8 +181,8 @@ function NotificationRow({ notif, onClick }: { notif: Notification; onClick: () 
                 symbol={m.symbol}
                 pct={m.pct}
                 accionId={m.accion_id}
-                up={false}
-                mode={notif.kind === 'weekly_rank' ? 'score' : 'pct'}
+                up={notif.kind === 'historical_highs'}
+                mode={notif.kind === 'weekly_rank' ? 'score' : notif.kind === 'historical_lows' ? 'dist' : notif.kind === 'historical_highs' ? 'dist_high' : 'pct'}
               />
             ))}
           </div>
@@ -211,7 +216,7 @@ function NotificationRow({ notif, onClick }: { notif: Notification; onClick: () 
 
 function MoverChip({ symbol, pct, accionId, up, mode = 'pct' }: {
   symbol: string; pct: number; accionId?: number; up: boolean
-  mode?: 'pct' | 'score'
+  mode?: 'pct' | 'score' | 'dist' | 'dist_high'
 }) {
   const navigate = useNavigate()
   const cls = up
@@ -219,6 +224,10 @@ function MoverChip({ symbol, pct, accionId, up, mode = 'pct' }: {
     : 'bg-down/10 text-down border-down/20'
   const label = mode === 'score'
     ? pct.toFixed(0)
+    : mode === 'dist'
+    ? `${pct.toFixed(1)}% del min`
+    : mode === 'dist_high'
+    ? `${pct.toFixed(1)}% del max`
     : `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`
   return (
     <span

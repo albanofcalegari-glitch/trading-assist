@@ -55,6 +55,18 @@ _channel_cache: dict = {}        # symbol → {'data': dict, 'ts': float}
 _channel_lock = threading.Lock()
 _CHANNEL_TTL  = 3600             # 1 hora
 
+# ── Caché para dynamic-supports ───────────────────────────────────────────────
+
+_dynsup_cache: dict = {}         # symbol → {'data': dict, 'ts': float}
+_dynsup_lock = threading.Lock()
+_DYNSUP_TTL  = 3600              # 1 hora
+
+# ── Caché para ut-bot ─────────────────────────────────────────────────────────
+
+_utbot_cache: dict = {}          # (symbol, sensitivity, atr_period) → {'data': dict, 'ts': float}
+_utbot_lock = threading.Lock()
+_UTBOT_TTL  = 3600               # 1 hora
+
 # ── Optionals ──────────────────────────────────────────────────────────────────
 try:
     from flask import Flask, jsonify, request
@@ -1128,6 +1140,84 @@ def get_longterm_support_endpoint(accion_id: int):
     return _jresp(result)
 
 
+# ── /api/assets/<id>/dynamic-supports ─────────────────────────────────────────
+#
+# Soportes dinámicos ascendentes sobre el histórico semanal (log-space).
+# Devuelve 3 tiers en un solo call:  long / mid / short.  Pensado para pintar
+# tres overlays (verde/amarillo/cyan) en el PriceChart.
+
+@app.route('/api/assets/<int:accion_id>/dynamic-supports')
+def get_dynamic_supports_endpoint(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _dynsup_lock:
+        entry = _dynsup_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _DYNSUP_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        from strategies.dynamic_supports import get_dynamic_supports
+        result = get_dynamic_supports(symbol, datetime.date.today())
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _dynsup_lock:
+        _dynsup_cache[symbol] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/assets/<id>/ut-bot ───────────────────────────────────────────────────
+#
+# UT Bot trailing stop (variante QuantNomad) sobre cierre diario.
+# Query params opcionales:
+#   sensitivity (float, default 2.0)
+#   atr_period  (int,   default 10)
+
+@app.route('/api/assets/<int:accion_id>/ut-bot')
+def get_ut_bot_endpoint(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    try:
+        sensitivity = float(request.args.get('sensitivity', 2.0))
+        atr_period  = int(request.args.get('atr_period', 10))
+    except (ValueError, TypeError):
+        return _jresp({'error': 'Invalid sensitivity/atr_period'}, 400)
+
+    key = (symbol, sensitivity, atr_period)
+    with _utbot_lock:
+        entry = _utbot_cache.get(key)
+        if entry and (time.time() - entry['ts']) < _UTBOT_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        from strategies.ut_bot import get_ut_bot
+        result = get_ut_bot(symbol, datetime.date.today(), sensitivity, atr_period)
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _utbot_lock:
+        _utbot_cache[key] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
 # ── /api/assets/<id>/horizontal-zones ─────────────────────────────────────────
 #
 # Zonas horizontales de soporte y resistencia detectadas sobre ohlcv_extended
@@ -1197,6 +1287,90 @@ def get_channel(accion_id: int):
         _channel_cache[symbol] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
+
+
+# ── /api/assets/<id>/historical-low-signal ────────────────────────────────────
+#
+# Devuelve la última señal de mínimos históricos para un activo.
+# Tabla puede no existir todavía → devolver null sin error.
+
+@app.route('/api/assets/<int:accion_id>/historical-low-signal')
+def get_historical_low_signal(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id=%s", [accion_id])
+            row = cur.fetchone()
+            if not row:
+                return _jresp({'error': 'asset not found'}, 404)
+            try:
+                cur.execute("""
+                    SELECT fecha, simbolo, price, low_52w, low_52w_date,
+                           low_52w_days_ago, distance_52w_pct,
+                           low_all, low_all_date, distance_all_pct,
+                           is_all_time_low, setup_state, decision,
+                           confidence_level, reading, rsi14, mom20, sma200
+                    FROM historical_low_signals
+                    WHERE simbolo=%s
+                    ORDER BY fecha DESC LIMIT 1
+                """, [row['simbolo']])
+                sig = cur.fetchone()
+            except Exception:
+                return _jresp(None)
+    if not sig:
+        return _jresp(None)
+    sig['fecha'] = str(sig['fecha'])
+    if sig.get('low_52w_date'):
+        sig['low_52w_date'] = str(sig['low_52w_date'])
+    if sig.get('low_all_date'):
+        sig['low_all_date'] = str(sig['low_all_date'])
+    for k in ('price', 'low_52w', 'distance_52w_pct', 'low_all',
+              'distance_all_pct', 'rsi14', 'mom20', 'sma200'):
+        if sig.get(k) is not None:
+            sig[k] = float(sig[k])
+    sig['is_all_time_low'] = bool(sig.get('is_all_time_low'))
+    return _jresp(sig)
+
+
+# ── /api/assets/<id>/historical-high-signal ───────────────────────────────────
+#
+# Devuelve la última señal de máximos históricos para un activo.
+# Tabla puede no existir todavía → devolver null sin error.
+
+@app.route('/api/assets/<int:accion_id>/historical-high-signal')
+def get_historical_high_signal(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id=%s", [accion_id])
+            row = cur.fetchone()
+            if not row:
+                return _jresp({'error': 'asset not found'}, 404)
+            try:
+                cur.execute("""
+                    SELECT fecha, simbolo, price, high_52w, high_52w_date,
+                           high_52w_days_ago, distance_52w_pct,
+                           high_all, high_all_date, distance_all_pct,
+                           is_all_time_high, setup_state, decision,
+                           confidence_level, reading, rsi14, mom20, sma200
+                    FROM historical_high_signals
+                    WHERE simbolo=%s
+                    ORDER BY fecha DESC LIMIT 1
+                """, [row['simbolo']])
+                sig = cur.fetchone()
+            except Exception:
+                return _jresp(None)
+    if not sig:
+        return _jresp(None)
+    sig['fecha'] = str(sig['fecha'])
+    if sig.get('high_52w_date'):
+        sig['high_52w_date'] = str(sig['high_52w_date'])
+    if sig.get('high_all_date'):
+        sig['high_all_date'] = str(sig['high_all_date'])
+    for k in ('price', 'high_52w', 'distance_52w_pct', 'high_all',
+              'distance_all_pct', 'rsi14', 'mom20', 'sma200'):
+        if sig.get(k) is not None:
+            sig[k] = float(sig[k])
+    sig['is_all_time_high'] = bool(sig.get('is_all_time_high'))
+    return _jresp(sig)
 
 
 # ── /api/assets/<id>/company-info ─────────────────────────────────────────────

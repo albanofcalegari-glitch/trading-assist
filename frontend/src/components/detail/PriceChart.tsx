@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useLayoutEffect } from 'react'
 import {
   createChart, ColorType, LineStyle, PriceScaleMode,
   type IChartApi, type ISeriesApi, type CandlestickSeriesOptions,
+  type IPriceLine,
 } from 'lightweight-charts'
 import { calcWMA, calcSMA, resampleOHLCV, type Candle } from '@/lib/utils'
 
@@ -12,13 +13,34 @@ interface IndicatorLine {
   label:  string
 }
 
+export interface ChartMarker {
+  fecha: string
+  kind:  'BUY' | 'SELL'
+  price: number
+}
+
+// Zona de soporte/resistencia: banda horizontal entre `floor` y `top`, dibujada
+// con 2 priceLines (nativas de lightweight-charts).  Se usa para mostrar
+// lateralizaciones detectadas por dynamic_supports (short tier horizontal).
+export interface PriceZone {
+  floor: number
+  top:   number
+  color: string
+  label: string
+}
+
 // ── Props ─────────────────────────────────────────────────────────────────────
 
 interface Props {
-  candles:    Candle[]
-  freq:       'D' | 'W' | 'M'
-  indicators: IndicatorLine[]
-  height?:    number
+  candles:       Candle[]
+  freq:          'D' | 'W' | 'M'
+  indicators:    IndicatorLine[]
+  markers?:      ChartMarker[]
+  zones?:        PriceZone[]
+  height?:       number
+  // Fecha (YYYY-MM-DD) desde la que mostrar el chart por default.
+  // Si está definida y existe en los datos, reemplaza el DEFAULT_BARS.
+  viewStartDate?: string
 }
 
 // Colores exactos TradingView dark theme
@@ -38,12 +60,20 @@ const COLORS = {
 
 export default function PriceChart({
   candles, freq, indicators,
+  markers,
+  zones,
   height = 550,
+  viewStartDate,
 }: Props) {
   const containerRef  = useRef<HTMLDivElement>(null)
   const chartRef      = useRef<IChartApi | null>(null)
+  const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const overlayRef    = useRef<ISeriesApi<'Line'>[]>([])
   const chartDatesRef = useRef<Set<string>>(new Set())
+  const priceLinesRef = useRef<IPriceLine[]>([])
+  const viewStartRef  = useRef<string | undefined>(viewStartDate)
+  // Sincroniza el ref con el prop (para que onDblClick y el reset usen el valor vigente)
+  useLayoutEffect(() => { viewStartRef.current = viewStartDate }, [viewStartDate])
 
   // ── Effect 1: Chart lifecycle (candles, freq, height) ─────────────────────
   useEffect(() => {
@@ -173,6 +203,7 @@ export default function PriceChart({
     })
 
     candleSeries.setData(ohlcData)
+    candleSeriesRef.current = candleSeries
 
     // ── Volumen ───────────────────────────────────────────────────────────────
     const volSeries = chart.addHistogramSeries({
@@ -192,7 +223,7 @@ export default function PriceChart({
 
     // ── Overlay pool: series pre-creadas, nunca se agregan ni eliminan ────────
     // Esto garantiza que toggle de canales/indicadores no altere el layout.
-    const POOL_SIZE = 20
+    const POOL_SIZE = 28
     const pool: ISeriesApi<'Line'>[] = []
     for (let i = 0; i < POOL_SIZE; i++) {
       pool.push(chart.addLineSeries({
@@ -208,27 +239,29 @@ export default function PriceChart({
     overlayRef.current = pool
 
     // ── Vista por defecto según timeframe ─────────────────────────────────────
+    // Si hay viewStartDate y existe en `data`, se usa como borde izquierdo (mismo
+    // comportamiento que el PDF: mostrar desde anchor1 del soporte largo plazo).
     const DEFAULT_BARS = freq === 'W' ? 250 : freq === 'M' ? 120 : 365
-    if (data.length > DEFAULT_BARS) {
-      chart.timeScale().setVisibleLogicalRange({
-        from: data.length - DEFAULT_BARS - 0.5,
-        to:   data.length - 1 + 15,
-      })
-    } else {
-      chart.timeScale().fitContent()
+    const computeRange = (): { from: number; to: number } | null => {
+      const vsd = viewStartRef.current
+      if (vsd) {
+        const idx = data.findIndex(c => c.fecha >= vsd)
+        if (idx >= 0) return { from: idx - 0.5, to: data.length - 1 + 15 }
+      }
+      if (data.length > DEFAULT_BARS) {
+        return { from: data.length - DEFAULT_BARS - 0.5, to: data.length - 1 + 15 }
+      }
+      return null
     }
+    const applyDefaultView = () => {
+      const r = computeRange()
+      if (r) chart.timeScale().setVisibleLogicalRange(r)
+      else chart.timeScale().fitContent()
+    }
+    applyDefaultView()
 
     // ── Doble click: reset a la vista por defecto ─────────────────────────────
-    const onDblClick = () => {
-      if (data.length > DEFAULT_BARS) {
-        chart.timeScale().setVisibleLogicalRange({
-          from: data.length - DEFAULT_BARS - 0.5,
-          to:   data.length - 1 + 15,
-        })
-      } else {
-        chart.timeScale().fitContent()
-      }
-    }
+    const onDblClick = () => applyDefaultView()
     el.addEventListener('dblclick', onDblClick)
 
     // ── Region zoom (Ctrl+drag) ──────────────────────────────────────────────
@@ -317,9 +350,94 @@ export default function PriceChart({
       if (zoomBox.parentNode) zoomBox.parentNode.removeChild(zoomBox)
       chart.remove()
       chartRef.current = null
+      candleSeriesRef.current = null
       overlayRef.current = []
     }
   }, [candles, freq, height])
+
+  // ── Effect 1b: pan del chart cuando llega tarde viewStartDate (dynSupports) ─
+  useEffect(() => {
+    const chart = chartRef.current
+    if (!chart || !viewStartDate || !candles.length) return
+    const data = freq === 'D' ? candles
+               : freq === 'W' ? resampleOHLCV(candles, 'W')
+               :                resampleOHLCV(candles, 'M')
+    const idx = data.findIndex(c => c.fecha >= viewStartDate)
+    if (idx < 0) return
+    chart.timeScale().setVisibleLogicalRange({
+      from: idx - 0.5,
+      to:   data.length - 1 + 15,
+    })
+  }, [viewStartDate, freq, candles])
+
+  // ── Effect markers: BUY/SELL labels estilo TradingView ────────────────────
+  // Se filtran a fechas que existen en las velas actuales (tras resample) para
+  // que lightweight-charts no las rechace. Si una señal cae dentro de un bucket
+  // W/M, se snapea al próximo bar cuya fecha sea ≥ la señal.
+  useEffect(() => {
+    const cs = candleSeriesRef.current
+    if (!cs) return
+    if (!markers || !markers.length) {
+      cs.setMarkers([])
+      return
+    }
+    const validDates = chartDatesRef.current
+    const sortedDates = Array.from(validDates).sort()
+    const snap = (fecha: string): string | null => {
+      if (validDates.has(fecha)) return fecha
+      // busca la primera fecha de vela >= fecha de la señal
+      for (const d of sortedDates) if (d >= fecha) return d
+      return null
+    }
+    const out = markers
+      .map(m => {
+        const time = snap(m.fecha)
+        if (!time) return null
+        return {
+          time: time as any,
+          position: (m.kind === 'BUY' ? 'belowBar' : 'aboveBar') as 'belowBar' | 'aboveBar',
+          color:    m.kind === 'BUY' ? '#26a69a' : '#ef5350',
+          shape:    (m.kind === 'BUY' ? 'arrowUp' : 'arrowDown') as 'arrowUp' | 'arrowDown',
+          text:     m.kind,
+          size:     1,
+        }
+      })
+      .filter(Boolean) as any[]
+    // lightweight-charts pide markers ordenados por tiempo
+    out.sort((a, b) => (a.time < b.time ? -1 : 1))
+    cs.setMarkers(out)
+  }, [markers, candles, freq])
+
+  // ── Effect zones: banda horizontal (piso + tope) via priceLines nativas ──
+  // Se limpian y recrean en cada cambio de zones/candles/freq.  priceLines
+  // son horizontales infinitas sobre el eje X y tienen label en el eje Y.
+  useEffect(() => {
+    const cs = candleSeriesRef.current
+    if (!cs) return
+    for (const pl of priceLinesRef.current) {
+      try { cs.removePriceLine(pl) } catch {}
+    }
+    priceLinesRef.current = []
+    if (!zones || !zones.length) return
+    for (const z of zones) {
+      priceLinesRef.current.push(cs.createPriceLine({
+        price:            z.floor,
+        color:            z.color,
+        lineWidth:        2,
+        lineStyle:        LineStyle.Solid,
+        axisLabelVisible: true,
+        title:            `${z.label} piso`,
+      } as any))
+      priceLinesRef.current.push(cs.createPriceLine({
+        price:            z.top,
+        color:            z.color,
+        lineWidth:        1,
+        lineStyle:        LineStyle.Dotted,
+        axisLabelVisible: true,
+        title:            `${z.label} tope`,
+      } as any))
+    }
+  }, [zones, candles, freq])
 
   // ── Effect 2: Update overlay data/visibility (never add/remove series) ────
   useEffect(() => {

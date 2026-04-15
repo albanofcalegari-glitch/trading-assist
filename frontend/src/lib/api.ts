@@ -181,6 +181,53 @@ export interface LongtermSupport {
   active_resistance_reading?:         string
 }
 
+export interface DynamicSupportTier {
+  status:           'ACTIVE' | 'TESTING' | 'BROKEN'
+  anchor1:          { fecha: string; value: number }
+  anchor2:          { fecha: string; value: number }
+  line_points:      { fecha: string; value: number }[]
+  current_value:    number
+  distance_pct:     number
+  slope_annual_pct: number
+  touches:          number
+  violations:       number
+  // 'horizontal' indica lateralizacion reciente; el chart la dibuja como ZONA
+  // (piso + tope) en vez de linea.  Default 'ascending' para compat.
+  kind?:            'ascending' | 'horizontal'
+  zone_top?:        number  // solo si kind='horizontal'
+}
+
+export interface DynamicSupports {
+  symbol:         string
+  timeframe_used: string | null
+  bars_of_data:   number
+  price:          number | null
+  long:           DynamicSupportTier | null
+  mid:            DynamicSupportTier | null
+  short:          DynamicSupportTier | null
+}
+
+export interface UtBotPoint {
+  fecha: string
+  value: number
+  state: 'UP' | 'DOWN'
+}
+
+export interface UtBotSignal {
+  fecha: string
+  kind:  'BUY' | 'SELL'
+  price: number
+}
+
+export interface UtBotResponse {
+  symbol:       string
+  sensitivity:  number
+  atr_period:   number
+  bars_of_data: number
+  points:       UtBotPoint[]
+  signals:      UtBotSignal[]
+}
+
 export interface HorizontalZone {
   zone_low:        number
   zone_high:       number
@@ -237,10 +284,52 @@ export interface HorizontalZonesResponse {
   pivot_highs_found: number
 }
 
+export interface HistoricalLowSignal {
+  fecha:              string
+  simbolo:            string
+  price:              number
+  low_52w:            number
+  low_52w_date:       string
+  low_52w_days_ago:   number
+  distance_52w_pct:   number | null
+  low_all:            number
+  low_all_date:       string
+  distance_all_pct:   number | null
+  is_all_time_low:    boolean
+  setup_state:        string   // 'NO_SIGNAL' | 'NEAR_52W_LOW' | 'AT_52W_LOW' | 'NEW_52W_LOW'
+  decision:           string
+  confidence_level:   string
+  reading:            string
+  rsi14:              number | null
+  mom20:              number | null
+  sma200:             number | null
+}
+
+export interface HistoricalHighSignal {
+  fecha:              string
+  simbolo:            string
+  price:              number
+  high_52w:           number
+  high_52w_date:      string
+  high_52w_days_ago:  number
+  distance_52w_pct:   number | null
+  high_all:           number
+  high_all_date:      string
+  distance_all_pct:   number | null
+  is_all_time_high:   boolean
+  setup_state:        string   // 'NO_SIGNAL' | 'NEAR_52W_HIGH' | 'AT_52W_HIGH' | 'NEW_52W_HIGH'
+  decision:           string
+  confidence_level:   string
+  reading:            string
+  rsi14:              number | null
+  mom20:              number | null
+  sma200:             number | null
+}
+
 export interface Notification {
   id:           number
   batch_run_id: number | null
-  kind:         string            // 'close' | 'pre_market' | 'opening' | 'midday' | 'weekly_rank'
+  kind:         string            // 'close' | 'pre_market' | 'opening' | 'midday' | 'weekly_rank' | 'historical_lows'
   title:        string
   body:         string
   data:         any | null
@@ -347,6 +436,17 @@ export const api = {
   longtermSupport: (id: number, horizon = 'long_term') =>
     get<LongtermSupport>(`/assets/${id}/longterm-support?horizon=${horizon}`),
 
+  dynamicSupports: (id: number) =>
+    get<DynamicSupports>(`/assets/${id}/dynamic-supports`),
+
+  utBot: (id: number, sensitivity?: number, atrPeriod?: number) => {
+    const qs = new URLSearchParams()
+    if (sensitivity != null) qs.set('sensitivity', String(sensitivity))
+    if (atrPeriod   != null) qs.set('atr_period',  String(atrPeriod))
+    const s = qs.toString()
+    return get<UtBotResponse>(`/assets/${id}/ut-bot${s ? '?' + s : ''}`)
+  },
+
   horizontalZones: (id: number) =>
     get<HorizontalZonesResponse>(`/assets/${id}/horizontal-zones`),
 
@@ -358,6 +458,12 @@ export const api = {
 
   trendPullbackSignal: (id: number) =>
     get<TrendPullbackSignal | null>(`/assets/${id}/trend-pullback-signal`),
+
+  historicalLowSignal: (id: number) =>
+    get<HistoricalLowSignal | null>(`/assets/${id}/historical-low-signal`),
+
+  historicalHighSignal: (id: number) =>
+    get<HistoricalHighSignal | null>(`/assets/${id}/historical-high-signal`),
 
   fundamentals: (id: number) =>
     get<Fundamentals>(`/assets/${id}/fundamentals`),

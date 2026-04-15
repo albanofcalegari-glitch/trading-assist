@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { ArrowLeft, TrendingUp, Activity, BarChart2, Tv2, AlertTriangle } from 'lucide-react'
-import { api, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem } from '@/lib/api'
-import { fmtPrice, fmtPct, pctClass, fmt, calcRSI, calcADX } from '@/lib/utils'
+import { ArrowLeft, TrendingUp, TrendingDown, Activity, BarChart2, Tv2, AlertTriangle } from 'lucide-react'
+import { api, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports } from '@/lib/api'
+import { fmtPrice, fmtPct, pctClass, fmt, calcRSI, calcADX, resampleOHLCV } from '@/lib/utils'
+import { computeUtBot } from '@/lib/utBot'
 import PriceChart, { buildIndicatorLines } from '@/components/detail/PriceChart'
 import { SemaphoreBadge } from '@/components/shared/Semaphore'
 import { detectDivergences, type Divergence } from '@/lib/divergence'
@@ -24,9 +25,9 @@ const STRATEGIES = [
 ]
 
 const TIMEFRAMES = [
-  { label: 'Diario',   value: 'D' as const },
-  { label: 'Semanal',  value: 'W' as const },
-  { label: 'Mensual',  value: 'M' as const },
+  { label: 'D', value: 'D' as const },
+  { label: 'S', value: 'W' as const },
+  { label: 'M', value: 'M' as const },
 ]
 
 export default function AssetDetail() {
@@ -47,6 +48,11 @@ export default function AssetDetail() {
   const [tpSignal,       setTpSignal]       = useState<TrendPullbackSignal | null>(null)
   const [channelData,    setChannelData]    = useState<ChannelData | null>(null)
   const [showChannels,   setShowChannels]   = useState(true)
+  const [hlSignal,       setHlSignal]       = useState<HistoricalLowSignal | null>(null)
+  const [hhSignal,       setHhSignal]       = useState<HistoricalHighSignal | null>(null)
+  const [dynSupports,    setDynSupports]    = useState<DynamicSupports | null>(null)
+  const [showDynSupports,setShowDynSupports]= useState(true)
+  const [showUtBot,      setShowUtBot]      = useState(false)
 
   useEffect(() => {
     if (!accionId) return
@@ -78,14 +84,37 @@ export default function AssetDetail() {
     api.channel(accionId)
       .then(setChannelData)
       .catch(() => setChannelData(null))
+
+    // Fetch historical low signal
+    api.historicalLowSignal(accionId)
+      .then(setHlSignal)
+      .catch(() => setHlSignal(null))
+
+    // Fetch historical high signal
+    api.historicalHighSignal(accionId)
+      .then(setHhSignal)
+      .catch(() => setHhSignal(null))
+
+    // Fetch dynamic supports (long/mid/short trendlines ascendentes en log-space)
+    api.dynamicSupports(accionId)
+      .then(setDynSupports)
+      .catch(() => setDynSupports(null))
   }, [accionId])
 
-  const rsiValues   = candles.length ? calcRSI(candles.map(c => Number(c.close))) : []
-  const divergences = candles.length
-    ? detectDivergences(candles, rsiValues)
+  // Velas al timeframe del chart — todos los paneles (ADX/RSI/UT Bot/divergences)
+  // usan esta serie para que coincida con las velas visibles.
+  const chartCandles: Candle[] = candles.length
+    ? (tf === 'D' ? candles
+       : tf === 'W' ? resampleOHLCV(candles, 'W')
+       :              resampleOHLCV(candles, 'M'))
+    : []
+
+  const rsiValues   = chartCandles.length ? calcRSI(chartCandles.map(c => Number(c.close))) : []
+  const divergences = chartCandles.length
+    ? detectDivergences(chartCandles, rsiValues)
     : [] as Divergence[]
   const currentRsiCalc = rsiValues.length ? (rsiValues[rsiValues.length - 1] ?? null) : null
-  const adxData = candles.length ? calcADX(candles) : { adx: [], plusDI: [], minusDI: [] }
+  const adxData = chartCandles.length ? calcADX(chartCandles) : { adx: [], plusDI: [], minusDI: [] }
 
   const activeStrategies = [strategyA, strategyB].filter(s => s !== '(Ninguna)')
   const indicatorLines = buildIndicatorLines(candles, activeStrategies)
@@ -132,6 +161,142 @@ export default function AssetDetail() {
       { dates, values: midVals,   color: colors.mid,  label: `Canal ${label} Mid` },
     )
   }
+  // Build dynamic support overlay lines (long/mid/short trendlines)
+  //   verde    = largo plazo estructural
+  //   amarillo = mediano plazo (pullbacks recientes)
+  //   cyan     = corto plazo (ultimo rally / lateralizacion)
+  // Tiers con kind='horizontal' se renderizan como ZONA (priceZones) en vez
+  // de como linea; los ascendentes siguen como IndicatorLine interpolada.
+  const dynZones: import('@/components/detail/PriceChart').PriceZone[] = []
+  if (dynSupports && showDynSupports && candles.length) {
+    const tiers: [keyof DynamicSupports, string, string][] = [
+      ['long',  '#00e676', 'LP'],
+      ['mid',   '#ffd54f', 'MP'],
+      ['short', '#4fc3f7', 'CP'],
+    ]
+    const candleDates = candles.map(c => c.fecha)
+    for (const [key, color, label] of tiers) {
+      const tier = dynSupports[key]
+      if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
+      if (!('line_points' in tier)) continue
+      // Horizontal (lateralizacion): zona con piso + tope
+      if (tier.kind === 'horizontal' && typeof tier.zone_top === 'number') {
+        dynZones.push({
+          floor: tier.current_value,
+          top:   tier.zone_top,
+          color,
+          label: `Zona ${label}`,
+        })
+        continue
+      }
+      if (!tier.line_points.length) continue
+      // line_points viene en fechas semanales; interpolo en log-space a cada fecha diaria
+      // dentro del rango [primera, última] fecha del tier.
+      const pts = tier.line_points
+      const tsValues = pts.map(p => Date.parse(p.fecha))
+      const logValues = pts.map(p => Math.log(p.value))
+      const firstTs = tsValues[0]
+      const lastTs  = tsValues[tsValues.length - 1]
+      const values = candleDates.map(d => {
+        const t = Date.parse(d)
+        if (t < firstTs || t > lastTs) return null
+        // búsqueda binaria del intervalo [i, i+1] que contiene t
+        let lo = 0, hi = tsValues.length - 1
+        while (hi - lo > 1) {
+          const mid = (lo + hi) >> 1
+          if (tsValues[mid] <= t) lo = mid
+          else hi = mid
+        }
+        const t0 = tsValues[lo], t1 = tsValues[hi]
+        if (t1 === t0) return Math.exp(logValues[lo])
+        const frac = (t - t0) / (t1 - t0)
+        return Math.exp(logValues[lo] + frac * (logValues[hi] - logValues[lo]))
+      })
+      indicatorLines.push({
+        dates:  candleDates,
+        values,
+        color,
+        label:  `Soporte ${label}`,
+      })
+    }
+  }
+  // Build UT Bot trailing stop overlay + markers (se computa local, sobre las
+  // velas del timeframe visible — así D/S/M rinden su propia versión consistente
+  // con las velas del chart y los markers caen exactos sobre los bars).
+  //
+  // 2 IndicatorLines: UP verde `#26a69a` / DOWN rojo `#ef5350`. En cada flip, el
+  // valor se agrega a AMBAS series para que se toquen visualmente sin huecos.
+  const utBot = showUtBot && chartCandles.length
+    ? computeUtBot(chartCandles, 2.0, 10)
+    : { points: [], signals: [] }
+  if (showUtBot && utBot.points.length) {
+    const pts = utBot.points
+    const dates = pts.map(p => p.fecha)
+    const upVals:   (number | null)[] = []
+    const downVals: (number | null)[] = []
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i]
+      const prev = i > 0 ? pts[i - 1] : null
+      const flip = prev && prev.state !== p.state
+      if (p.state === 'UP') {
+        upVals.push(p.value)
+        downVals.push(flip ? p.value : null)
+      } else {
+        downVals.push(p.value)
+        upVals.push(flip ? p.value : null)
+      }
+    }
+    indicatorLines.push(
+      { dates, values: upVals,   color: '#26a69a', label: 'UT Bot UP' },
+      { dates, values: downVals, color: '#ef5350', label: 'UT Bot DOWN' },
+    )
+  }
+  const utBotMarkers = showUtBot ? utBot.signals : []
+  // Build historical low overlay lines (horizontal lines at 52w low / all-time low)
+  if (hlSignal && hlSignal.setup_state !== 'NO_SIGNAL' && candles.length) {
+    const dates = candles.map(c => c.fecha)
+    // 52-week low line
+    if (hlSignal.low_52w) {
+      indicatorLines.push({
+        dates,
+        values: dates.map(() => hlSignal.low_52w),
+        color: '#ef4444',
+        label: `Min 52w $${hlSignal.low_52w.toFixed(2)}`,
+      })
+    }
+    // All-time low line (only if different from 52w low)
+    if (hlSignal.low_all && Math.abs(hlSignal.low_all - hlSignal.low_52w) > 0.01) {
+      indicatorLines.push({
+        dates,
+        values: dates.map(() => hlSignal.low_all),
+        color: '#f97316',
+        label: `Min hist $${hlSignal.low_all.toFixed(2)}`,
+      })
+    }
+  }
+  // Build historical high overlay lines (horizontal lines at 52w high / all-time high)
+  if (hhSignal && hhSignal.setup_state !== 'NO_SIGNAL' && candles.length) {
+    const dates = candles.map(c => c.fecha)
+    // 52-week high line
+    if (hhSignal.high_52w) {
+      indicatorLines.push({
+        dates,
+        values: dates.map(() => hhSignal.high_52w),
+        color: '#22c55e',
+        label: `Max 52w $${hhSignal.high_52w.toFixed(2)}`,
+      })
+    }
+    // All-time high line (only if different from 52w high)
+    if (hhSignal.high_all && Math.abs(hhSignal.high_all - hhSignal.high_52w) > 0.01) {
+      indicatorLines.push({
+        dates,
+        values: dates.map(() => hhSignal.high_all),
+        color: '#16a34a',
+        label: `Max hist $${hhSignal.high_all.toFixed(2)}`,
+      })
+    }
+  }
+
   const rsiDivergenceActive = activeStrategies.includes('RSI Divergence — Señal')
 
   // Último indicador disponible
@@ -225,6 +390,16 @@ export default function AssetDetail() {
 
       {/* Estado señal Trend+Pullback (con filtro gap del usuario) */}
       {tpSignal && <TrendPullbackBadgeRow signal={tpSignal} />}
+
+      {/* Estado señal de mínimos históricos */}
+      {hlSignal && hlSignal.setup_state !== 'NO_SIGNAL' && (
+        <HistoricalLowBadgeRow signal={hlSignal} />
+      )}
+
+      {/* Estado señal de máximos históricos */}
+      {hhSignal && hhSignal.setup_state !== 'NO_SIGNAL' && (
+        <HistoricalHighBadgeRow signal={hhSignal} />
+      )}
 
       {/* Controles del gráfico */}
       <div className="flex items-center gap-3 flex-wrap">
@@ -329,6 +504,17 @@ export default function AssetDetail() {
         >
           <TrendingUp size={12} /> Canales
         </button>
+        <button
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
+            showUtBot
+              ? 'bg-[#26a69a]/20 text-[#26a69a] border-[#26a69a]/40'
+              : 'border-border text-text-muted hover:text-text-secondary'
+          }`}
+          onClick={() => setShowUtBot(v => !v)}
+          title="UT Bot trailing stop (sensitivity 2, ATR 10)"
+        >
+          <Activity size={12} /> UT Bot
+        </button>
       </div>
 
       {/* Chart */}
@@ -345,7 +531,10 @@ export default function AssetDetail() {
             candles={candles}
             freq={tf}
             indicators={indicatorLines}
+            markers={utBotMarkers}
+            zones={dynZones}
             height={480}
+            viewStartDate={dynSupports?.long?.anchor1?.fecha}
           />
         ) : (
           <div className="h-80 flex items-center justify-center">
@@ -355,9 +544,9 @@ export default function AssetDetail() {
       </div>
 
       {/* ADX panel — siempre visible bajo el chart */}
-      {candles.length > 0 && (
+      {chartCandles.length > 0 && (
         <ADXPanel
-          candles={candles}
+          candles={chartCandles}
           adx={adxData.adx}
           plusDI={adxData.plusDI}
           minusDI={adxData.minusDI}
@@ -366,10 +555,10 @@ export default function AssetDetail() {
       )}
 
       {/* RSI Divergence panels — visibles si la estrategia está activa en cualquiera de los dos combos */}
-      {rsiDivergenceActive && candles.length > 0 && (
+      {rsiDivergenceActive && chartCandles.length > 0 && (
         <>
           <RSIPanel
-            candles={candles}
+            candles={chartCandles}
             rsiValues={rsiValues}
             divergences={divergences}
             height={180}
@@ -448,6 +637,76 @@ function TrendPullbackBadgeRow({ signal }: { signal: TrendPullbackSignal }) {
       </span>
       <span className="text-text-muted">
         Pullback <span className="font-mono text-text-primary">{signal.pullback_score}</span>
+      </span>
+      <span className="text-text-muted hidden md:inline">{signal.reading}</span>
+      <span className="ml-auto text-text-muted text-2xs">{signal.fecha}</span>
+    </div>
+  )
+}
+
+// ── HistoricalLowBadgeRow ─────────────────────────────────────────────────────
+
+const HL_STATE_LABEL: Record<string, { label: string; cls: string }> = {
+  NEW_52W_LOW:  { label: 'Nuevo mínimo 52w',    cls: 'text-down bg-down/10 border-down/30' },
+  AT_52W_LOW:   { label: 'En mínimo 52w',       cls: 'text-down bg-down/10 border-down/30' },
+  NEAR_52W_LOW: { label: 'Cerca de mínimo 52w', cls: 'text-orange-400 bg-orange-500/10 border-orange-500/30' },
+}
+
+function HistoricalLowBadgeRow({ signal }: { signal: HistoricalLowSignal }) {
+  const meta = HL_STATE_LABEL[signal.setup_state] ?? HL_STATE_LABEL.NEAR_52W_LOW
+
+  return (
+    <div className="card p-3 md:p-4 flex flex-wrap items-center gap-3 text-xs">
+      <TrendingDown size={14} className="text-down" />
+      <span className="text-text-muted uppercase tracking-wider">Mínimos</span>
+      <span className={`font-medium px-2 py-0.5 rounded border ${meta.cls}`}>{meta.label}</span>
+
+      {signal.is_all_time_low && (
+        <span className="px-2 py-0.5 rounded border text-down bg-down/10 border-down/30 font-medium animate-pulse">
+          ALL-TIME LOW
+        </span>
+      )}
+
+      <span className="text-text-muted">
+        Min 52w <span className="font-mono text-text-primary">${signal.low_52w.toFixed(2)}</span>
+      </span>
+      <span className="text-text-muted">
+        Dist <span className="font-mono text-text-primary">{signal.distance_52w_pct?.toFixed(1)}%</span>
+      </span>
+      <span className="text-text-muted hidden md:inline">{signal.reading}</span>
+      <span className="ml-auto text-text-muted text-2xs">{signal.fecha}</span>
+    </div>
+  )
+}
+
+// ── HistoricalHighBadgeRow ────────────────────────────────────────────────────
+
+const HH_STATE_LABEL: Record<string, { label: string; cls: string }> = {
+  NEW_52W_HIGH:  { label: 'Nuevo máximo 52w',    cls: 'text-up bg-up/10 border-up/30' },
+  AT_52W_HIGH:   { label: 'En máximo 52w',       cls: 'text-up bg-up/10 border-up/30' },
+  NEAR_52W_HIGH: { label: 'Cerca de máximo 52w', cls: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30' },
+}
+
+function HistoricalHighBadgeRow({ signal }: { signal: HistoricalHighSignal }) {
+  const meta = HH_STATE_LABEL[signal.setup_state] ?? HH_STATE_LABEL.NEAR_52W_HIGH
+
+  return (
+    <div className="card p-3 md:p-4 flex flex-wrap items-center gap-3 text-xs">
+      <TrendingUp size={14} className="text-up" />
+      <span className="text-text-muted uppercase tracking-wider">Máximos</span>
+      <span className={`font-medium px-2 py-0.5 rounded border ${meta.cls}`}>{meta.label}</span>
+
+      {signal.is_all_time_high && (
+        <span className="px-2 py-0.5 rounded border text-up bg-up/10 border-up/30 font-medium animate-pulse">
+          ALL-TIME HIGH
+        </span>
+      )}
+
+      <span className="text-text-muted">
+        Max 52w <span className="font-mono text-text-primary">${signal.high_52w.toFixed(2)}</span>
+      </span>
+      <span className="text-text-muted">
+        Dist <span className="font-mono text-text-primary">{signal.distance_52w_pct?.toFixed(1)}%</span>
       </span>
       <span className="text-text-muted hidden md:inline">{signal.reading}</span>
       <span className="ml-auto text-text-muted text-2xs">{signal.fecha}</span>
