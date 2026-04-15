@@ -254,8 +254,11 @@ def _fit_trendline_log(
                 continue
 
             # Regla Julian (v4, hard): la linea no puede atravesar ningun cuerpo
-            # de vela en [anchor1, N-1].  Aplica a TODAS las barras, no solo pivots.
-            if _line_crosses_any_body(slope, intercept, log_body, i, N - 1):
+            # de vela en [anchor1, anchor2].  Aplica a TODAS las barras entre
+            # anchors (el segmento que la linea representa historicamente).
+            # Despues de anchor2 es proyeccion; si el precio cae por debajo es
+            # BROKEN (status), no invalida la linea.
+            if _line_crosses_any_body(slope, intercept, log_body, i, j):
                 continue
 
             touches = 0
@@ -428,12 +431,12 @@ def _fit_regression_log(
             continue
 
         # Regla Julian (v4, hard): la linea no puede atravesar ningun cuerpo
-        # de vela en [anchor1, N-1].  Aplica a TODAS las barras, no solo pivots.
-        # La regresion minimiza error cuadratico sobre las mechas de la cadena,
-        # entonces puede quedar por arriba del body_low de velas intermedias
-        # (pivot o no).  Eso es justo lo que Julian llama "cortar velas por
-        # el medio".  Hard-reject.
-        if _line_crosses_any_body(slope, intercept, log_body, i0, N - 1):
+        # de vela en [anchor1, anchor2].  La regresion minimiza error cuadratico
+        # sobre las mechas de la cadena, entonces puede quedar por arriba del
+        # body_low de velas intermedias (pivot o no) — eso es "cortar velas por
+        # el medio".  Hard-reject DENTRO del segmento que la linea representa.
+        # Post-anchor2 es proyeccion: si el precio cae por debajo, status=BROKEN.
+        if _line_crosses_any_body(slope, intercept, log_body, i0, i1):
             continue
 
         # Nota: no se aplica `max_proj_ratio` aqui.  Esa regla era para lineas
