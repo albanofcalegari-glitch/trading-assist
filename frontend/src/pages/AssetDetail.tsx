@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { ArrowLeft, TrendingUp, TrendingDown, Activity, BarChart2, Tv2, AlertTriangle, Trash2, Pencil, X, Check } from 'lucide-react'
-import { api, backfillAsset, addPriceLevel, updatePriceLevel, deletePriceLevel, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports, type PriceLevel, type PriceLevelKind } from '@/lib/api'
+import { api, backfillAsset, addPriceLevel, updatePriceLevel, deletePriceLevel, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports, type DynamicResistances, type PriceLevel, type PriceLevelKind } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
 import { fmtPrice, fmtPct, pctClass, fmt, calcRSI, calcADX, resampleOHLCV } from '@/lib/utils'
 import { computeUtBot } from '@/lib/utBot'
@@ -53,6 +53,8 @@ export default function AssetDetail() {
   const [hhSignal,       setHhSignal]       = useState<HistoricalHighSignal | null>(null)
   const [dynSupports,    setDynSupports]    = useState<DynamicSupports | null>(null)
   const [showDynSupports,setShowDynSupports]= useState(true)
+  const [dynResistances,    setDynResistances]    = useState<DynamicResistances | null>(null)
+  const [showDynResistances,setShowDynResistances]= useState(true)
   const [showUtBot,      setShowUtBot]      = useState(false)
   const [backfilling,    setBackfilling]    = useState(false)
   // Niveles dibujados por el usuario (soporte/resistencia/target/nota) — per-user
@@ -121,6 +123,11 @@ export default function AssetDetail() {
     api.dynamicSupports(accionId)
       .then(setDynSupports)
       .catch(() => setDynSupports(null))
+
+    // Fetch dynamic resistances (long/mid/short trendlines descendentes)
+    api.dynamicResistances(accionId)
+      .then(setDynResistances)
+      .catch(() => setDynResistances(null))
 
     // Fetch niveles de precio dibujados por el usuario (per-user, filtrados en backend)
     api.priceLevels(accionId)
@@ -277,6 +284,60 @@ export default function AssetDetail() {
         values,
         color,
         label:  `Soporte ${label}`,
+      })
+    }
+  }
+  // Build dynamic resistance overlay lines (long/mid/short trendlines descendentes)
+  //   rojo     = largo plazo estructural (bear market vigente)
+  //   naranja  = mediano plazo (rally bajista reciente)
+  //   magenta  = corto plazo (ultima caida / lateralizacion bajo un techo)
+  // Horizontal => zona (zone_floor + zone_ceiling) en vez de linea diagonal.
+  if (dynResistances && showDynResistances && candles.length) {
+    const tiers: [keyof DynamicResistances, string, string][] = [
+      ['long',  '#ef4444', 'LP'],
+      ['mid',   '#fb923c', 'MP'],
+      ['short', '#e879f9', 'CP'],
+    ]
+    const candleDates = candles.map(c => c.fecha)
+    for (const [key, color, label] of tiers) {
+      const tier = dynResistances[key]
+      if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
+      if (!('line_points' in tier)) continue
+      // Horizontal: zona con piso + techo (techo = la resistencia)
+      if (tier.kind === 'horizontal' && typeof tier.zone_floor === 'number' && typeof tier.zone_ceiling === 'number') {
+        dynZones.push({
+          floor: tier.zone_floor,
+          top:   tier.zone_ceiling,
+          color,
+          label: `Zona R ${label}`,
+        })
+        continue
+      }
+      if (!tier.line_points.length) continue
+      const pts = tier.line_points
+      const tsValues = pts.map(p => Date.parse(p.fecha))
+      const logValues = pts.map(p => Math.log(p.value))
+      const firstTs = tsValues[0]
+      const lastTs  = tsValues[tsValues.length - 1]
+      const values = candleDates.map(d => {
+        const t = Date.parse(d)
+        if (t < firstTs || t > lastTs) return null
+        let lo = 0, hi = tsValues.length - 1
+        while (hi - lo > 1) {
+          const mid = (lo + hi) >> 1
+          if (tsValues[mid] <= t) lo = mid
+          else hi = mid
+        }
+        const t0 = tsValues[lo], t1 = tsValues[hi]
+        if (t1 === t0) return Math.exp(logValues[lo])
+        const frac = (t - t0) / (t1 - t0)
+        return Math.exp(logValues[lo] + frac * (logValues[hi] - logValues[lo]))
+      })
+      indicatorLines.push({
+        dates:  candleDates,
+        values,
+        color,
+        label:  `Resistencia ${label}`,
       })
     }
   }
@@ -574,6 +635,17 @@ export default function AssetDetail() {
           title="UT Bot trailing stop (sensitivity 2, ATR 10)"
         >
           <Activity size={12} /> UT Bot
+        </button>
+        <button
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
+            showDynResistances
+              ? 'bg-[#ef4444]/20 text-[#ef4444] border-[#ef4444]/40'
+              : 'border-border text-text-muted hover:text-text-secondary'
+          }`}
+          onClick={() => setShowDynResistances(v => !v)}
+          title="Resistencias dinámicas (long/mid/short)"
+        >
+          <TrendingDown size={12} /> Resistencias
         </button>
       </div>
 

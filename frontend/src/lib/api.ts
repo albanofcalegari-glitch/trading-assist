@@ -207,6 +207,33 @@ export interface DynamicSupports {
   short:          DynamicSupportTier | null
 }
 
+export interface DynamicResistanceTier {
+  status:           'ACTIVE' | 'TESTING' | 'BROKEN'
+  anchor1:          { fecha: string; value: number }
+  anchor2:          { fecha: string; value: number }
+  line_points:      { fecha: string; value: number }[]
+  current_value:    number
+  distance_pct:     number
+  slope_annual_pct: number
+  touches:          number
+  violations:       number
+  // 'horizontal' indica lateralizacion reciente bajo un techo; se dibuja como
+  // ZONA (zone_floor + zone_ceiling). Default 'descending' para compat.
+  kind?:            'descending' | 'horizontal'
+  zone_floor?:      number  // piso de la banda (solo kind='horizontal')
+  zone_ceiling?:    number  // techo = la resistencia (solo kind='horizontal')
+}
+
+export interface DynamicResistances {
+  symbol:         string
+  timeframe_used: string | null
+  bars_of_data:   number
+  price:          number | null
+  long:           DynamicResistanceTier | null
+  mid:            DynamicResistanceTier | null
+  short:          DynamicResistanceTier | null
+}
+
 export interface UtBotPoint {
   fecha: string
   value: number
@@ -498,6 +525,9 @@ export const api = {
 
   dynamicSupports: (id: number) =>
     get<DynamicSupports>(`/assets/${id}/dynamic-supports`),
+
+  dynamicResistances: (id: number) =>
+    get<DynamicResistances>(`/assets/${id}/dynamic-resistances`),
 
   utBot: (id: number, sensitivity?: number, atrPeriod?: number) => {
     const qs = new URLSearchParams()

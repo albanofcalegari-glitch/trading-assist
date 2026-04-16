@@ -61,6 +61,12 @@ _dynsup_cache: dict = {}         # symbol → {'data': dict, 'ts': float}
 _dynsup_lock = threading.Lock()
 _DYNSUP_TTL  = 3600              # 1 hora
 
+# ── Caché para dynamic-resistances ────────────────────────────────────────────
+
+_dynres_cache: dict = {}         # symbol → {'data': dict, 'ts': float}
+_dynres_lock = threading.Lock()
+_DYNRES_TTL  = 3600              # 1 hora
+
 # ── Caché para ut-bot ─────────────────────────────────────────────────────────
 
 _utbot_cache: dict = {}          # (symbol, sensitivity, atr_period) → {'data': dict, 'ts': float}
@@ -1246,6 +1252,40 @@ def get_dynamic_supports_endpoint(accion_id: int):
 
     with _dynsup_lock:
         _dynsup_cache[symbol] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/assets/<id>/dynamic-resistances ──────────────────────────────────────
+#
+# Resistencias dinamicas descendentes (espejo de dynamic-supports). Devuelve 3
+# tiers: long / mid / short para pintar overlays rojo/naranja/magenta.
+
+@app.route('/api/assets/<int:accion_id>/dynamic-resistances')
+def get_dynamic_resistances_endpoint(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _dynres_lock:
+        entry = _dynres_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _DYNRES_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        from strategies.dynamic_resistances import get_dynamic_resistances
+        result = get_dynamic_resistances(symbol, datetime.date.today())
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _dynres_lock:
+        _dynres_cache[symbol] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 
