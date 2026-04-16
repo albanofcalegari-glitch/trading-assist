@@ -29,6 +29,22 @@ export interface PriceZone {
   label: string
 }
 
+// Nivel horizontal dibujado por el usuario. Se renderiza como priceLine nativa.
+export interface UserPriceLevel {
+  id:    number
+  price: number
+  kind:  'support' | 'resistance' | 'target' | 'note'
+  label: string | null
+}
+
+// Paleta por kind. Match con los presets del popover en AssetDetail.
+const USER_LEVEL_COLORS: Record<UserPriceLevel['kind'], string> = {
+  support:    '#22c55e',
+  resistance: '#ef4444',
+  target:     '#eab308',
+  note:       '#94a3b8',
+}
+
 // ── Props ─────────────────────────────────────────────────────────────────────
 
 interface Props {
@@ -37,6 +53,12 @@ interface Props {
   indicators:    IndicatorLine[]
   markers?:      ChartMarker[]
   zones?:        PriceZone[]
+  userLevels?:   UserPriceLevel[]
+  // Callback cuando el usuario hace click-derecho sobre el chart.
+  // Recibe el precio del clic (convertido desde Y) y las coords absolutas del
+  // mouse para posicionar el popover. Si no se pasa, el click-derecho nativo
+  // del browser queda habilitado.
+  onContextMenu?: (args: { price: number; clientX: number; clientY: number }) => void
   height?:       number
   // Fecha (YYYY-MM-DD) desde la que mostrar el chart por default.
   // Si está definida y existe en los datos, reemplaza el DEFAULT_BARS.
@@ -62,6 +84,8 @@ export default function PriceChart({
   candles, freq, indicators,
   markers,
   zones,
+  userLevels,
+  onContextMenu,
   height = 550,
   viewStartDate,
 }: Props) {
@@ -71,7 +95,10 @@ export default function PriceChart({
   const overlayRef    = useRef<ISeriesApi<'Line'>[]>([])
   const chartDatesRef = useRef<Set<string>>(new Set())
   const priceLinesRef = useRef<IPriceLine[]>([])
+  const userLinesRef  = useRef<IPriceLine[]>([])
   const viewStartRef  = useRef<string | undefined>(viewStartDate)
+  const onContextMenuRef = useRef(onContextMenu)
+  useLayoutEffect(() => { onContextMenuRef.current = onContextMenu }, [onContextMenu])
   // Sincroniza el ref con el prop (para que onDblClick y el reset usen el valor vigente)
   useLayoutEffect(() => { viewStartRef.current = viewStartDate }, [viewStartDate])
 
@@ -335,6 +362,21 @@ export default function PriceChart({
     window.addEventListener('mousemove', onMouseMove)
     window.addEventListener('mouseup',   onMouseUp)
 
+    // ── Context menu (click-derecho): crear nivel a la altura clickeada ──────
+    const onContextMenuEvt = (ev: MouseEvent) => {
+      const cb = onContextMenuRef.current
+      if (!cb) return
+      const cs = candleSeriesRef.current
+      if (!cs) return
+      const rect = el.getBoundingClientRect()
+      const y = ev.clientY - rect.top
+      const price = cs.coordinateToPrice(y)
+      if (price == null) return
+      ev.preventDefault()
+      cb({ price: Number(price), clientX: ev.clientX, clientY: ev.clientY })
+    }
+    el.addEventListener('contextmenu', onContextMenuEvt)
+
     // ── Responsive ────────────────────────────────────────────────────────────
     const ro = new ResizeObserver(entries => {
       for (const entry of entries) chart.applyOptions({ width: entry.contentRect.width })
@@ -345,6 +387,7 @@ export default function PriceChart({
       ro.disconnect()
       el.removeEventListener('dblclick', onDblClick)
       el.removeEventListener('mousedown', onMouseDown)
+      el.removeEventListener('contextmenu', onContextMenuEvt)
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseup',   onMouseUp)
       if (zoomBox.parentNode) zoomBox.parentNode.removeChild(zoomBox)
@@ -352,6 +395,7 @@ export default function PriceChart({
       chartRef.current = null
       candleSeriesRef.current = null
       overlayRef.current = []
+      userLinesRef.current = []
     }
   }, [candles, freq, height])
 
@@ -438,6 +482,33 @@ export default function PriceChart({
       } as any))
     }
   }, [zones, candles, freq])
+
+  // ── Effect userLevels: priceLines horizontales del usuario (color por kind) ─
+  // Se recrean en cada cambio de userLevels/candles/freq. Independientes de
+  // las zones automáticas del sistema.
+  useEffect(() => {
+    const cs = candleSeriesRef.current
+    if (!cs) return
+    for (const pl of userLinesRef.current) {
+      try { cs.removePriceLine(pl) } catch {}
+    }
+    userLinesRef.current = []
+    if (!userLevels || !userLevels.length) return
+    for (const lvl of userLevels) {
+      const color = USER_LEVEL_COLORS[lvl.kind] || '#94a3b8'
+      const title = lvl.label && lvl.label.trim()
+        ? lvl.label.trim()
+        : ({ support: 'Soporte', resistance: 'Resistencia', target: 'Target', note: 'Nota' }[lvl.kind])
+      userLinesRef.current.push(cs.createPriceLine({
+        price:            lvl.price,
+        color,
+        lineWidth:        2,
+        lineStyle:        lvl.kind === 'note' ? LineStyle.Dashed : LineStyle.Solid,
+        axisLabelVisible: true,
+        title,
+      } as any))
+    }
+  }, [userLevels, candles, freq])
 
   // ── Effect 2: Update overlay data/visibility (never add/remove series) ────
   useEffect(() => {

@@ -327,14 +327,19 @@ export interface HistoricalHighSignal {
 }
 
 export interface Notification {
-  id:           number
-  batch_run_id: number | null
-  kind:         string            // 'close' | 'pre_market' | 'opening' | 'midday' | 'weekly_rank' | 'historical_lows'
-  title:        string
-  body:         string
-  data:         any | null
-  created_at:   string
-  read_at:      string | null
+  id:               number
+  batch_run_id:     number | null
+  kind:             string            // 'close' | 'pre_market' | 'opening' | 'midday' | 'weekly_rank' | 'historical_lows' | 'watchlist' | 'watchlist_summary'
+  title:            string
+  body:             string
+  data:             any | null
+  created_at:       string
+  read_at:          string | null
+  user_id:          number | null
+  accion_id:        number | null
+  signal_code:      string | null     // 'UT_BOT' | 'NEAR_DYN_SUPPORT' | 'NEAR_LT_SUPPORT' | 'NEAR_LT_RESISTANCE' | '52W_LOW' | '52W_HIGH' | 'TREND_PULLBACK'
+  signal_direction: 'BUY' | 'SELL' | null
+  accion_simbolo:   string | null
 }
 
 export interface CompanyInfo {
@@ -385,6 +390,61 @@ export interface CompanyInfo {
     net_income:       number | null
     ebit:             number | null
   }[]
+}
+
+export interface WatchlistItem {
+  id:                number
+  accion_id:         number
+  simbolo:           string
+  nombre:            string
+  mercado:           string
+  qty:               number | null
+  avg_buy_price:     number | null
+  note:              string | null
+  precio:            number | null
+  pct_cambio_dia:    number | null
+  pct_cambio_semana: number | null
+  valor_corriente:   number | null
+  ganancia_abs:      number | null
+  ganancia_pct:      number | null
+  added_at:          string | null
+}
+
+export interface WatchlistInput {
+  accion_id:      number
+  qty?:           number | null
+  avg_buy_price?: number | null
+  note?:          string | null
+}
+
+export interface WatchlistPatch {
+  qty?:           number | null
+  avg_buy_price?: number | null
+  note?:          string | null
+}
+
+export type PriceLevelKind = 'support' | 'resistance' | 'target' | 'note'
+
+export interface PriceLevel {
+  id:         number
+  accion_id:  number
+  price:      number
+  kind:       PriceLevelKind
+  label:      string | null
+  created_at: string | null
+}
+
+export interface PriceLevelInput {
+  accion_id: number
+  price:     number
+  kind:      PriceLevelKind
+  label?:    string | null
+}
+
+export interface PriceLevelPatch {
+  price?: number
+  kind?:  PriceLevelKind
+  label?: string | null
 }
 
 export interface WmaCrossItem {
@@ -475,6 +535,76 @@ export const api = {
 
   notificationsUnread: () =>
     get<{ unread: number }>('/notifications/unread-count'),
+
+  watchlist: () =>
+    get<{ items: WatchlistItem[] }>('/watchlist'),
+
+  priceLevels: (accionId: number) =>
+    get<{ items: PriceLevel[] }>(`/price-levels?accion_id=${accionId}`),
+}
+
+export async function addWatchlist(input: WatchlistInput) {
+  const res = await fetch(BASE + '/watchlist', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(input),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al agregar a la watchlist')
+  return data as { ok: boolean; id: number }
+}
+
+export async function updateWatchlist(id: number, patch: WatchlistPatch) {
+  const res = await fetch(BASE + `/watchlist/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(patch),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al actualizar')
+  return data as { ok: boolean }
+}
+
+export async function deleteWatchlist(id: number) {
+  const res = await fetch(BASE + `/watchlist/${id}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al eliminar')
+  return data as { ok: boolean }
+}
+
+export async function addPriceLevel(input: PriceLevelInput) {
+  const res = await fetch(BASE + '/price-levels', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(input),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al crear nivel')
+  return data.item as PriceLevel
+}
+
+export async function updatePriceLevel(id: number, patch: PriceLevelPatch) {
+  const res = await fetch(BASE + `/price-levels/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(patch),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al actualizar nivel')
+  return data.item as PriceLevel
+}
+
+export async function deletePriceLevel(id: number) {
+  const res = await fetch(BASE + `/price-levels/${id}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al eliminar nivel')
+  return data as { ok: boolean }
 }
 
 export async function markNotificationRead(id: number) {
@@ -484,4 +614,14 @@ export async function markNotificationRead(id: number) {
   })
   if (!res.ok) throw new Error(`Error al marcar leída: ${res.status}`)
   return res.json()
+}
+
+export async function backfillAsset(accionId: number) {
+  const res = await fetch(BASE + `/assets/${accionId}/backfill`, {
+    method: 'POST',
+    headers: authHeaders(),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || `Backfill error ${res.status}`)
+  return data as { symbol: string; results: Record<string, unknown> }
 }

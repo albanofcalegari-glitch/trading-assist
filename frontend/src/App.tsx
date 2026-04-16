@@ -7,6 +7,7 @@ import Dashboard   from '@/pages/Dashboard'
 import AssetDetail from '@/pages/AssetDetail'
 import Screener    from '@/pages/Screener'
 import Alerts      from '@/pages/Alerts'
+import Watchlist   from '@/pages/Watchlist'
 import Settings    from '@/pages/Settings'
 import Login       from '@/pages/Login'
 
@@ -22,6 +23,7 @@ function ProtectedRoutes() {
         <Route path="/asset/:id" element={<AssetDetail />} />
         <Route path="/screener" element={<Screener />} />
         <Route path="/alerts" element={<Alerts />} />
+        <Route path="/watchlist" element={<Watchlist />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Route>

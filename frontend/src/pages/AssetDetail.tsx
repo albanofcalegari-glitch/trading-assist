@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { ArrowLeft, TrendingUp, TrendingDown, Activity, BarChart2, Tv2, AlertTriangle } from 'lucide-react'
-import { api, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports } from '@/lib/api'
+import { ArrowLeft, TrendingUp, TrendingDown, Activity, BarChart2, Tv2, AlertTriangle, Trash2, Pencil, X, Check } from 'lucide-react'
+import { api, backfillAsset, addPriceLevel, updatePriceLevel, deletePriceLevel, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports, type PriceLevel, type PriceLevelKind } from '@/lib/api'
+import { useAuth } from '@/lib/auth'
 import { fmtPrice, fmtPct, pctClass, fmt, calcRSI, calcADX, resampleOHLCV } from '@/lib/utils'
 import { computeUtBot } from '@/lib/utBot'
 import PriceChart, { buildIndicatorLines } from '@/components/detail/PriceChart'
@@ -53,6 +54,27 @@ export default function AssetDetail() {
   const [dynSupports,    setDynSupports]    = useState<DynamicSupports | null>(null)
   const [showDynSupports,setShowDynSupports]= useState(true)
   const [showUtBot,      setShowUtBot]      = useState(false)
+  const [backfilling,    setBackfilling]    = useState(false)
+  // Niveles dibujados por el usuario (soporte/resistencia/target/nota) — per-user
+  const [priceLevels,    setPriceLevels]    = useState<PriceLevel[]>([])
+  // Popover posicionado en click-derecho sobre el chart. `price` viene del Y->price del chart.
+  const [ctxMenu, setCtxMenu] = useState<{ price: number; x: number; y: number } | null>(null)
+  const { username } = useAuth()
+  const isAdmin = username === 'albano'
+
+  const handleBackfill = async () => {
+    if (backfilling) return
+    setBackfilling(true)
+    try {
+      const r = await backfillAsset(accionId)
+      alert(`Backfill OK para ${r.symbol}. Recargando…`)
+      window.location.reload()
+    } catch (e) {
+      alert(`Error backfill: ${(e as Error).message}`)
+    } finally {
+      setBackfilling(false)
+    }
+  }
 
   useEffect(() => {
     if (!accionId) return
@@ -99,7 +121,45 @@ export default function AssetDetail() {
     api.dynamicSupports(accionId)
       .then(setDynSupports)
       .catch(() => setDynSupports(null))
+
+    // Fetch niveles de precio dibujados por el usuario (per-user, filtrados en backend)
+    api.priceLevels(accionId)
+      .then(r => setPriceLevels(r.items ?? []))
+      .catch(() => setPriceLevels([]))
   }, [accionId])
+
+  // Helpers CRUD para niveles del usuario — refetch simple post-mutación
+  const reloadLevels = () => {
+    api.priceLevels(accionId)
+      .then(r => setPriceLevels(r.items ?? []))
+      .catch(() => { /* keep previous */ })
+  }
+  const handleAddLevel = async (kind: PriceLevelKind, price: number) => {
+    try {
+      await addPriceLevel({ accion_id: accionId, price, kind })
+      reloadLevels()
+    } catch (e) {
+      alert(`No pude crear el nivel: ${(e as Error).message}`)
+    } finally {
+      setCtxMenu(null)
+    }
+  }
+  const handleDeleteLevel = async (id: number) => {
+    try {
+      await deletePriceLevel(id)
+      setPriceLevels(prev => prev.filter(l => l.id !== id))
+    } catch (e) {
+      alert(`No pude borrar el nivel: ${(e as Error).message}`)
+    }
+  }
+  const handlePatchLevel = async (id: number, patch: { price?: number; kind?: PriceLevelKind; label?: string | null }) => {
+    try {
+      const updated = await updatePriceLevel(id, patch)
+      setPriceLevels(prev => prev.map(l => l.id === id ? updated : l))
+    } catch (e) {
+      alert(`No pude actualizar el nivel: ${(e as Error).message}`)
+    }
+  }
 
   // Velas al timeframe del chart — todos los paneles (ADX/RSI/UT Bot/divergences)
   // usan esta serie para que coincida con las velas visibles.
@@ -518,7 +578,7 @@ export default function AssetDetail() {
       </div>
 
       {/* Chart */}
-      <div className="card p-1 overflow-hidden">
+      <div className="card p-1 overflow-hidden relative">
         {chartMode === 'tv' && asset ? (
           <TradingViewChart
             symbol={tvSymbol(asset)}
@@ -533,15 +593,75 @@ export default function AssetDetail() {
             indicators={indicatorLines}
             markers={utBotMarkers}
             zones={dynZones}
+            userLevels={priceLevels.map(l => ({
+              id:    l.id,
+              price: l.price,
+              kind:  l.kind,
+              label: l.label,
+            }))}
+            onContextMenu={({ price, clientX, clientY }) =>
+              setCtxMenu({ price, x: clientX, y: clientY })
+            }
             height={480}
-            viewStartDate={dynSupports?.long?.anchor1?.fecha}
+            viewStartDate={(() => {
+              // Auto-zoom desde anchor1 del tier LP, pero minimo 3 anios de historia
+              // — si el LP detectado es corto (ej. NVDA con micro-linea reciente),
+              // igual se muestra el contexto multi-anio para no "agrandar" el chart.
+              const anchor = dynSupports?.long?.anchor1?.fecha
+              const minDate = new Date()
+              minDate.setFullYear(minDate.getFullYear() - 3)
+              const minStr = minDate.toISOString().slice(0, 10)
+              if (!anchor) return minStr
+              return anchor < minStr ? anchor : minStr
+            })()}
           />
         ) : (
-          <div className="h-80 flex items-center justify-center">
+          <div className="h-80 flex flex-col items-center justify-center gap-3">
             <p className="text-sm text-text-muted">Sin datos de precio</p>
+            {isAdmin && (
+              <button
+                onClick={handleBackfill}
+                disabled={backfilling}
+                className="px-4 py-2 rounded bg-accent-blue/20 border border-accent-blue/50 text-accent-blue hover:bg-accent-blue/30 disabled:opacity-50 text-sm"
+              >
+                {backfilling ? 'Descargando histórico…' : 'Cargar datos (admin)'}
+              </button>
+            )}
+          </div>
+        )}
+        {isAdmin && candles.length > 0 && (
+          <div className="mt-2 flex justify-end">
+            <button
+              onClick={handleBackfill}
+              disabled={backfilling}
+              className="px-2 py-1 rounded text-xs bg-bg-secondary/50 border border-border-subtle text-text-muted hover:text-text-primary disabled:opacity-50"
+              title="Re-descargar histórico desde Yahoo (admin)"
+            >
+              {backfilling ? '…' : '↻ refrescar histórico'}
+            </button>
           </div>
         )}
       </div>
+
+      {/* Popover para crear nivel (click-derecho sobre el chart) */}
+      {ctxMenu && (
+        <AddLevelPopover
+          price={ctxMenu.price}
+          x={ctxMenu.x}
+          y={ctxMenu.y}
+          onPick={handleAddLevel}
+          onClose={() => setCtxMenu(null)}
+        />
+      )}
+
+      {/* Panel "Mis niveles" — lista editable de niveles del usuario para este activo */}
+      {candles.length > 0 && (
+        <MyLevelsPanel
+          levels={priceLevels}
+          onPatch={handlePatchLevel}
+          onDelete={handleDeleteLevel}
+        />
+      )}
 
       {/* ADX panel — siempre visible bajo el chart */}
       {chartCandles.length > 0 && (
@@ -728,6 +848,216 @@ function Kpi({ icon, label, value, cls }: {
       <span className={`font-mono text-sm font-medium text-text-primary ${cls ?? ''}`}>
         {value}
       </span>
+    </div>
+  )
+}
+
+// ── AddLevelPopover ───────────────────────────────────────────────────────────
+//
+// Popover de 4 presets posicionado en (x,y) absolutos respecto al viewport.
+// `price` ya viene calculado desde el coordinateToPrice del chart. Se cierra
+// al elegir una opción, al clickear fuera o al presionar Escape.
+
+const LEVEL_PRESETS: { kind: PriceLevelKind; label: string; color: string; icon: string }[] = [
+  { kind: 'support',    label: 'Soporte',     color: '#22c55e', icon: '🟢' },
+  { kind: 'resistance', label: 'Resistencia', color: '#ef4444', icon: '🔴' },
+  { kind: 'target',     label: 'Target',      color: '#eab308', icon: '🟡' },
+  { kind: 'note',       label: 'Nota',        color: '#94a3b8', icon: '⚪' },
+]
+
+function AddLevelPopover({ price, x, y, onPick, onClose }: {
+  price:   number
+  x:       number
+  y:       number
+  onPick:  (kind: PriceLevelKind, price: number) => void
+  onClose: () => void
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onDocClick = (e: MouseEvent) => {
+      const el = document.getElementById('add-level-popover')
+      if (el && !el.contains(e.target as Node)) onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    // defer para no capturar el mismo click-derecho que abrió el popover
+    const t = window.setTimeout(() => document.addEventListener('mousedown', onDocClick), 0)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      document.removeEventListener('mousedown', onDocClick)
+      window.clearTimeout(t)
+    }
+  }, [onClose])
+
+  // Clamp al viewport para no quedar fuera de pantalla
+  const WIDTH = 200
+  const HEIGHT = 180
+  const left = Math.min(x, window.innerWidth  - WIDTH  - 8)
+  const top  = Math.min(y, window.innerHeight - HEIGHT - 8)
+
+  return (
+    <div
+      id="add-level-popover"
+      className="fixed z-50 bg-surface border border-border rounded-md shadow-lg p-2 text-xs"
+      style={{ left, top, width: WIDTH }}
+    >
+      <div className="flex items-center justify-between px-1 pb-1.5 mb-1 border-b border-border">
+        <span className="text-text-muted">
+          Nivel en <span className="font-mono text-text-primary">${price.toFixed(2)}</span>
+        </span>
+        <button className="text-text-muted hover:text-text-primary" onClick={onClose} title="Cerrar">
+          <X size={12} />
+        </button>
+      </div>
+      <div className="flex flex-col gap-0.5">
+        {LEVEL_PRESETS.map(p => (
+          <button
+            key={p.kind}
+            onClick={() => onPick(p.kind, price)}
+            className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-elevated text-left"
+          >
+            <span>{p.icon}</span>
+            <span className="text-text-primary">{p.label}</span>
+            <span
+              className="ml-auto w-3 h-0.5 rounded"
+              style={{ backgroundColor: p.color }}
+            />
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ── MyLevelsPanel ─────────────────────────────────────────────────────────────
+//
+// Lista editable de los niveles del usuario para el activo actual. Cada fila
+// tiene label (editable inline), precio, kind (dropdown) y borrar. Si no hay
+// niveles, muestra un hint explicando cómo crearlos con click-derecho.
+
+const KIND_META: Record<PriceLevelKind, { label: string; color: string; icon: string }> = {
+  support:    { label: 'Soporte',     color: '#22c55e', icon: '🟢' },
+  resistance: { label: 'Resistencia', color: '#ef4444', icon: '🔴' },
+  target:     { label: 'Target',      color: '#eab308', icon: '🟡' },
+  note:       { label: 'Nota',        color: '#94a3b8', icon: '⚪' },
+}
+
+function MyLevelsPanel({ levels, onPatch, onDelete }: {
+  levels:   PriceLevel[]
+  onPatch:  (id: number, patch: { price?: number; kind?: PriceLevelKind; label?: string | null }) => void
+  onDelete: (id: number) => void
+}) {
+  return (
+    <div className="card p-3 md:p-4">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-xs uppercase tracking-wider text-text-muted font-medium">
+          Mis niveles
+        </h3>
+        <span className="text-2xs text-text-muted">
+          click derecho sobre el chart para agregar
+        </span>
+      </div>
+      {levels.length === 0 ? (
+        <p className="text-xs text-text-muted py-2">
+          Todavía no marcaste niveles en este activo. Apuntá al precio en el gráfico y hacé click-derecho.
+        </p>
+      ) : (
+        <div className="divide-y divide-border">
+          {levels.map(lvl => (
+            <LevelRow
+              key={lvl.id}
+              level={lvl}
+              onPatch={patch => onPatch(lvl.id, patch)}
+              onDelete={() => onDelete(lvl.id)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function LevelRow({ level, onPatch, onDelete }: {
+  level:    PriceLevel
+  onPatch:  (patch: { price?: number; kind?: PriceLevelKind; label?: string | null }) => void
+  onDelete: () => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [labelDraft, setLabelDraft] = useState(level.label ?? '')
+  const [priceDraft, setPriceDraft] = useState(String(level.price))
+  const meta = KIND_META[level.kind]
+
+  const commit = () => {
+    const patch: { price?: number; label?: string | null } = {}
+    const newPrice = Number(priceDraft)
+    if (Number.isFinite(newPrice) && newPrice > 0 && newPrice !== Number(level.price)) {
+      patch.price = newPrice
+    }
+    const newLabel = labelDraft.trim()
+    const oldLabel = (level.label ?? '').trim()
+    if (newLabel !== oldLabel) patch.label = newLabel || null
+    if (Object.keys(patch).length) onPatch(patch)
+    setEditing(false)
+  }
+  const cancel = () => {
+    setLabelDraft(level.label ?? '')
+    setPriceDraft(String(level.price))
+    setEditing(false)
+  }
+
+  return (
+    <div className="flex items-center gap-2 py-1.5 text-xs">
+      <span
+        className="w-2 h-2 rounded-full shrink-0"
+        style={{ backgroundColor: meta.color }}
+        title={meta.label}
+      />
+      <select
+        value={level.kind}
+        onChange={e => onPatch({ kind: e.target.value as PriceLevelKind })}
+        className="bg-surface border border-border rounded px-1.5 py-0.5 text-2xs text-text-primary"
+      >
+        {(Object.keys(KIND_META) as PriceLevelKind[]).map(k => (
+          <option key={k} value={k}>{KIND_META[k].icon} {KIND_META[k].label}</option>
+        ))}
+      </select>
+      {editing ? (
+        <>
+          <input
+            type="number"
+            step="0.01"
+            value={priceDraft}
+            onChange={e => setPriceDraft(e.target.value)}
+            className="w-24 bg-surface border border-border rounded px-1.5 py-0.5 text-2xs font-mono text-text-primary"
+          />
+          <input
+            type="text"
+            value={labelDraft}
+            onChange={e => setLabelDraft(e.target.value)}
+            placeholder="etiqueta (opcional)"
+            maxLength={120}
+            className="flex-1 min-w-0 bg-surface border border-border rounded px-1.5 py-0.5 text-2xs text-text-primary"
+          />
+          <button onClick={commit} className="text-up hover:text-up/80" title="Guardar">
+            <Check size={13} />
+          </button>
+          <button onClick={cancel} className="text-text-muted hover:text-text-primary" title="Cancelar">
+            <X size={13} />
+          </button>
+        </>
+      ) : (
+        <>
+          <span className="font-mono text-text-primary w-24">${Number(level.price).toFixed(2)}</span>
+          <span className="flex-1 min-w-0 truncate text-text-secondary">
+            {level.label || <span className="text-text-muted italic">sin etiqueta</span>}
+          </span>
+          <button onClick={() => setEditing(true)} className="text-text-muted hover:text-text-primary" title="Editar">
+            <Pencil size={12} />
+          </button>
+          <button onClick={onDelete} className="text-down/80 hover:text-down" title="Borrar">
+            <Trash2 size={12} />
+          </button>
+        </>
+      )}
     </div>
   )
 }

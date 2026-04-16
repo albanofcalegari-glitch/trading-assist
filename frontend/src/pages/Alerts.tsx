@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Bell, RefreshCw, Sunrise, DoorOpen, Sun, Moon, Trophy, Activity, ChevronRight,
-  TrendingDown, TrendingUp,
+  TrendingDown, TrendingUp, Star,
 } from 'lucide-react'
 import { api, markNotificationRead, type Notification } from '@/lib/api'
 
@@ -15,16 +15,19 @@ const KIND_FILTERS = [
   { value: 'weekly_rank',     label: 'Semanal',  icon: Trophy },
   { value: 'historical_lows', label: 'Mínimos',  icon: TrendingDown },
   { value: 'historical_highs', label: 'Máximos', icon: TrendingUp },
+  { value: 'watchlist',       label: 'Watchlist', icon: Star },
 ]
 
 const KIND_META: Record<string, { color: string; icon: any; label: string }> = {
-  pre_market:       { color: '#f59e0b', icon: Sunrise,      label: 'Premarket' },
-  opening:          { color: '#06b6d4', icon: DoorOpen,     label: 'Apertura' },
-  midday:           { color: '#facc15', icon: Sun,          label: 'Mediodía' },
-  close:            { color: '#8b5cf6', icon: Moon,         label: 'Cierre' },
-  weekly_rank:      { color: '#22c55e', icon: Trophy,       label: 'Semanal' },
-  historical_lows:  { color: '#ef4444', icon: TrendingDown, label: 'Mínimos' },
-  historical_highs: { color: '#22c55e', icon: TrendingUp,   label: 'Máximos' },
+  pre_market:        { color: '#f59e0b', icon: Sunrise,      label: 'Premarket' },
+  opening:           { color: '#06b6d4', icon: DoorOpen,     label: 'Apertura' },
+  midday:            { color: '#facc15', icon: Sun,          label: 'Mediodía' },
+  close:             { color: '#8b5cf6', icon: Moon,         label: 'Cierre' },
+  weekly_rank:       { color: '#22c55e', icon: Trophy,       label: 'Semanal' },
+  historical_lows:   { color: '#ef4444', icon: TrendingDown, label: 'Mínimos' },
+  historical_highs:  { color: '#22c55e', icon: TrendingUp,   label: 'Máximos' },
+  watchlist:         { color: '#eab308', icon: Star,         label: 'Watchlist' },
+  watchlist_summary: { color: '#eab308', icon: Star,         label: 'Watchlist' },
 }
 
 export default function Alerts() {
@@ -118,6 +121,7 @@ function NotificationRow({ notif, onClick }: { notif: Notification; onClick: () 
   // derecha lleva a la página de detalle del activo.
   // Soportamos varias claves posibles según el batch que la generó.
   const targetAccionId: number | null = (() => {
+    if (typeof notif.accion_id === 'number') return notif.accion_id
     const d = notif.data
     if (!d) return null
     if (typeof d.accion_id === 'number') return d.accion_id
@@ -149,6 +153,22 @@ function NotificationRow({ notif, onClick }: { notif: Notification; onClick: () 
           >
             {meta.label}
           </span>
+          {notif.signal_direction && (
+            <span
+              className={`text-2xs px-1.5 py-0.5 rounded font-semibold tracking-wide ${
+                notif.signal_direction === 'BUY'
+                  ? 'bg-up/15 text-up border border-up/30'
+                  : 'bg-down/15 text-down border border-down/30'
+              }`}
+            >
+              {notif.signal_direction}
+            </span>
+          )}
+          {notif.accion_simbolo && (
+            <span className="text-2xs font-mono text-text-secondary">
+              {notif.accion_simbolo}
+            </span>
+          )}
           <span className="text-2xs text-text-muted">·</span>
           <span className="text-2xs text-text-muted">{fmtRelative(notif.created_at)}</span>
           {isUnread && (

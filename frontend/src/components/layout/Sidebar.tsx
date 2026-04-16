@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { NavLink, Link } from 'react-router-dom'
 import {
   LayoutDashboard, ScanLine, Bell, Settings, TrendingUp, X,
-  ChevronsLeft, ChevronsRight,
+  ChevronsLeft, ChevronsRight, Star,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -10,6 +10,7 @@ const NAV = [
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/screener',  icon: ScanLine,         label: 'Screener' },
   { to: '/alerts',    icon: Bell,             label: 'Alertas' },
+  { to: '/watchlist', icon: Star,             label: 'Watchlist' },
 ]
 
 const NAV_BOTTOM = [
@@ -52,10 +53,10 @@ export default function Sidebar({ open, onClose }: Props) {
           open ? 'translate-x-0' : '-translate-x-full md:translate-x-0',
         )}
       >
-        {/* Logo — clickable, navega al dashboard */}
+        {/* Header con logo + collapse */}
         <div className={cn(
-          'flex items-center h-14 border-b border-border',
-          collapsed ? 'md:px-2 px-4' : 'px-4',
+          'flex items-center h-14 border-b border-border gap-1',
+          collapsed ? 'md:px-2 px-4' : 'px-3',
         )}>
           <Link
             to="/dashboard"
@@ -69,14 +70,30 @@ export default function Sidebar({ open, onClose }: Props) {
               <TrendingUp size={14} className="text-accent" />
             </div>
             {!collapsed && (
-              <span className="font-semibold text-sm text-text-primary tracking-tight truncate md:inline">
+              <span className="font-semibold text-sm text-text-primary tracking-tight truncate">
                 Trading Assist
               </span>
             )}
           </Link>
+
+          {/* Collapse — solo desktop, visible siempre */}
+          <button
+            type="button"
+            onClick={() => setCollapsed(c => !c)}
+            className={cn(
+              'hidden md:flex items-center justify-center w-7 h-7 rounded-md shrink-0',
+              'text-text-muted hover:text-text-primary hover:bg-elevated transition-colors cursor-pointer',
+            )}
+            title={collapsed ? 'Expandir' : 'Contraer'}
+            aria-label={collapsed ? 'Expandir sidebar' : 'Contraer sidebar'}
+          >
+            {collapsed ? <ChevronsRight size={15} /> : <ChevronsLeft size={15} />}
+          </button>
+
+          {/* Cerrar — solo móvil */}
           <button
             onClick={onClose}
-            className="md:hidden ml-2 p-1 rounded-md hover:bg-elevated text-text-muted cursor-pointer"
+            className="md:hidden p-1 rounded-md hover:bg-elevated text-text-muted cursor-pointer"
             aria-label="Cerrar menú"
           >
             <X size={16} />
@@ -132,22 +149,6 @@ export default function Sidebar({ open, onClose }: Props) {
               {collapsed && <span className="md:hidden">{label}</span>}
             </NavLink>
           ))}
-
-          {/* Botón collapse — solo desktop */}
-          <button
-            type="button"
-            onClick={() => setCollapsed(c => !c)}
-            className={cn(
-              'hidden md:flex items-center gap-2 w-full mt-1 px-3 py-2 rounded-md',
-              'text-text-muted hover:text-text-primary hover:bg-elevated transition-colors text-xs',
-              collapsed && 'md:justify-center md:px-0',
-            )}
-            title={collapsed ? 'Expandir' : 'Contraer'}
-            aria-label={collapsed ? 'Expandir sidebar' : 'Contraer sidebar'}
-          >
-            {collapsed ? <ChevronsRight size={15} /> : <ChevronsLeft size={15} />}
-            {!collapsed && <span>Contraer</span>}
-          </button>
         </div>
       </aside>
     </>

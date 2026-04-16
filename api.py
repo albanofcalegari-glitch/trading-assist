@@ -193,6 +193,32 @@ def _ensure_batch_tables():
                     INDEX idx_notif_kind    (kind)
                 )
             """)
+            # Migración idempotente: columnas de señales por usuario
+            for col, ddl in [
+                ('user_id',          'INT NULL'),
+                ('accion_id',        'INT NULL'),
+                ('signal_code',      'VARCHAR(40) NULL'),
+                ('signal_direction', 'VARCHAR(10) NULL'),
+            ]:
+                cur.execute("""
+                    SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'notification'
+                      AND COLUMN_NAME = %s
+                """, [col])
+                if cur.fetchone()['cnt'] == 0:
+                    cur.execute(f"ALTER TABLE notification ADD COLUMN {col} {ddl}")
+                    print(f' * Columna notification.{col} creada')
+            # Índice compuesto para filtrar por user rápido
+            cur.execute("""
+                SELECT COUNT(*) AS cnt FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'notification'
+                  AND INDEX_NAME = 'idx_notif_user_created'
+            """)
+            if cur.fetchone()['cnt'] == 0:
+                cur.execute("CREATE INDEX idx_notif_user_created ON notification (user_id, created_at)")
+                print(' * Índice notification.idx_notif_user_created creado')
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS rotation_state (
                     id              INT AUTO_INCREMENT PRIMARY KEY,
@@ -242,6 +268,55 @@ def _ensure_users_table():
             if cur.fetchone()['cnt'] == 0:
                 cur.execute("ALTER TABLE users ADD COLUMN investor_profile VARCHAR(20) NULL")
                 print(' * Columna users.investor_profile creada')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ensure_watchlist_table():
+    """Watchlist por usuario (idempotente)."""
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_watchlist (
+                    id            INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id       INT           NOT NULL,
+                    accion_id     INT           NOT NULL,
+                    qty           DECIMAL(20,6) NULL,
+                    avg_buy_price DECIMAL(20,6) NULL,
+                    note          VARCHAR(500)  NULL,
+                    added_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_user_accion (user_id, accion_id),
+                    INDEX idx_user (user_id),
+                    CONSTRAINT fk_uw_user   FOREIGN KEY (user_id)   REFERENCES users(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_uw_accion FOREIGN KEY (accion_id) REFERENCES accion(id) ON DELETE CASCADE
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ensure_price_levels_table():
+    """Niveles de precio dibujados por usuario sobre un gráfico (idempotente)."""
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_price_levels (
+                    id         INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id    INT           NOT NULL,
+                    accion_id  INT           NOT NULL,
+                    price      DECIMAL(20,6) NOT NULL,
+                    kind       VARCHAR(20)   NOT NULL DEFAULT 'support',
+                    label      VARCHAR(120)  NULL,
+                    created_at TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_upl_user_accion (user_id, accion_id),
+                    CONSTRAINT fk_upl_user   FOREIGN KEY (user_id)   REFERENCES users(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_upl_accion FOREIGN KEY (accion_id) REFERENCES accion(id) ON DELETE CASCADE
+                )
+            """)
         conn.commit()
     finally:
         conn.close()
@@ -1373,6 +1448,48 @@ def get_historical_high_signal(accion_id: int):
     return _jresp(sig)
 
 
+# ── /api/assets/<id>/backfill ─────────────────────────────────────────────────
+#
+# Trigger on-demand para descargar histórico OHLCV de un ticker desde Yahoo.
+# Restringido al usuario "albano" (admin). Corre los 3 timeframes (D/W/M)
+# sincrono — tarda ~5-15s dependiendo de la cobertura disponible en Yahoo.
+
+@app.route('/api/assets/<int:accion_id>/backfill', methods=['POST'])
+@login_required
+def backfill_asset(accion_id: int):
+    if request.user.get('user') != 'albano':
+        return _jresp({'error': 'forbidden'}, 403)
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT simbolo FROM accion WHERE id=%s', [accion_id])
+            row = cur.fetchone()
+    if not row:
+        return _jresp({'error': 'asset not found'}, 404)
+    symbol = row['simbolo']
+
+    from scripts.backfill_history import backfill_symbol, ensure_table
+    ensure_table()
+    out = {}
+    for tf in ('D', 'W', 'M'):
+        try:
+            out[tf] = backfill_symbol(symbol, tf)
+        except Exception as e:
+            out[tf] = {'error': str(e)}
+    # Invalidar caches por simbolo — datos nuevos deben recomputar estrategias.
+    for cache, lock in (
+        (_ltsupp_cache, _ltsupp_lock),
+        (_hzones_cache, _hzones_lock),
+        (_channel_cache, _channel_lock),
+        (_dynsup_cache,  _dynsup_lock),
+        (_utbot_cache,   _utbot_lock),
+    ):
+        with lock:
+            for k in list(cache.keys()):
+                if k == symbol or (isinstance(k, tuple) and k and k[0] == symbol):
+                    cache.pop(k, None)
+    return _jresp({'symbol': symbol, 'results': out})
+
+
 # ── /api/assets/<id>/company-info ─────────────────────────────────────────────
 #
 # Información fundamental de la empresa: perfil, salud financiera, crecimiento,
@@ -1706,24 +1823,29 @@ def get_fundamentals(accion_id: int):
 def get_notifications():
     limit = min(int(request.args.get('limit', 50)), 200)
     kind  = request.args.get('kind', '').strip()
+    user_id = request.user['sub']
+
+    # Se ven las notifs globales (user_id NULL) + las propias del usuario.
+    params = [user_id]
+    where  = '(n.user_id IS NULL OR n.user_id = %s)'
+    if kind:
+        where += ' AND n.kind = %s'
+        params.append(kind)
+    params.append(limit)
 
     with _conn() as conn:
         with conn.cursor() as cur:
-            if kind:
-                cur.execute("""
-                    SELECT id, batch_run_id, kind, title, body, data_json, created_at, read_at
-                    FROM notification
-                    WHERE kind = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, [kind, limit])
-            else:
-                cur.execute("""
-                    SELECT id, batch_run_id, kind, title, body, data_json, created_at, read_at
-                    FROM notification
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, [limit])
+            cur.execute(f"""
+                SELECT n.id, n.batch_run_id, n.kind, n.title, n.body, n.data_json,
+                       n.created_at, n.read_at,
+                       n.user_id, n.accion_id, n.signal_code, n.signal_direction,
+                       a.simbolo AS accion_simbolo
+                FROM notification n
+                LEFT JOIN accion a ON a.id = n.accion_id
+                WHERE {where}
+                ORDER BY n.created_at DESC
+                LIMIT %s
+            """, params)
             rows = cur.fetchall()
 
     # Parsear data_json para que el frontend reciba un objeto, no un string
@@ -1743,12 +1865,16 @@ def get_notifications():
 @app.route('/api/notifications/<int:notif_id>/read', methods=['POST'])
 @login_required
 def mark_notification_read(notif_id: int):
+    user_id = request.user['sub']
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE notification SET read_at = NOW() WHERE id = %s AND read_at IS NULL",
-                [notif_id],
-            )
+            # Sólo permite marcar como leída si es global o propia del user
+            cur.execute("""
+                UPDATE notification SET read_at = NOW()
+                WHERE id = %s
+                  AND read_at IS NULL
+                  AND (user_id IS NULL OR user_id = %s)
+            """, [notif_id, user_id])
         conn.commit()
     return _jresp({'ok': True})
 
@@ -1756,11 +1882,344 @@ def mark_notification_read(notif_id: int):
 @app.route('/api/notifications/unread-count')
 @login_required
 def get_unread_count():
+    user_id = request.user['sub']
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS n FROM notification WHERE read_at IS NULL")
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM notification
+                WHERE read_at IS NULL
+                  AND (user_id IS NULL OR user_id = %s)
+            """, [user_id])
             n = cur.fetchone()['n']
     return _jresp({'unread': n})
+
+
+# ── Watchlist por usuario ─────────────────────────────────────────────────────
+
+def _watchlist_serialize_row(r: dict) -> dict:
+    """Calcula campos derivados (P&L, valor corriente, pct día/semana) y tipa decimales."""
+    precio      = float(r['precio'])           if r.get('precio')           is not None else None
+    precio_prev = float(r['precio_prev'])      if r.get('precio_prev')      is not None else None
+    precio_week = float(r['precio_week_ago']) if r.get('precio_week_ago') is not None else None
+    qty         = float(r['qty'])              if r.get('qty')              is not None else None
+    avg         = float(r['avg_buy_price'])    if r.get('avg_buy_price')    is not None else None
+
+    pct_dia    = round((precio / precio_prev - 1) * 100, 2) if (precio and precio_prev) else None
+    pct_semana = round((precio / precio_week - 1) * 100, 2) if (precio and precio_week) else None
+
+    valor_corriente = round(qty * precio, 2) if (qty is not None and precio is not None) else None
+    ganancia_abs    = round((precio - avg) * qty, 2)        if (qty is not None and avg is not None and precio is not None) else None
+    ganancia_pct    = round((precio / avg - 1) * 100, 2)    if (avg and precio) else None
+
+    return {
+        'id':                r['id'],
+        'accion_id':         r['accion_id'],
+        'simbolo':           r['simbolo'],
+        'nombre':            r['nombre'],
+        'mercado':           r['mercado'],
+        'qty':               qty,
+        'avg_buy_price':     avg,
+        'note':              r.get('note'),
+        'precio':            precio,
+        'pct_cambio_dia':    pct_dia,
+        'pct_cambio_semana': pct_semana,
+        'valor_corriente':   valor_corriente,
+        'ganancia_abs':      ganancia_abs,
+        'ganancia_pct':      ganancia_pct,
+        'added_at':          str(r['added_at']) if r.get('added_at') else None,
+    }
+
+
+@app.route('/api/watchlist', methods=['GET'])
+@login_required
+def get_watchlist():
+    user_id = request.user['sub']
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT uw.id, uw.accion_id, uw.qty, uw.avg_buy_price, uw.note, uw.added_at,
+                       a.simbolo, a.nombre, m.descripcion AS mercado,
+                       (SELECT v.precio_cierre FROM valorhistoricoaccion v
+                        WHERE v.accion_id = uw.accion_id
+                        ORDER BY v.fecha DESC LIMIT 1) AS precio,
+                       (SELECT v.precio_cierre FROM valorhistoricoaccion v
+                        WHERE v.accion_id = uw.accion_id
+                        ORDER BY v.fecha DESC LIMIT 1 OFFSET 1) AS precio_prev,
+                       (SELECT v.precio_cierre FROM valorhistoricoaccion v
+                        WHERE v.accion_id = uw.accion_id
+                        ORDER BY v.fecha DESC LIMIT 1 OFFSET 5) AS precio_week_ago
+                FROM user_watchlist uw
+                JOIN accion a  ON a.id = uw.accion_id
+                JOIN mercado m ON m.id = a.mercado_id
+                WHERE uw.user_id = %s
+                ORDER BY uw.added_at DESC
+            """, [user_id])
+            rows = cur.fetchall()
+    return _jresp({'items': [_watchlist_serialize_row(r) for r in rows]})
+
+
+@app.route('/api/watchlist', methods=['POST'])
+@login_required
+def add_watchlist():
+    user_id = request.user['sub']
+    body = request.get_json(silent=True) or {}
+
+    try:
+        accion_id = int(body.get('accion_id'))
+    except (TypeError, ValueError):
+        return _jresp({'error': 'accion_id requerido y numérico'}, 400)
+
+    def _parse_num(key):
+        v = body.get(key)
+        if v is None or v == '':
+            return None
+        try:
+            f = float(v)
+            if f < 0:
+                return False  # señal de inválido
+            return f
+        except (TypeError, ValueError):
+            return False
+
+    qty = _parse_num('qty')
+    avg = _parse_num('avg_buy_price')
+    if qty is False or avg is False:
+        return _jresp({'error': 'qty y avg_buy_price deben ser numéricos no negativos'}, 400)
+
+    note = (body.get('note') or '').strip() or None
+    if note and len(note) > 500:
+        note = note[:500]
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM accion WHERE id = %s", [accion_id])
+            if not cur.fetchone():
+                return _jresp({'error': 'accion_id no existe'}, 404)
+            cur.execute(
+                "SELECT id FROM user_watchlist WHERE user_id = %s AND accion_id = %s",
+                [user_id, accion_id],
+            )
+            if cur.fetchone():
+                return _jresp({'error': 'Ya está en la watchlist'}, 409)
+            cur.execute("""
+                INSERT INTO user_watchlist (user_id, accion_id, qty, avg_buy_price, note)
+                VALUES (%s, %s, %s, %s, %s)
+            """, [user_id, accion_id, qty, avg, note])
+            new_id = cur.lastrowid
+        conn.commit()
+    return _jresp({'ok': True, 'id': new_id}, 201)
+
+
+@app.route('/api/watchlist/<int:item_id>', methods=['PATCH'])
+@login_required
+def update_watchlist(item_id: int):
+    user_id = request.user['sub']
+    body = request.get_json(silent=True) or {}
+
+    updates = []
+    params  = []
+
+    if 'qty' in body:
+        v = body['qty']
+        if v is None or v == '':
+            updates.append('qty = NULL')
+        else:
+            try:
+                f = float(v)
+                if f < 0:
+                    return _jresp({'error': 'qty no puede ser negativa'}, 400)
+                updates.append('qty = %s')
+                params.append(f)
+            except (TypeError, ValueError):
+                return _jresp({'error': 'qty debe ser numérica'}, 400)
+
+    if 'avg_buy_price' in body:
+        v = body['avg_buy_price']
+        if v is None or v == '':
+            updates.append('avg_buy_price = NULL')
+        else:
+            try:
+                f = float(v)
+                if f < 0:
+                    return _jresp({'error': 'avg_buy_price no puede ser negativo'}, 400)
+                updates.append('avg_buy_price = %s')
+                params.append(f)
+            except (TypeError, ValueError):
+                return _jresp({'error': 'avg_buy_price debe ser numérico'}, 400)
+
+    if 'note' in body:
+        note = (body.get('note') or '').strip() or None
+        if note and len(note) > 500:
+            note = note[:500]
+        updates.append('note = %s')
+        params.append(note)
+
+    if not updates:
+        return _jresp({'error': 'Nada para actualizar'}, 400)
+
+    params.extend([item_id, user_id])
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE user_watchlist SET {', '.join(updates)} WHERE id = %s AND user_id = %s",
+                params,
+            )
+            if cur.rowcount == 0:
+                return _jresp({'error': 'No encontrado'}, 404)
+        conn.commit()
+    return _jresp({'ok': True})
+
+
+@app.route('/api/watchlist/<int:item_id>', methods=['DELETE'])
+@login_required
+def delete_watchlist(item_id: int):
+    user_id = request.user['sub']
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM user_watchlist WHERE id = %s AND user_id = %s",
+                [item_id, user_id],
+            )
+            if cur.rowcount == 0:
+                return _jresp({'error': 'No encontrado'}, 404)
+        conn.commit()
+    return _jresp({'ok': True})
+
+
+# ── Niveles dibujados por el usuario sobre el chart ───────────────────────────
+
+_PRICE_LEVEL_KINDS = {'support', 'resistance', 'target', 'note'}
+
+
+def _price_level_serialize(r: dict) -> dict:
+    return {
+        'id':         r['id'],
+        'accion_id':  r['accion_id'],
+        'price':      float(r['price']) if r['price'] is not None else None,
+        'kind':       r['kind'],
+        'label':      r.get('label'),
+        'created_at': str(r['created_at']) if r.get('created_at') else None,
+    }
+
+
+@app.route('/api/price-levels', methods=['GET'])
+@login_required
+def get_price_levels():
+    user_id = request.user['sub']
+    try:
+        accion_id = int(request.args.get('accion_id') or 0)
+    except ValueError:
+        return _jresp({'error': 'accion_id inválido'}, 400)
+    if accion_id <= 0:
+        return _jresp({'error': 'accion_id requerido'}, 400)
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, accion_id, price, kind, label, created_at
+                FROM user_price_levels
+                WHERE user_id = %s AND accion_id = %s
+                ORDER BY price DESC
+            """, [user_id, accion_id])
+            rows = cur.fetchall() or []
+    return _jresp({'items': [_price_level_serialize(r) for r in rows]})
+
+
+@app.route('/api/price-levels', methods=['POST'])
+@login_required
+def create_price_level():
+    user_id = request.user['sub']
+    body = request.get_json(silent=True) or {}
+    try:
+        accion_id = int(body.get('accion_id') or 0)
+        price     = float(body.get('price'))
+    except (TypeError, ValueError):
+        return _jresp({'error': 'accion_id y price requeridos'}, 400)
+    if accion_id <= 0 or price <= 0:
+        return _jresp({'error': 'accion_id y price deben ser > 0'}, 400)
+    kind  = (body.get('kind') or 'support').strip().lower()
+    if kind not in _PRICE_LEVEL_KINDS:
+        return _jresp({'error': f'kind debe ser uno de: {sorted(_PRICE_LEVEL_KINDS)}'}, 400)
+    label = (body.get('label') or None)
+    if label and len(label) > 120:
+        label = label[:120]
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM accion WHERE id = %s", [accion_id])
+            if not cur.fetchone():
+                return _jresp({'error': 'accion no existe'}, 404)
+            cur.execute("""
+                INSERT INTO user_price_levels (user_id, accion_id, price, kind, label)
+                VALUES (%s, %s, %s, %s, %s)
+            """, [user_id, accion_id, price, kind, label])
+            new_id = cur.lastrowid
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, accion_id, price, kind, label, created_at
+                FROM user_price_levels WHERE id = %s
+            """, [new_id])
+            row = cur.fetchone()
+    return _jresp({'item': _price_level_serialize(row)}, 201)
+
+
+@app.route('/api/price-levels/<int:level_id>', methods=['PATCH'])
+@login_required
+def update_price_level(level_id: int):
+    user_id = request.user['sub']
+    body = request.get_json(silent=True) or {}
+    updates, params = [], []
+    if 'price' in body:
+        try:
+            p = float(body['price'])
+            if p <= 0:
+                return _jresp({'error': 'price debe ser > 0'}, 400)
+            updates.append('price = %s'); params.append(p)
+        except (TypeError, ValueError):
+            return _jresp({'error': 'price inválido'}, 400)
+    if 'kind' in body:
+        k = (body.get('kind') or '').strip().lower()
+        if k not in _PRICE_LEVEL_KINDS:
+            return _jresp({'error': f'kind debe ser uno de: {sorted(_PRICE_LEVEL_KINDS)}'}, 400)
+        updates.append('kind = %s'); params.append(k)
+    if 'label' in body:
+        lbl = body.get('label')
+        if lbl is not None and len(lbl) > 120:
+            lbl = lbl[:120]
+        updates.append('label = %s'); params.append(lbl)
+    if not updates:
+        return _jresp({'error': 'nada para actualizar'}, 400)
+    params.extend([level_id, user_id])
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE user_price_levels SET {', '.join(updates)} WHERE id = %s AND user_id = %s",
+                params,
+            )
+            if cur.rowcount == 0:
+                return _jresp({'error': 'No encontrado'}, 404)
+            cur.execute("""
+                SELECT id, accion_id, price, kind, label, created_at
+                FROM user_price_levels WHERE id = %s
+            """, [level_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _jresp({'item': _price_level_serialize(row)})
+
+
+@app.route('/api/price-levels/<int:level_id>', methods=['DELETE'])
+@login_required
+def delete_price_level(level_id: int):
+    user_id = request.user['sub']
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM user_price_levels WHERE id = %s AND user_id = %s",
+                [level_id, user_id],
+            )
+            if cur.rowcount == 0:
+                return _jresp({'error': 'No encontrado'}, 404)
+        conn.commit()
+    return _jresp({'ok': True})
 
 
 # ── Backtest: rotación semanal ────────────────────────────────────────────────
@@ -1860,6 +2319,8 @@ def _warm_cache():
 try:
     _ensure_users_table()
     _ensure_batch_tables()
+    _ensure_watchlist_table()
+    _ensure_price_levels_table()
 except Exception as _bootstrap_err:
     print(f' * WARN bootstrap migrations: {_bootstrap_err}')
 
