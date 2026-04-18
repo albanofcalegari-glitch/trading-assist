@@ -19,6 +19,12 @@ export interface ChartMarker {
   price: number
 }
 
+export interface DotMarker {
+  fecha: string
+  value: number
+  color: string
+}
+
 // Zona de soporte/resistencia: banda horizontal entre `floor` y `top`, dibujada
 // con 2 priceLines (nativas de lightweight-charts).  Se usa para mostrar
 // lateralizaciones detectadas por dynamic_supports (short tier horizontal).
@@ -27,6 +33,13 @@ export interface PriceZone {
   top:   number
   color: string
   label: string
+  // V2 visual tier extensions
+  borderColor?:  string
+  floorWidth?:   number
+  topWidth?:     number
+  floorStyle?:   'solid' | 'dashed' | 'dotted'
+  topStyle?:     'solid' | 'dashed' | 'dotted'
+  labelVisible?: boolean
 }
 
 // Nivel horizontal dibujado por el usuario. Se renderiza como priceLine nativa.
@@ -45,6 +58,21 @@ const USER_LEVEL_COLORS: Record<UserPriceLevel['kind'], string> = {
   note:       '#94a3b8',
 }
 
+// Trendline (polyline de N puntos, N>=2) dibujada por el usuario.
+// Se renderiza como LineSeries con N puntos consecutivos.
+export interface UserTrendline {
+  id:     number
+  points: { t: string; p: number }[]   // ordenados por t ascendente
+  kind:   UserPriceLevel['kind']
+  label:  string | null
+}
+
+// Punto en coordenadas del chart para el preview en vivo durante el dibujo.
+export interface DrawPreviewPoint {
+  time:  string   // 'YYYY-MM-DD'
+  price: number
+}
+
 // ── Props ─────────────────────────────────────────────────────────────────────
 
 interface Props {
@@ -52,8 +80,20 @@ interface Props {
   freq:          'D' | 'W' | 'M'
   indicators:    IndicatorLine[]
   markers?:      ChartMarker[]
+  dotLayers?:    DotMarker[][]
   zones?:        PriceZone[]
   userLevels?:   UserPriceLevel[]
+  userTrendlines?: UserTrendline[]
+  // Modo dibujo: cuando está activo, cada clic izquierdo sobre el chart
+  // dispara onDrawPoint con (time, price). AssetDetail acumula puntos y
+  // crea la trendline cuando el usuario pulsa "Trazar".
+  drawMode?:     boolean
+  onDrawPoint?:  (args: { time: string; price: number }) => void
+  // Puntos en progreso (N>=0). Se renderiza un LineSeries preview separado
+  // para mostrar el polyline que se está dibujando.
+  drawPreview?:  DrawPreviewPoint[]
+  // Color del preview (coincide con kind elegido en AssetDetail).
+  drawPreviewColor?: string
   // Callback cuando el usuario hace click-derecho sobre el chart.
   // Recibe el precio del clic (convertido desde Y) y las coords absolutas del
   // mouse para posicionar el popover. Si no se pasa, el click-derecho nativo
@@ -83,8 +123,14 @@ const COLORS = {
 export default function PriceChart({
   candles, freq, indicators,
   markers,
+  dotLayers,
   zones,
   userLevels,
+  userTrendlines,
+  drawMode,
+  onDrawPoint,
+  drawPreview,
+  drawPreviewColor,
   onContextMenu,
   height = 550,
   viewStartDate,
@@ -93,12 +139,20 @@ export default function PriceChart({
   const chartRef      = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const overlayRef    = useRef<ISeriesApi<'Line'>[]>([])
+  const trendlinePoolRef = useRef<ISeriesApi<'Line'>[]>([])
+  const drawPreviewSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const dotSeriesPoolRef = useRef<ISeriesApi<'Line'>[]>([])
   const chartDatesRef = useRef<Set<string>>(new Set())
+  const chartDataRef  = useRef<Candle[]>([])
   const priceLinesRef = useRef<IPriceLine[]>([])
   const userLinesRef  = useRef<IPriceLine[]>([])
   const viewStartRef  = useRef<string | undefined>(viewStartDate)
   const onContextMenuRef = useRef(onContextMenu)
+  const drawModeRef    = useRef<boolean>(!!drawMode)
+  const onDrawPointRef = useRef(onDrawPoint)
   useLayoutEffect(() => { onContextMenuRef.current = onContextMenu }, [onContextMenu])
+  useLayoutEffect(() => { drawModeRef.current    = !!drawMode }, [drawMode])
+  useLayoutEffect(() => { onDrawPointRef.current = onDrawPoint }, [onDrawPoint])
   // Sincroniza el ref con el prop (para que onDblClick y el reset usen el valor vigente)
   useLayoutEffect(() => { viewStartRef.current = viewStartDate }, [viewStartDate])
 
@@ -120,6 +174,7 @@ export default function PriceChart({
 
     // Store chart dates so Effect 2 can filter overlays to matching dates only
     chartDatesRef.current = new Set(data.map(c => c.fecha))
+    chartDataRef.current  = data
 
     const chart = createChart(el, {
       width:  el.clientWidth,
@@ -265,6 +320,55 @@ export default function PriceChart({
     }
     overlayRef.current = pool
 
+    // ── Trendline pool: pre-creado para que crear/borrar no altere layout ────
+    const TRENDLINE_POOL_SIZE = 20
+    const tlPool: ISeriesApi<'Line'>[] = []
+    for (let i = 0; i < TRENDLINE_POOL_SIZE; i++) {
+      tlPool.push(chart.addLineSeries({
+        color:                  '#3b82f6',
+        lineWidth:              2,
+        priceLineVisible:       false,
+        lastValueVisible:       false,
+        crosshairMarkerVisible: false,
+        visible:                false,
+        autoscaleInfoProvider:  () => ({ priceRange: null }),
+      } as any))
+    }
+    trendlinePoolRef.current = tlPool
+
+    // ── Preview series: polyline que se está dibujando en drawMode ───────────
+    // Usa líneas discontinuas + markers visibles para diferenciar del trazo final.
+    drawPreviewSeriesRef.current = chart.addLineSeries({
+      color:                  '#3b82f6',
+      lineWidth:              2,
+      lineStyle:              LineStyle.Dashed,
+      priceLineVisible:       false,
+      lastValueVisible:       false,
+      crosshairMarkerVisible: false,
+      pointMarkersVisible:    true,
+      pointMarkersRadius:     4,
+      visible:                false,
+      autoscaleInfoProvider:  () => ({ priceRange: null }),
+    } as any)
+
+    // ── Dot markers pool: hasta 3 series para puntos de contacto por tier ─────
+    const DOT_POOL_SIZE = 3
+    const dotPool: ISeriesApi<'Line'>[] = []
+    for (let i = 0; i < DOT_POOL_SIZE; i++) {
+      dotPool.push(chart.addLineSeries({
+        color:                  '#ff00ff',
+        lineVisible:            false,
+        priceLineVisible:       false,
+        lastValueVisible:       false,
+        crosshairMarkerVisible: false,
+        pointMarkersVisible:    true,
+        pointMarkersRadius:     5,
+        visible:                false,
+        autoscaleInfoProvider:  () => ({ priceRange: null }),
+      } as any))
+    }
+    dotSeriesPoolRef.current = dotPool
+
     // ── Vista por defecto según timeframe ─────────────────────────────────────
     // Si hay viewStartDate y existe en `data`, se usa como borde izquierdo (mismo
     // comportamiento que el PDF: mostrar desde anchor1 del soporte largo plazo).
@@ -377,6 +481,32 @@ export default function PriceChart({
     }
     el.addEventListener('contextmenu', onContextMenuEvt)
 
+    // ── Click izquierdo en modo dibujo: captura (time, price) ────────────────
+    // Se usa subscribeClick de lightweight-charts (integra con su time scale).
+    // Sólo dispara cuando drawMode está activo. El propio drag del chart no
+    // genera 'click' así que la funcionalidad de pan queda intacta.
+    const onChartClick = (param: any) => {
+      if (!drawModeRef.current) return
+      const cb = onDrawPointRef.current
+      if (!cb) return
+      if (!param || !param.point || param.time == null) return
+      const cs = candleSeriesRef.current
+      if (!cs) return
+      const price = cs.coordinateToPrice(param.point.y)
+      if (price == null) return
+      // param.time puede ser string ('YYYY-MM-DD') o BusinessDay
+      let timeStr: string | null = null
+      if (typeof param.time === 'string') {
+        timeStr = param.time
+      } else if (param.time && typeof param.time === 'object' && 'year' in param.time) {
+        const bd = param.time as { year: number; month: number; day: number }
+        timeStr = `${bd.year}-${String(bd.month).padStart(2, '0')}-${String(bd.day).padStart(2, '0')}`
+      }
+      if (!timeStr) return
+      cb({ time: timeStr, price: Number(price) })
+    }
+    chart.subscribeClick(onChartClick)
+
     // ── Responsive ────────────────────────────────────────────────────────────
     const ro = new ResizeObserver(entries => {
       for (const entry of entries) chart.applyOptions({ width: entry.contentRect.width })
@@ -390,11 +520,14 @@ export default function PriceChart({
       el.removeEventListener('contextmenu', onContextMenuEvt)
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseup',   onMouseUp)
+      try { chart.unsubscribeClick(onChartClick) } catch {}
       if (zoomBox.parentNode) zoomBox.parentNode.removeChild(zoomBox)
       chart.remove()
       chartRef.current = null
       candleSeriesRef.current = null
       overlayRef.current = []
+      trendlinePoolRef.current = []
+      drawPreviewSeriesRef.current = null
       userLinesRef.current = []
     }
   }, [candles, freq, height])
@@ -452,6 +585,41 @@ export default function PriceChart({
     cs.setMarkers(out)
   }, [markers, candles, freq])
 
+  // ── Effect dot layers: puntos de contacto en precio exacto, uno por tier ──
+  useEffect(() => {
+    const pool = dotSeriesPoolRef.current
+    if (!pool.length) return
+    const validDates = chartDatesRef.current
+    const sortedDates = Array.from(validDates).sort()
+    const snap = (fecha: string): string | null => {
+      if (validDates.has(fecha)) return fecha
+      for (const d of sortedDates) if (d >= fecha) return d
+      return null
+    }
+    for (let i = 0; i < pool.length; i++) {
+      const layer = dotLayers && dotLayers[i]
+      if (!layer || !layer.length) {
+        pool[i].applyOptions({ visible: false } as any)
+        pool[i].setData([])
+        continue
+      }
+      const mapped: { time: any; value: number }[] = []
+      for (const dm of layer) {
+        const snapped = snap(dm.fecha)
+        if (!snapped) continue
+        mapped.push({ time: snapped as any, value: dm.value })
+      }
+      mapped.sort((a, b) => (a.time < b.time ? -1 : 1))
+      if (!mapped.length) {
+        pool[i].applyOptions({ visible: false } as any)
+        pool[i].setData([])
+        continue
+      }
+      pool[i].applyOptions({ visible: true, color: layer[0].color } as any)
+      pool[i].setData(mapped)
+    }
+  }, [dotLayers, candles, freq])
+
   // ── Effect zones: banda horizontal (piso + tope) via priceLines nativas ──
   // Se limpian y recrean en cada cambio de zones/candles/freq.  priceLines
   // son horizontales infinitas sobre el eje X y tienen label en el eje Y.
@@ -463,22 +631,29 @@ export default function PriceChart({
     }
     priceLinesRef.current = []
     if (!zones || !zones.length) return
+    const styleMap = { solid: LineStyle.Solid, dashed: LineStyle.Dashed, dotted: LineStyle.Dotted }
     for (const z of zones) {
+      const bc = z.borderColor ?? z.color
+      const floorW = z.floorWidth ?? 2
+      const topW = z.topWidth ?? 1
+      const floorS = z.floorStyle ? (styleMap[z.floorStyle] ?? LineStyle.Solid) : LineStyle.Solid
+      const topS = z.topStyle ? (styleMap[z.topStyle] ?? LineStyle.Dotted) : LineStyle.Dotted
+      const showLabel = z.labelVisible !== false
       priceLinesRef.current.push(cs.createPriceLine({
         price:            z.floor,
-        color:            z.color,
-        lineWidth:        2,
-        lineStyle:        LineStyle.Solid,
-        axisLabelVisible: true,
-        title:            `${z.label} piso`,
+        color:            bc,
+        lineWidth:        floorW,
+        lineStyle:        floorS,
+        axisLabelVisible: showLabel,
+        title:            showLabel ? z.label : '',
       } as any))
       priceLinesRef.current.push(cs.createPriceLine({
         price:            z.top,
-        color:            z.color,
-        lineWidth:        1,
-        lineStyle:        LineStyle.Dotted,
-        axisLabelVisible: true,
-        title:            `${z.label} tope`,
+        color:            bc,
+        lineWidth:        topW,
+        lineStyle:        topS,
+        axisLabelVisible: false,
+        title:            '',
       } as any))
     }
   }, [zones, candles, freq])
@@ -510,6 +685,82 @@ export default function PriceChart({
     }
   }, [userLevels, candles, freq])
 
+  // ── Effect userTrendlines: polyline de N>=2 puntos usando el pool ───────
+  // Snap de cada punto a la fecha de vela más cercana >= (mismo esquema que
+  // markers). Puntos con la misma fecha post-snap se colapsan (se queda el
+  // último), garantizando que lightweight-charts acepte la serie ordenada.
+  useEffect(() => {
+    const pool = trendlinePoolRef.current
+    if (!pool.length) return
+    const validDates = chartDatesRef.current
+    const sortedDates = Array.from(validDates).sort()
+    const snap = (fecha: string): string | null => {
+      if (validDates.has(fecha)) return fecha
+      for (const d of sortedDates) if (d >= fecha) return d
+      return null
+    }
+    for (let i = 0; i < pool.length; i++) {
+      const tl = userTrendlines && userTrendlines[i]
+      if (!tl || !tl.points || tl.points.length < 2) {
+        pool[i].applyOptions({ visible: false } as any)
+        pool[i].setData([])
+        continue
+      }
+      const mapped: { time: any; value: number }[] = []
+      const seen = new Map<string, number>()
+      for (const pt of tl.points) {
+        const snapped = snap(pt.t)
+        if (!snapped) continue
+        seen.set(snapped, pt.p)
+      }
+      const keys = Array.from(seen.keys()).sort()
+      for (const k of keys) mapped.push({ time: k as any, value: seen.get(k)! })
+      if (mapped.length < 2) {
+        pool[i].applyOptions({ visible: false } as any)
+        pool[i].setData([])
+        continue
+      }
+      const color = USER_LEVEL_COLORS[tl.kind] || '#3b82f6'
+      pool[i].applyOptions({ color, visible: true } as any)
+      pool[i].setData(mapped)
+    }
+  }, [userTrendlines, candles, freq])
+
+  // ── Effect drawPreview: polyline en vivo mientras el usuario está dibujando
+  useEffect(() => {
+    const s = drawPreviewSeriesRef.current
+    if (!s) return
+    if (!drawMode || !drawPreview || drawPreview.length === 0) {
+      s.applyOptions({ visible: false } as any)
+      s.setData([])
+      return
+    }
+    const validDates = chartDatesRef.current
+    const sortedDates = Array.from(validDates).sort()
+    const snap = (fecha: string): string | null => {
+      if (validDates.has(fecha)) return fecha
+      for (const d of sortedDates) if (d >= fecha) return d
+      return null
+    }
+    const seen = new Map<string, number>()
+    for (const pt of drawPreview) {
+      const snapped = snap(pt.time)
+      if (!snapped) continue
+      seen.set(snapped, pt.price)
+    }
+    const keys = Array.from(seen.keys()).sort()
+    const mapped = keys.map(k => ({ time: k as any, value: seen.get(k)! }))
+    const color = drawPreviewColor || '#3b82f6'
+    if (mapped.length === 0) {
+      s.applyOptions({ visible: false } as any)
+      s.setData([])
+      return
+    }
+    // Con 1 solo punto, LineSeries igual acepta: se ve como un marker
+    s.applyOptions({ color, visible: true } as any)
+    s.setData(mapped)
+  }, [drawMode, drawPreview, drawPreviewColor, candles, freq])
+
   // ── Effect 2: Update overlay data/visibility (never add/remove series) ────
   useEffect(() => {
     const pool = overlayRef.current
@@ -537,9 +788,11 @@ export default function PriceChart({
   return (
     <div
       ref={containerRef}
-      style={{ height }}
+      style={{ height, cursor: drawMode ? 'crosshair' : undefined }}
       className="w-full rounded-md overflow-hidden"
-      title="Scroll: pan horizontal · Rueda: zoom · Ctrl+arrastrar: zoom a región · Doble click: reset"
+      title={drawMode
+        ? 'Modo dibujo activo — clic en 2 puntos para crear una trendline'
+        : 'Scroll: pan horizontal · Rueda: zoom · Ctrl+arrastrar: zoom a región · Doble click: reset'}
     />
   )
 }

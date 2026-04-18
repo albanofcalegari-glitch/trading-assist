@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { ArrowLeft, TrendingUp, TrendingDown, Activity, BarChart2, Tv2, AlertTriangle, Trash2, Pencil, X, Check } from 'lucide-react'
-import { api, backfillAsset, addPriceLevel, updatePriceLevel, deletePriceLevel, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports, type DynamicResistances, type PriceLevel, type PriceLevelKind } from '@/lib/api'
+import { ArrowLeft, TrendingUp, TrendingDown, Activity, BarChart2, Tv2, AlertTriangle, Trash2, Pencil, X, Check, ChevronDown } from 'lucide-react'
+import { api, backfillAsset, addPriceLevel, updatePriceLevel, deletePriceLevel, addTrendline, updateTrendline, deleteTrendline, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports, type DynamicSupportTier, type DynamicResistances, type DynamicResistanceTier, type PriceLevel, type PriceLevelKind, type Trendline, type TrendlineKind, type ChannelBreakdown, type SRV2Result } from '@/lib/api'
+import { computeV2RenderObjects, type V2RenderObject, type V2RenderZone, type V2RenderDiagonal } from '@/lib/srV2Render'
 import { useAuth } from '@/lib/auth'
 import { fmtPrice, fmtPct, pctClass, fmt, calcRSI, calcADX, resampleOHLCV } from '@/lib/utils'
 import { computeUtBot } from '@/lib/utBot'
@@ -43,7 +44,7 @@ export default function AssetDetail() {
   const [strategyA, setStrategyA] = useState('(Ninguna)')
   const [strategyB, setStrategyB] = useState('(Ninguna)')
   const [tf,        setTf]        = useState<'D' | 'W' | 'M'>('W')
-  const [chartMode, setChartMode] = useState<'local' | 'tv'>('local')
+  const [chartMode, setChartMode] = useState<'local' | 'tv' | 'v2'>('local')
   const [companyInfo,    setCompanyInfo]    = useState<CompanyInfo | null>(null)
   const [companyLoading, setCompanyLoading] = useState(true)
   const [tpSignal,       setTpSignal]       = useState<TrendPullbackSignal | null>(null)
@@ -53,14 +54,29 @@ export default function AssetDetail() {
   const [hhSignal,       setHhSignal]       = useState<HistoricalHighSignal | null>(null)
   const [dynSupports,    setDynSupports]    = useState<DynamicSupports | null>(null)
   const [showDynSupports,setShowDynSupports]= useState(true)
+  const [dynSupTiers, setDynSupTiers] = useState({ long: true, mid: true, short: true })
+  const [dynSupDropdown, setDynSupDropdown] = useState(false)
   const [dynResistances,    setDynResistances]    = useState<DynamicResistances | null>(null)
   const [showDynResistances,setShowDynResistances]= useState(true)
+  const [dynResTf,          setDynResTf]          = useState<'W' | 'D'>('W')
+  const [chBreakdown,    setChBreakdown]    = useState<ChannelBreakdown | null>(null)
   const [showUtBot,      setShowUtBot]      = useState(false)
   const [backfilling,    setBackfilling]    = useState(false)
   // Niveles dibujados por el usuario (soporte/resistencia/target/nota) — per-user
   const [priceLevels,    setPriceLevels]    = useState<PriceLevel[]>([])
   // Popover posicionado en click-derecho sobre el chart. `price` viene del Y->price del chart.
   const [ctxMenu, setCtxMenu] = useState<{ price: number; x: number; y: number } | null>(null)
+  // Trendlines (polyline N>=2) dibujadas por el usuario — per-user
+  const [trendlines,     setTrendlines]     = useState<Trendline[]>([])
+  // Modo dibujo: cada clic acumula un punto. "Trazar" guarda la trendline
+  // con todos los puntos acumulados (se requiere N>=2).
+  const [drawMode,       setDrawMode]       = useState(false)
+  const [drawKind,       setDrawKind]       = useState<TrendlineKind>('support')
+  const [drawPoints,     setDrawPoints]     = useState<{ time: string; price: number }[]>([])
+  const [lineInfoTab,    setLineInfoTab]    = useState<string | null>(null)
+  const [srV2,           setSrV2]           = useState<SRV2Result | null>(null)
+  const [srV2Loading,    setSrV2Loading]    = useState(false)
+  const [v2InfoTab,      setV2InfoTab]      = useState<string | null>(null)
   const { username } = useAuth()
   const isAdmin = username === 'albano'
 
@@ -119,21 +135,48 @@ export default function AssetDetail() {
       .then(setHhSignal)
       .catch(() => setHhSignal(null))
 
+    // Fetch channel breakdown analysis (3 escenarios post-ruptura de canal)
+    api.channelBreakdown(accionId)
+      .then(setChBreakdown)
+      .catch(() => setChBreakdown(null))
+
     // Fetch dynamic supports (long/mid/short trendlines ascendentes en log-space)
     api.dynamicSupports(accionId)
       .then(setDynSupports)
       .catch(() => setDynSupports(null))
 
-    // Fetch dynamic resistances (long/mid/short trendlines descendentes)
-    api.dynamicResistances(accionId)
-      .then(setDynResistances)
-      .catch(() => setDynResistances(null))
+    // Resistencias dinámicas se fetchean en un effect separado para poder
+    // reaccionar al toggle W/D sin volver a traer todo.
 
     // Fetch niveles de precio dibujados por el usuario (per-user, filtrados en backend)
     api.priceLevels(accionId)
       .then(r => setPriceLevels(r.items ?? []))
       .catch(() => setPriceLevels([]))
+
+    // Fetch trendlines dibujadas por el usuario (per-user, filtradas en backend)
+    api.trendlines(accionId)
+      .then(r => setTrendlines(r.items ?? []))
+      .catch(() => setTrendlines([]))
   }, [accionId])
+
+  // Resistencias dinámicas: re-fetch al cambiar asset o timeframe (W/D)
+  useEffect(() => {
+    if (!accionId) return
+    api.dynamicResistances(accionId, dynResTf)
+      .then(setDynResistances)
+      .catch(() => setDynResistances(null))
+  }, [accionId, dynResTf])
+
+  // SR V2: lazy-fetch al entrar al tab V2
+  useEffect(() => {
+    if (chartMode !== 'v2' || !accionId) return
+    if (srV2 && srV2.symbol) return
+    setSrV2Loading(true)
+    api.srV2(accionId)
+      .then(setSrV2)
+      .catch(() => setSrV2(null))
+      .finally(() => setSrV2Loading(false))
+  }, [chartMode, accionId])
 
   // Helpers CRUD para niveles del usuario — refetch simple post-mutación
   const reloadLevels = () => {
@@ -167,6 +210,78 @@ export default function AssetDetail() {
       alert(`No pude actualizar el nivel: ${(e as Error).message}`)
     }
   }
+
+  // Handlers para trendlines (polyline N>=2)
+  const handleDrawPoint = ({ time, price }: { time: string; price: number }) => {
+    // Dedup por fecha: si el usuario clickea 2 veces sobre la misma vela,
+    // sobreescribimos el precio del punto previo (una sola trendline por bar).
+    setDrawPoints(prev => {
+      const without = prev.filter(p => p.time !== time)
+      return [...without, { time, price }].sort((a, b) => a.time < b.time ? -1 : 1)
+    })
+  }
+  const handleUndoPoint = () => {
+    setDrawPoints(prev => prev.slice(0, -1))
+  }
+  const handleCancelDraw = () => {
+    setDrawPoints([])
+  }
+  const handleCommitTrendline = async () => {
+    if (drawPoints.length < 2) {
+      alert('Necesitás al menos 2 puntos')
+      return
+    }
+    try {
+      const created = await addTrendline({
+        accion_id: accionId,
+        points:    drawPoints.map(p => ({ t: p.time, p: p.price })),
+        kind:      drawKind,
+      })
+      setTrendlines(prev => [created, ...prev])
+      setDrawPoints([])
+    } catch (e) {
+      alert(`No pude crear la trendline: ${(e as Error).message}`)
+    }
+  }
+  const handleDeleteTrendline = async (id: number) => {
+    try {
+      await deleteTrendline(id)
+      setTrendlines(prev => prev.filter(t => t.id !== id))
+    } catch (e) {
+      alert(`No pude borrar la trendline: ${(e as Error).message}`)
+    }
+  }
+  const handlePatchTrendline = async (id: number, patch: { kind?: TrendlineKind; label?: string | null }) => {
+    try {
+      const updated = await updateTrendline(id, patch)
+      setTrendlines(prev => prev.map(t => t.id === id ? updated : t))
+    } catch (e) {
+      alert(`No pude actualizar la trendline: ${(e as Error).message}`)
+    }
+  }
+
+  // Cancelar modo dibujo si cambia el activo
+  useEffect(() => {
+    setDrawMode(false)
+    setDrawPoints([])
+  }, [accionId])
+
+  // Esc: si hay puntos en progreso los cancela; si no, sale del modo.
+  // Enter: si hay N>=2 puntos, traza.
+  useEffect(() => {
+    if (!drawMode) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (drawPoints.length) setDrawPoints([])
+        else setDrawMode(false)
+      } else if (e.key === 'Enter' && drawPoints.length >= 2) {
+        handleCommitTrendline()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawMode, drawPoints])
 
   // Velas al timeframe del chart — todos los paneles (ADX/RSI/UT Bot/divergences)
   // usan esta serie para que coincida con las velas visibles.
@@ -243,6 +358,7 @@ export default function AssetDetail() {
     ]
     const candleDates = candles.map(c => c.fecha)
     for (const [key, color, label] of tiers) {
+      if (!dynSupTiers[key as 'long' | 'mid' | 'short']) continue
       const tier = dynSupports[key]
       if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
       if (!('line_points' in tier)) continue
@@ -257,27 +373,21 @@ export default function AssetDetail() {
         continue
       }
       if (!tier.line_points.length) continue
-      // line_points viene en fechas semanales; interpolo en log-space a cada fecha diaria
-      // dentro del rango [primera, última] fecha del tier.
+      // La recta es y=m*x+b en log-space — interpolar solo entre primer y ultimo
+      // punto garantiza linea recta sin artefactos por spacing irregular de barras.
       const pts = tier.line_points
-      const tsValues = pts.map(p => Date.parse(p.fecha))
-      const logValues = pts.map(p => Math.log(p.value))
-      const firstTs = tsValues[0]
-      const lastTs  = tsValues[tsValues.length - 1]
+      const firstPt = pts[0]
+      const lastPt  = pts[pts.length - 1]
+      const firstTs = Date.parse(firstPt.fecha)
+      const lastTs  = Date.parse(lastPt.fecha)
+      const logFirst = Math.log(firstPt.value)
+      const logLast  = Math.log(lastPt.value)
       const values = candleDates.map(d => {
         const t = Date.parse(d)
         if (t < firstTs || t > lastTs) return null
-        // búsqueda binaria del intervalo [i, i+1] que contiene t
-        let lo = 0, hi = tsValues.length - 1
-        while (hi - lo > 1) {
-          const mid = (lo + hi) >> 1
-          if (tsValues[mid] <= t) lo = mid
-          else hi = mid
-        }
-        const t0 = tsValues[lo], t1 = tsValues[hi]
-        if (t1 === t0) return Math.exp(logValues[lo])
-        const frac = (t - t0) / (t1 - t0)
-        return Math.exp(logValues[lo] + frac * (logValues[hi] - logValues[lo]))
+        if (lastTs === firstTs) return firstPt.value
+        const frac = (t - firstTs) / (lastTs - firstTs)
+        return Math.exp(logFirst + frac * (logLast - logFirst))
       })
       indicatorLines.push({
         dates:  candleDates,
@@ -296,7 +406,7 @@ export default function AssetDetail() {
     const tiers: [keyof DynamicResistances, string, string][] = [
       ['long',  '#ef4444', 'LP'],
       ['mid',   '#fb923c', 'MP'],
-      ['short', '#e879f9', 'CP'],
+      ['short', '#ef4444', 'CP'],
     ]
     const candleDates = candles.map(c => c.fecha)
     for (const [key, color, label] of tiers) {
@@ -315,23 +425,18 @@ export default function AssetDetail() {
       }
       if (!tier.line_points.length) continue
       const pts = tier.line_points
-      const tsValues = pts.map(p => Date.parse(p.fecha))
-      const logValues = pts.map(p => Math.log(p.value))
-      const firstTs = tsValues[0]
-      const lastTs  = tsValues[tsValues.length - 1]
+      const firstPt = pts[0]
+      const lastPt  = pts[pts.length - 1]
+      const firstTs = Date.parse(firstPt.fecha)
+      const lastTs  = Date.parse(lastPt.fecha)
+      const logFirst = Math.log(firstPt.value)
+      const logLast  = Math.log(lastPt.value)
       const values = candleDates.map(d => {
         const t = Date.parse(d)
         if (t < firstTs || t > lastTs) return null
-        let lo = 0, hi = tsValues.length - 1
-        while (hi - lo > 1) {
-          const mid = (lo + hi) >> 1
-          if (tsValues[mid] <= t) lo = mid
-          else hi = mid
-        }
-        const t0 = tsValues[lo], t1 = tsValues[hi]
-        if (t1 === t0) return Math.exp(logValues[lo])
-        const frac = (t - t0) / (t1 - t0)
-        return Math.exp(logValues[lo] + frac * (logValues[hi] - logValues[lo]))
+        if (lastTs === firstTs) return firstPt.value
+        const frac = (t - firstTs) / (lastTs - firstTs)
+        return Math.exp(logFirst + frac * (logLast - logFirst))
       })
       indicatorLines.push({
         dates:  candleDates,
@@ -373,6 +478,21 @@ export default function AssetDetail() {
     )
   }
   const utBotMarkers = showUtBot ? utBot.signals : []
+
+  // Touch-point dot layers: una capa por tier, cada una con su color
+  const dotLayers: import('@/components/detail/PriceChart').DotMarker[][] = []
+  if (dynSupports && showDynSupports) {
+    const dotColors: Record<string, string> = { long: '#ff00ff', mid: '#ff8800', short: '#00ffff' }
+    for (const key of ['long', 'mid', 'short'] as const) {
+      if (!dynSupTiers[key]) continue
+      const tier = dynSupports[key]
+      if (!tier || typeof tier !== 'object' || !('touch_points' in tier)) continue
+      if (tier.kind === 'horizontal') continue
+      const tp = (tier as any).touch_points as { fecha: string; value: number }[] | undefined
+      if (!tp || !tp.length) continue
+      dotLayers.push(tp.map(pt => ({ fecha: pt.fecha, value: pt.value, color: dotColors[key] })))
+    }
+  }
   // Build historical low overlay lines (horizontal lines at 52w low / all-time low)
   if (hlSignal && hlSignal.setup_state !== 'NO_SIGNAL' && candles.length) {
     const dates = candles.map(c => c.fecha)
@@ -417,6 +537,101 @@ export default function AssetDetail() {
       })
     }
   }
+
+  // Channel Breakdown: dibujar zonas de soporte post-ruptura como bandas
+  if (chBreakdown && chBreakdown.has_breakdown && chBreakdown.zones.length && candles.length) {
+    for (const z of chBreakdown.zones) {
+      dynZones.push({
+        floor: z.zone_low,
+        top:   z.zone_high,
+        color: '#4fc3f7',
+        label: `Zona BD $${z.floor.toFixed(0)}`,
+      })
+    }
+  }
+
+  // ── V2 render pipeline ─────────────────────────────────────────────────────
+  const v2Rendered = useMemo(() => {
+    if (!srV2 || !candles.length) return [] as V2RenderObject[]
+    const prices = candles.map(c => Number(c.high))
+    const lows = candles.map(c => Number(c.low))
+    const recentHigh = Math.max(...prices.slice(-52))
+    const recentLow = Math.min(...lows.slice(-52))
+    return computeV2RenderObjects(srV2, recentHigh, recentLow)
+  }, [srV2, candles])
+
+  const v2Overlays = useMemo(() => {
+    const indicators: { dates: string[]; values: (number | null)[]; color: string; label: string }[] = []
+    const zones: { floor: number; top: number; color: string; label: string; borderColor?: string; floorWidth?: number; topWidth?: number; floorStyle?: 'solid' | 'dashed' | 'dotted'; topStyle?: 'solid' | 'dashed' | 'dotted'; labelVisible?: boolean }[] = []
+
+    if (!v2Rendered.length || !candles.length) return { indicators, zones }
+
+    const candleDates = candles.map(c => c.fecha)
+
+    for (const obj of v2Rendered) {
+      if (obj.kind === 'horizontal') {
+        const hz = obj as V2RenderZone
+        zones.push({
+          floor:        hz.zone_min,
+          top:          hz.zone_max,
+          color:        hz.fill_color,
+          label:        hz.label,
+          borderColor:  hz.border_color,
+          floorWidth:   hz.border_width,
+          topWidth:     hz.border_width,
+          floorStyle:   hz.border_style,
+          topStyle:     hz.border_style,
+          labelVisible: hz.label_visible,
+        })
+      } else {
+        const dl = obj as V2RenderDiagonal
+
+        const buildInterp = (pts: { fecha: string; value: number }[]) => {
+          if (!pts.length) return candleDates.map(() => null as number | null)
+          const tsV = pts.map(p => Date.parse(p.fecha))
+          const logV = pts.map(p => Math.log(p.value))
+          const firstTs = tsV[0]
+          const lastTs = tsV[tsV.length - 1]
+          return candleDates.map(d => {
+            const t = Date.parse(d)
+            if (t < firstTs || t > lastTs) return null
+            let lo = 0, hi = tsV.length - 1
+            while (hi - lo > 1) {
+              const mid = (lo + hi) >> 1
+              if (tsV[mid] <= t) lo = mid; else hi = mid
+            }
+            const t0 = tsV[lo], t1 = tsV[hi]
+            if (t1 === t0) return Math.exp(logV[lo])
+            const frac = (t - t0) / (t1 - t0)
+            return Math.exp(logV[lo] + frac * (logV[hi] - logV[lo]))
+          })
+        }
+
+        indicators.push({
+          dates:  candleDates,
+          values: buildInterp(dl.line_points),
+          color:  dl.line_color,
+          label:  dl.label,
+        })
+        if (dl.visual_tier !== 'tertiary') {
+          indicators.push({
+            dates:  candleDates,
+            values: buildInterp(dl.zone_upper_points),
+            color:  dl.zone_color,
+            label:  `${dl.label} upper`,
+          })
+          indicators.push({
+            dates:  candleDates,
+            values: buildInterp(dl.zone_lower_points),
+            color:  dl.zone_color,
+            label:  `${dl.label} lower`,
+          })
+        }
+      }
+    }
+
+    return { indicators, zones }
+  }, [v2Rendered, candles])
 
   const rsiDivergenceActive = activeStrategies.includes('RSI Divergence — Señal')
 
@@ -522,6 +737,11 @@ export default function AssetDetail() {
         <HistoricalHighBadgeRow signal={hhSignal} />
       )}
 
+      {/* Channel Breakdown — 3 escenarios post-ruptura */}
+      {chBreakdown && chBreakdown.has_breakdown && chBreakdown.best_scenario && (
+        <ChannelBreakdownBadgeRow data={chBreakdown} />
+      )}
+
       {/* Controles del gráfico */}
       <div className="flex items-center gap-3 flex-wrap">
         {/* Estrategias — combinables de a dos */}
@@ -606,6 +826,16 @@ export default function AssetDetail() {
         </button>
         <button
           className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
+            chartMode === 'v2'
+              ? 'bg-accent text-white border-accent'
+              : 'border-border text-text-muted hover:text-text-secondary'
+          }`}
+          onClick={() => setChartMode('v2')}
+        >
+          <BarChart2 size={12} /> Gráfico local V2
+        </button>
+        <button
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
             chartMode === 'tv'
               ? 'bg-accent text-white border-accent'
               : 'border-border text-text-muted hover:text-text-secondary'
@@ -615,6 +845,41 @@ export default function AssetDetail() {
           <Tv2 size={12} /> TradingView Live
         </button>
         <span className="mx-1 border-l border-border h-5" />
+        <div className="relative">
+          <button
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
+              showDynSupports
+                ? 'bg-[#00e676]/20 text-[#00e676] border-[#00e676]/40'
+                : 'border-border text-text-muted hover:text-text-secondary'
+            }`}
+            onClick={() => setShowDynSupports(v => !v)}
+            title="Soportes dinámicos (long/mid/short)"
+          >
+            <TrendingUp size={12} /> Soportes
+            <ChevronDown
+              size={10}
+              className="ml-0.5 cursor-pointer"
+              onClick={e => { e.stopPropagation(); setDynSupDropdown(v => !v) }}
+            />
+          </button>
+          {dynSupDropdown && showDynSupports && (<>
+            <div className="fixed inset-0 z-40" onClick={() => setDynSupDropdown(false)} />
+            <div className="absolute top-full left-0 mt-1 bg-bg-primary border border-border rounded-md shadow-lg z-50 min-w-[120px]">
+              {([['long', 'LP', '#00e676'], ['mid', 'MP', '#ffd54f'], ['short', 'CP', '#4fc3f7']] as const).map(([k, label, color]) => (
+                <label key={k} className="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-bg-secondary">
+                  <input
+                    type="checkbox"
+                    checked={dynSupTiers[k]}
+                    onChange={() => setDynSupTiers(prev => ({ ...prev, [k]: !prev[k] }))}
+                    className="accent-current"
+                    style={{ accentColor: color }}
+                  />
+                  <span style={{ color }}>{label}</span>
+                </label>
+              ))}
+            </div>
+          </>)}
+        </div>
         <button
           className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
             showChannels
@@ -647,7 +912,102 @@ export default function AssetDetail() {
         >
           <TrendingDown size={12} /> Resistencias
         </button>
+        {showDynResistances && (
+          <div className="flex items-center rounded-md border border-border overflow-hidden -ml-1">
+            {(['W', 'D'] as const).map(tf => (
+              <button
+                key={tf}
+                className={`px-2 py-1.5 text-xs transition-colors ${
+                  dynResTf === tf
+                    ? 'bg-[#ef4444]/15 text-[#ef4444]'
+                    : 'text-text-muted hover:text-text-secondary'
+                }`}
+                onClick={() => setDynResTf(tf)}
+                title={`Recalcular resistencias en ${tf === 'W' ? 'semanal' : 'diario'}`}
+              >
+                {tf}
+              </button>
+            ))}
+          </div>
+        )}
+        <span className="mx-1 border-l border-border h-5" />
+        <button
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
+            drawMode
+              ? 'bg-accent-blue/20 text-accent-blue border-accent-blue/40'
+              : 'border-border text-text-muted hover:text-text-secondary'
+          }`}
+          onClick={() => {
+            setDrawMode(v => !v)
+            setDrawPoints([])
+          }}
+          title="Dibujar trendline: clic en 2+ puntos y después 'Trazar'"
+        >
+          <Pencil size={12} /> Dibujar
+        </button>
+        {drawMode && (
+          <div className="flex items-center gap-1">
+            {(['support', 'resistance', 'target', 'note'] as TrendlineKind[]).map(k => {
+              const meta = { support: { c: '#22c55e', i: '🟢' }, resistance: { c: '#ef4444', i: '🔴' }, target: { c: '#eab308', i: '🟡' }, note: { c: '#94a3b8', i: '⚪' } }[k]
+              const active = drawKind === k
+              return (
+                <button
+                  key={k}
+                  className={`w-6 h-6 rounded border text-xs flex items-center justify-center ${
+                    active ? 'border-white' : 'border-border opacity-60 hover:opacity-100'
+                  }`}
+                  style={{ backgroundColor: active ? `${meta.c}33` : undefined }}
+                  onClick={() => setDrawKind(k)}
+                  title={k}
+                >
+                  {meta.i}
+                </button>
+              )
+            })}
+          </div>
+        )}
       </div>
+
+      {drawMode && (
+        <div className="rounded-md border border-accent-blue/30 bg-accent-blue/5 px-3 py-2 text-xs text-text-secondary flex items-center gap-2 flex-wrap">
+          <span>
+            {drawPoints.length === 0
+              ? 'Modo dibujo activo — hacé clic sobre el gráfico para marcar puntos.'
+              : <>
+                  <b>{drawPoints.length}</b> punto{drawPoints.length === 1 ? '' : 's'} marcado{drawPoints.length === 1 ? '' : 's'}
+                  {drawPoints.length >= 2 && <> — pulsá <b>Trazar</b> (o Enter) para guardar.</>}
+                  {drawPoints.length < 2  && <> — necesitás al menos 2 puntos.</>}
+                </>
+            }
+          </span>
+          <span className="ml-auto flex items-center gap-1.5">
+            <button
+              onClick={handleCommitTrendline}
+              disabled={drawPoints.length < 2}
+              className="px-2.5 py-1 rounded border border-accent-blue/40 bg-accent-blue/20 text-accent-blue text-2xs disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Guardar la trendline con los puntos marcados (Enter)"
+            >
+              Trazar
+            </button>
+            <button
+              onClick={handleUndoPoint}
+              disabled={drawPoints.length === 0}
+              className="px-2.5 py-1 rounded border border-border text-text-secondary text-2xs disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Deshacer el último punto"
+            >
+              ↶ Deshacer
+            </button>
+            <button
+              onClick={handleCancelDraw}
+              disabled={drawPoints.length === 0}
+              className="px-2.5 py-1 rounded border border-border text-text-muted text-2xs disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Cancelar trazo en progreso (Esc)"
+            >
+              Cancelar
+            </button>
+          </span>
+        </div>
+      )}
 
       {/* Chart */}
       <div className="card p-1 overflow-hidden relative">
@@ -658,12 +1018,36 @@ export default function AssetDetail() {
             theme="dark"
             height={520}
           />
+        ) : chartMode === 'v2' ? (
+          srV2Loading ? (
+            <div className="h-80 flex items-center justify-center">
+              <p className="text-sm text-text-muted">Calculando S/R V2…</p>
+            </div>
+          ) : candles.length > 0 ? (
+            <PriceChart
+              candles={candles}
+              freq={tf}
+              indicators={v2Overlays.indicators}
+              zones={v2Overlays.zones}
+              height={480}
+              viewStartDate={(() => {
+                const minDate = new Date()
+                minDate.setFullYear(minDate.getFullYear() - 3)
+                return minDate.toISOString().slice(0, 10)
+              })()}
+            />
+          ) : (
+            <div className="h-80 flex items-center justify-center">
+              <p className="text-sm text-text-muted">Sin datos de precio</p>
+            </div>
+          )
         ) : candles.length > 0 ? (
           <PriceChart
             candles={candles}
             freq={tf}
             indicators={indicatorLines}
             markers={utBotMarkers}
+            dotLayers={dotLayers}
             zones={dynZones}
             userLevels={priceLevels.map(l => ({
               id:    l.id,
@@ -671,7 +1055,19 @@ export default function AssetDetail() {
               kind:  l.kind,
               label: l.label,
             }))}
-            onContextMenu={({ price, clientX, clientY }) =>
+            userTrendlines={trendlines.map(t => ({
+              id:     t.id,
+              points: t.points,
+              kind:   t.kind,
+              label:  t.label,
+            }))}
+            drawMode={drawMode}
+            onDrawPoint={handleDrawPoint}
+            drawPreview={drawPoints}
+            drawPreviewColor={
+              ({ support: '#22c55e', resistance: '#ef4444', target: '#eab308', note: '#94a3b8' } as const)[drawKind]
+            }
+            onContextMenu={drawMode ? undefined : ({ price, clientX, clientY }) =>
               setCtxMenu({ price, x: clientX, y: clientY })
             }
             height={480}
@@ -701,6 +1097,160 @@ export default function AssetDetail() {
             )}
           </div>
         )}
+        {/* Line info overlay — tabs por soporte/resistencia */}
+        {chartMode === 'local' && candles.length > 0 && (() => {
+          const tabs: { id: string; label: string; color: string; tier: DynamicSupportTier | DynamicResistanceTier; type: 'S' | 'R' }[] = []
+          if (dynSupports && showDynSupports) {
+            const sTiers: [keyof DynamicSupports, string, string][] = [
+              ['long', 'S LP', '#00e676'], ['mid', 'S MP', '#ffd54f'], ['short', 'S CP', '#4fc3f7'],
+            ]
+            for (const [k, lbl, col] of sTiers) {
+              if (!dynSupTiers[k as 'long' | 'mid' | 'short']) continue
+              const t = dynSupports[k]
+              if (t && typeof t === 'object' && 'line_points' in t) tabs.push({ id: `s-${k}`, label: lbl, color: col, tier: t as DynamicSupportTier, type: 'S' })
+            }
+          }
+          if (dynResistances && showDynResistances) {
+            const rTiers: [keyof DynamicResistances, string, string][] = [
+              ['long', 'R LP', '#ef4444'], ['mid', 'R MP', '#fb923c'], ['short', 'R CP', '#ef4444'],
+            ]
+            for (const [k, lbl, col] of rTiers) {
+              const t = dynResistances[k]
+              if (t && typeof t === 'object' && 'line_points' in t) tabs.push({ id: `r-${k}`, label: lbl, color: col, tier: t as DynamicResistanceTier, type: 'R' })
+            }
+          }
+          if (!tabs.length) return null
+          const activeTab = lineInfoTab && tabs.find(t => t.id === lineInfoTab) ? lineInfoTab : null
+          const selected = activeTab ? tabs.find(t => t.id === activeTab) : null
+          const statusColors: Record<string, string> = { ACTIVE: '#22c55e', TESTING: '#eab308', BROKEN: '#ef4444' }
+          return (
+            <div className="absolute top-2 left-2 z-10 pointer-events-auto" style={{ maxWidth: 280 }}>
+              <div className="flex gap-0.5 flex-wrap">
+                {tabs.map(tab => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setLineInfoTab(activeTab === tab.id ? null : tab.id)}
+                    className="px-1.5 py-0.5 text-2xs font-medium rounded-t transition-colors"
+                    style={{
+                      background: activeTab === tab.id ? 'rgba(30,34,45,0.95)' : 'rgba(30,34,45,0.6)',
+                      color: tab.color,
+                      borderBottom: activeTab === tab.id ? `2px solid ${tab.color}` : '2px solid transparent',
+                    }}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+              {selected && (
+                <div
+                  className="rounded-b rounded-tr text-2xs leading-relaxed"
+                  style={{ background: 'rgba(30,34,45,0.95)', padding: '6px 8px', borderTop: `1px solid ${selected.color}33` }}
+                >
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <span className="font-semibold" style={{ color: selected.color }}>
+                      {selected.type === 'S' ? 'Soporte' : 'Resistencia'} {selected.label.split(' ')[1]}
+                    </span>
+                    <span
+                      className="px-1 py-px rounded font-bold"
+                      style={{ fontSize: '0.55rem', background: `${statusColors[selected.tier.status]}22`, color: statusColors[selected.tier.status] }}
+                    >
+                      {selected.tier.status}
+                    </span>
+                    <span className="text-text-muted ml-auto">{selected.tier.kind ?? (selected.type === 'S' ? 'ascending' : 'descending')}</span>
+                  </div>
+                  <table className="w-full" style={{ borderSpacing: 0 }}>
+                    <tbody className="text-text-secondary">
+                      <tr><td className="text-text-muted pr-2">Anchor 1</td><td>{selected.tier.anchor1.fecha}</td><td className="text-right">${fmtPrice(selected.tier.anchor1.value)}</td></tr>
+                      <tr><td className="text-text-muted pr-2">Anchor 2</td><td>{selected.tier.anchor2.fecha}</td><td className="text-right">${fmtPrice(selected.tier.anchor2.value)}</td></tr>
+                      <tr><td className="text-text-muted pr-2">Proyección</td><td colSpan={2} className="text-right">${fmtPrice(selected.tier.current_value)}</td></tr>
+                      <tr>
+                        <td className="text-text-muted pr-2">Distancia</td>
+                        <td colSpan={2} className="text-right" style={{ color: selected.tier.distance_pct > 0 ? '#22c55e' : '#ef4444' }}>
+                          {selected.tier.distance_pct > 0 ? '+' : ''}{selected.tier.distance_pct.toFixed(1)}%
+                        </td>
+                      </tr>
+                      <tr><td className="text-text-muted pr-2">Slope anual</td><td colSpan={2} className="text-right">{selected.tier.slope_annual_pct > 0 ? '+' : ''}{selected.tier.slope_annual_pct.toFixed(1)}%</td></tr>
+                      <tr><td className="text-text-muted pr-2">Toques</td><td colSpan={2} className="text-right">{selected.tier.touches}{(selected.tier as any).fallback ? ' ⚠' : ''}</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )
+        })()}
+        {/* V2 info overlay — tabs por cada render object */}
+        {chartMode === 'v2' && v2Rendered.length > 0 && (() => {
+          const tabs = v2Rendered.map(obj => ({
+            id: obj.id,
+            label: obj.label,
+            color: obj.kind === 'horizontal' ? (obj as V2RenderZone).border_color : (obj as V2RenderDiagonal).line_color,
+            obj,
+          }))
+          const activeTab = v2InfoTab && tabs.find(t => t.id === v2InfoTab) ? v2InfoTab : null
+          const selected = activeTab ? tabs.find(t => t.id === activeTab) : null
+          const tierBadge: Record<string, string> = { primary: 'PRIMARY', secondary: 'SECONDARY', tertiary: 'ACCEL', ghosted: 'GHOST' }
+          return (
+            <div className="absolute top-2 left-2 z-10 pointer-events-auto" style={{ maxWidth: 320 }}>
+              <div className="flex gap-0.5 flex-wrap">
+                {tabs.map(tab => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setV2InfoTab(activeTab === tab.id ? null : tab.id)}
+                    className="px-1.5 py-0.5 text-2xs font-medium rounded-t transition-colors"
+                    style={{
+                      background: activeTab === tab.id ? 'rgba(30,34,45,0.95)' : 'rgba(30,34,45,0.6)',
+                      color: tab.color,
+                      borderBottom: activeTab === tab.id ? `2px solid ${tab.color}` : '2px solid transparent',
+                    }}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+              {selected && (() => {
+                const obj = selected.obj
+                const tt = obj.tooltip
+                const sc = obj.kind === 'horizontal' ? (obj as V2RenderZone).label_color : (obj as V2RenderDiagonal).label_color
+                return (
+                  <div className="rounded-b rounded-tr text-2xs leading-relaxed" style={{ background: 'rgba(30,34,45,0.95)', padding: '6px 8px', borderTop: `1px solid ${selected.color}33` }}>
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <span className="font-semibold" style={{ color: selected.color }}>
+                        {obj.role === 'support' ? 'Soporte' : 'Resistencia'}
+                      </span>
+                      <span className="px-1 py-px rounded font-bold" style={{ fontSize: '0.55rem', background: `${sc}22`, color: sc }}>{tt.state}</span>
+                      <span className="text-text-muted" style={{ fontSize: '0.55rem' }}>{tierBadge[obj.visual_tier]}</span>
+                      <span className="text-text-muted ml-auto">score {tt.score}</span>
+                    </div>
+                    <table className="w-full" style={{ borderSpacing: 0 }}>
+                      <tbody className="text-text-secondary">
+                        {obj.kind === 'horizontal' && (
+                          <tr><td className="text-text-muted pr-2">Zona</td><td colSpan={2} className="text-right">${(obj as V2RenderZone).zone_min.toFixed(2)} – ${(obj as V2RenderZone).zone_max.toFixed(2)}</td></tr>
+                        )}
+                        <tr><td className="text-text-muted pr-2">Toques</td><td colSpan={2} className="text-right">{tt.touches}</td></tr>
+                        {obj.kind === 'horizontal' && (
+                          <tr><td className="text-text-muted pr-2">Rebote prom</td><td colSpan={2} className="text-right">{(tt as V2RenderZone['tooltip']).bounce_pct}%</td></tr>
+                        )}
+                        {obj.kind === 'diagonal' && (
+                          <>
+                            <tr>
+                              <td className="text-text-muted pr-2">Distancia</td>
+                              <td colSpan={2} className="text-right" style={{ color: (tt as any).distance_pct > 0 ? '#22c55e' : '#ef4444' }}>
+                                {(tt as any).distance_pct > 0 ? '+' : ''}{(tt as any).distance_pct.toFixed(1)}%
+                              </td>
+                            </tr>
+                            <tr><td className="text-text-muted pr-2">Slope anual</td><td colSpan={2} className="text-right">{(tt as any).slope_annual_pct.toFixed(1)}%/año</td></tr>
+                            <tr><td className="text-text-muted pr-2">Violaciones</td><td colSpan={2} className="text-right">{(tt as any).violations}</td></tr>
+                          </>
+                        )}
+                      </tbody>
+                    </table>
+                    <p className="text-text-muted mt-1" style={{ fontSize: '0.55rem' }}>{tt.explanation}</p>
+                  </div>
+                )
+              })()}
+            </div>
+          )
+        })()}
         {isAdmin && candles.length > 0 && (
           <div className="mt-2 flex justify-end">
             <button
@@ -732,6 +1282,15 @@ export default function AssetDetail() {
           levels={priceLevels}
           onPatch={handlePatchLevel}
           onDelete={handleDeleteLevel}
+        />
+      )}
+
+      {/* Panel "Mis trendlines" — lista de líneas de 2 puntos dibujadas por el usuario */}
+      {candles.length > 0 && (
+        <MyTrendlinesPanel
+          lines={trendlines}
+          onPatch={handlePatchTrendline}
+          onDelete={handleDeleteTrendline}
         />
       )}
 
@@ -1134,3 +1693,173 @@ function LevelRow({ level, onPatch, onDelete }: {
   )
 }
 
+// ── MyTrendlinesPanel ─────────────────────────────────────────────────────────
+//
+// Lista de trendlines (2 puntos) del usuario para el activo actual. Se puede
+// editar kind (color) y label; los puntos son inmutables — para ajustarlos,
+// borrar y redibujar.
+
+function MyTrendlinesPanel({ lines, onPatch, onDelete }: {
+  lines:    Trendline[]
+  onPatch:  (id: number, patch: { kind?: TrendlineKind; label?: string | null }) => void
+  onDelete: (id: number) => void
+}) {
+  return (
+    <div className="card p-3 md:p-4">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-xs uppercase tracking-wider text-text-muted font-medium">
+          Mis trendlines
+        </h3>
+        <span className="text-2xs text-text-muted">
+          activá "Dibujar" y marcá 2 puntos sobre el chart
+        </span>
+      </div>
+      {lines.length === 0 ? (
+        <p className="text-xs text-text-muted py-2">
+          Todavía no dibujaste trendlines en este activo.
+        </p>
+      ) : (
+        <div className="divide-y divide-border">
+          {lines.map(ln => (
+            <TrendlineRow
+              key={ln.id}
+              line={ln}
+              onPatch={patch => onPatch(ln.id, patch)}
+              onDelete={() => onDelete(ln.id)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function TrendlineRow({ line, onPatch, onDelete }: {
+  line:     Trendline
+  onPatch:  (patch: { kind?: TrendlineKind; label?: string | null }) => void
+  onDelete: () => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [labelDraft, setLabelDraft] = useState(line.label ?? '')
+  const meta = KIND_META[line.kind]
+
+  const commit = () => {
+    const newLabel = labelDraft.trim()
+    const oldLabel = (line.label ?? '').trim()
+    if (newLabel !== oldLabel) onPatch({ label: newLabel || null })
+    setEditing(false)
+  }
+  const cancel = () => {
+    setLabelDraft(line.label ?? '')
+    setEditing(false)
+  }
+
+  const first = line.points[0]
+  const last  = line.points[line.points.length - 1]
+  const nPts  = line.points.length
+  const slope = first && last && first.t !== last.t
+    ? (last.p - first.p) / Math.max(1, (new Date(last.t).getTime() - new Date(first.t).getTime()) / 86400000)
+    : 0
+  const direction = Math.abs(slope) < 1e-9 ? '→' : (slope > 0 ? '↗' : '↘')
+
+  return (
+    <div className="flex items-center gap-2 py-1.5 text-xs">
+      <span
+        className="w-2 h-2 rounded-full shrink-0"
+        style={{ backgroundColor: meta.color }}
+        title={meta.label}
+      />
+      <select
+        value={line.kind}
+        onChange={e => onPatch({ kind: e.target.value as TrendlineKind })}
+        className="bg-surface border border-border rounded px-1.5 py-0.5 text-2xs text-text-primary"
+      >
+        {(Object.keys(KIND_META) as TrendlineKind[]).map(k => (
+          <option key={k} value={k}>{KIND_META[k].icon} {KIND_META[k].label}</option>
+        ))}
+      </select>
+      <span className="font-mono text-text-secondary text-2xs whitespace-nowrap">
+        {first.t} ${Number(first.p).toFixed(2)} {direction} {last.t} ${Number(last.p).toFixed(2)}
+        {nPts > 2 && <span className="text-text-muted"> · {nPts} pts</span>}
+      </span>
+      {editing ? (
+        <>
+          <input
+            type="text"
+            value={labelDraft}
+            onChange={e => setLabelDraft(e.target.value)}
+            placeholder="etiqueta (opcional)"
+            maxLength={120}
+            className="flex-1 min-w-0 bg-surface border border-border rounded px-1.5 py-0.5 text-2xs text-text-primary"
+          />
+          <button onClick={commit} className="text-up hover:text-up/80" title="Guardar">
+            <Check size={13} />
+          </button>
+          <button onClick={cancel} className="text-text-muted hover:text-text-primary" title="Cancelar">
+            <X size={13} />
+          </button>
+        </>
+      ) : (
+        <>
+          <span className="flex-1 min-w-0 truncate text-text-secondary">
+            {line.label || <span className="text-text-muted italic">sin etiqueta</span>}
+          </span>
+          <button onClick={() => setEditing(true)} className="text-text-muted hover:text-text-primary" title="Editar">
+            <Pencil size={12} />
+          </button>
+          <button onClick={onDelete} className="text-down/80 hover:text-down" title="Borrar">
+            <Trash2 size={12} />
+          </button>
+        </>
+      )}
+    </div>
+  )
+}
+
+
+// ── ChannelBreakdownBadgeRow ─────────────────────────────────────────────────
+
+const CBD_SIGNAL_LABEL: Record<string, { label: string; cls: string }> = {
+  BUY:  { label: 'Compra',  cls: 'text-up bg-up/10 border-up/30' },
+  SELL: { label: 'Vender',  cls: 'text-down bg-down/10 border-down/30' },
+  WAIT: { label: 'Esperar', cls: 'text-yellow-400 bg-yellow-500/10 border-yellow-500/30' },
+  SKIP: { label: 'Skip',    cls: 'text-text-muted bg-surface border-border' },
+}
+
+const CBD_SCENARIO_LABEL: Record<string, string> = {
+  BOUNCE_RETEST: 'Esc.1 — Rebote + Retest',
+  NEW_FLOOR:     'Esc.2 — Piso Nuevo',
+  BREAKDOWN:     'Esc.3 — Breakdown',
+  ABOVE_ZONE:    'Sobre zona',
+  BELOW_ZONE:    'Bajo zona',
+}
+
+function ChannelBreakdownBadgeRow({ data }: { data: ChannelBreakdown }) {
+  const sc = data.best_scenario!
+  const sigMeta = CBD_SIGNAL_LABEL[sc.signal] ?? CBD_SIGNAL_LABEL.WAIT
+  const scenarioLabel = CBD_SCENARIO_LABEL[sc.scenario] ?? sc.scenario
+
+  return (
+    <div className="card p-3 md:p-4 flex flex-wrap items-center gap-3 text-xs">
+      <Activity size={14} className="text-accent" />
+      <span className="text-text-muted uppercase tracking-wider">Channel Breakdown</span>
+      <span className={`font-medium px-2 py-0.5 rounded border ${sigMeta.cls}`}>{sigMeta.label}</span>
+      <span className="text-text-muted">{scenarioLabel}</span>
+
+      {sc.entry != null && (
+        <span className="text-text-muted">
+          Entrada <span className="font-mono text-text-primary">${sc.entry.toFixed(2)}</span>
+        </span>
+      )}
+      {sc.sl != null && (
+        <span className="text-text-muted">
+          SL <span className="font-mono text-down">${sc.sl.toFixed(2)}</span>
+          {sc.sl_pct != null && <span className="text-down"> ({sc.sl_pct.toFixed(1)}%)</span>}
+        </span>
+      )}
+
+      <span className="text-text-muted hidden md:inline">{sc.description}</span>
+      <span className="ml-auto text-text-muted text-2xs">{data.fecha}</span>
+    </div>
+  )
+}

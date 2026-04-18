@@ -22,6 +22,7 @@ import decimal
 import functools
 import json
 import os
+import re
 import threading
 import time
 
@@ -66,6 +67,18 @@ _DYNSUP_TTL  = 3600              # 1 hora
 _dynres_cache: dict = {}         # symbol → {'data': dict, 'ts': float}
 _dynres_lock = threading.Lock()
 _DYNRES_TTL  = 3600              # 1 hora
+
+# ── Caché para channel-breakdown ──────────────────────────────────────────────
+
+_chbd_cache: dict = {}           # symbol → {'data': dict, 'ts': float}
+_chbd_lock = threading.Lock()
+_CHBD_TTL  = 3600                # 1 hora
+
+# ── Caché para sr-v2 ──────────────────────────────────────────────────────────
+
+_srv2_cache: dict = {}           # symbol → {'data': dict, 'ts': float}
+_srv2_lock = threading.Lock()
+_SRV2_TTL  = 3600                # 1 hora
 
 # ── Caché para ut-bot ─────────────────────────────────────────────────────────
 
@@ -304,6 +317,35 @@ def _ensure_watchlist_table():
         conn.close()
 
 
+def _ensure_trades_table():
+    """Log de movimientos (compras/ventas) por usuario. Idempotente."""
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_trades (
+                    id          INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id     INT           NOT NULL,
+                    accion_id   INT           NOT NULL,
+                    qty         DECIMAL(20,6) NOT NULL,
+                    buy_price   DECIMAL(20,6) NOT NULL,
+                    buy_date    DATE          NOT NULL,
+                    sell_price  DECIMAL(20,6) NULL,
+                    sell_date   DATE          NULL,
+                    fee         DECIMAL(20,6) NOT NULL DEFAULT 0,
+                    note        VARCHAR(500)  NULL,
+                    created_at  TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_ut_user (user_id),
+                    INDEX idx_ut_user_accion (user_id, accion_id),
+                    CONSTRAINT fk_ut_user   FOREIGN KEY (user_id)   REFERENCES users(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_ut_accion FOREIGN KEY (accion_id) REFERENCES accion(id) ON DELETE CASCADE
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _ensure_price_levels_table():
     """Niveles de precio dibujados por usuario sobre un gráfico (idempotente)."""
     conn = pymysql.connect(**MYSQL_CONFIG)
@@ -323,6 +365,45 @@ def _ensure_price_levels_table():
                     CONSTRAINT fk_upl_accion FOREIGN KEY (accion_id) REFERENCES accion(id) ON DELETE CASCADE
                 )
             """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ensure_trendlines_table():
+    """Trendlines (N puntos, N>=2) dibujadas por usuario. Idempotente.
+
+    Columnas `t1/p1/t2/p2` = primero/último punto (para índice + back-compat).
+    `points_json` contiene el polyline completo [{t,p}, ...] cuando N>2;
+    cuando N=2 puede ser NULL (se reconstruye desde t1/p1/t2/p2)."""
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_trendlines (
+                    id          INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id     INT           NOT NULL,
+                    accion_id   INT           NOT NULL,
+                    t1          VARCHAR(10)   NOT NULL,
+                    p1          DECIMAL(20,6) NOT NULL,
+                    t2          VARCHAR(10)   NOT NULL,
+                    p2          DECIMAL(20,6) NOT NULL,
+                    points_json TEXT          NULL,
+                    kind        VARCHAR(20)   NOT NULL DEFAULT 'support',
+                    label       VARCHAR(120)  NULL,
+                    created_at  TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_utl_user_accion (user_id, accion_id),
+                    CONSTRAINT fk_utl_user   FOREIGN KEY (user_id)   REFERENCES users(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_utl_accion FOREIGN KEY (accion_id) REFERENCES accion(id) ON DELETE CASCADE
+                )
+            """)
+            # ALTER idempotente para filas viejas (rama N=2 previa): agrega
+            # points_json si no existe. MySQL <8.0.29 no tiene IF NOT EXISTS
+            # en ADD COLUMN, así que probamos y tragamos el error si ya está.
+            try:
+                cur.execute("ALTER TABLE user_trendlines ADD COLUMN points_json TEXT NULL AFTER p2")
+            except Exception:
+                pass
         conn.commit()
     finally:
         conn.close()
@@ -1273,19 +1354,23 @@ def get_dynamic_resistances_endpoint(accion_id: int):
 
     symbol = row['simbolo']
 
+    tf_arg = (request.args.get('tf') or '').strip().upper()
+    tf = tf_arg if tf_arg in ('D', 'W') else None
+    cache_key = f'{symbol}::{tf or "auto"}'
+
     with _dynres_lock:
-        entry = _dynres_cache.get(symbol)
+        entry = _dynres_cache.get(cache_key)
         if entry and (time.time() - entry['ts']) < _DYNRES_TTL:
             return _jresp(entry['data'])
 
     try:
         from strategies.dynamic_resistances import get_dynamic_resistances
-        result = get_dynamic_resistances(symbol, datetime.date.today())
+        result = get_dynamic_resistances(symbol, datetime.date.today(), tf=tf)
     except Exception as e:
         return _jresp({'error': str(e), 'symbol': symbol}, 500)
 
     with _dynres_lock:
-        _dynres_cache[symbol] = {'data': result, 'ts': time.time()}
+        _dynres_cache[cache_key] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 
@@ -1400,6 +1485,40 @@ def get_channel(accion_id: int):
 
     with _channel_lock:
         _channel_cache[symbol] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/assets/<id>/channel-breakdown ───────────────────────────────────────
+#
+# Analiza ruptura de canal: 3 escenarios post-breakdown (Julian).
+# Escenario 1: bounce + retest,  2: piso nuevo,  3: breakdown → sell.
+
+@app.route('/api/assets/<int:accion_id>/channel-breakdown')
+def get_channel_breakdown_endpoint(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _chbd_lock:
+        entry = _chbd_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _CHBD_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        from strategies.channel_breakdown import analyze_channel_breakdown
+        result = analyze_channel_breakdown(symbol, datetime.date.today())
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _chbd_lock:
+        _chbd_cache[symbol] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 
@@ -1522,6 +1641,7 @@ def backfill_asset(accion_id: int):
         (_channel_cache, _channel_lock),
         (_dynsup_cache,  _dynsup_lock),
         (_utbot_cache,   _utbot_lock),
+        (_chbd_cache,    _chbd_lock),
     ):
         with lock:
             for k in list(cache.keys()):
@@ -2126,6 +2246,233 @@ def delete_watchlist(item_id: int):
     return _jresp({'ok': True})
 
 
+# ── Log de movimientos (trades) por usuario ───────────────────────────────────
+
+def _trade_serialize(r: dict) -> dict:
+    qty   = float(r['qty'])        if r.get('qty')        is not None else None
+    bp    = float(r['buy_price'])  if r.get('buy_price')  is not None else None
+    sp    = float(r['sell_price']) if r.get('sell_price') is not None else None
+    fee   = float(r['fee'])        if r.get('fee')        is not None else 0.0
+    gross = ((sp - bp) * qty) if (sp is not None and bp is not None and qty is not None) else None
+    net   = (gross - fee) if gross is not None else None
+    pct   = ((sp / bp - 1) * 100) if (sp is not None and bp) else None
+    return {
+        'id':          r['id'],
+        'accion_id':   r['accion_id'],
+        'simbolo':     r.get('simbolo'),
+        'nombre':      r.get('nombre'),
+        'mercado':     r.get('mercado'),
+        'qty':         qty,
+        'buy_price':   bp,
+        'buy_date':    str(r['buy_date'])  if r.get('buy_date')  else None,
+        'sell_price':  sp,
+        'sell_date':   str(r['sell_date']) if r.get('sell_date') else None,
+        'fee':         fee,
+        'note':        r.get('note'),
+        'gross_pnl':   round(gross, 2) if gross is not None else None,
+        'net_pnl':     round(net,   2) if net   is not None else None,
+        'pct':         round(pct,   2) if pct   is not None else None,
+        'created_at':  str(r['created_at']) if r.get('created_at') else None,
+    }
+
+
+def _parse_trade_body(body: dict, partial: bool = False):
+    """Valida el body de un trade. Devuelve (fields_dict, error_resp_or_None)."""
+    fields: dict = {}
+
+    if 'accion_id' in body or not partial:
+        try:
+            fields['accion_id'] = int(body.get('accion_id'))
+        except (TypeError, ValueError):
+            return None, _jresp({'error': 'accion_id requerido y numérico'}, 400)
+
+    def _num(key, required=False, allow_null=False):
+        if key not in body:
+            if required and not partial:
+                return None, _jresp({'error': f'{key} requerido'}, 400)
+            return '__skip__', None
+        v = body.get(key)
+        if v is None or v == '':
+            if allow_null:
+                return None, None
+            if required and not partial:
+                return None, _jresp({'error': f'{key} requerido'}, 400)
+            return None, None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None, _jresp({'error': f'{key} debe ser numérico'}, 400)
+        if f < 0:
+            return None, _jresp({'error': f'{key} no puede ser negativo'}, 400)
+        return f, None
+
+    for key, required, allow_null in [
+        ('qty',        True,  False),
+        ('buy_price',  True,  False),
+        ('sell_price', False, True),
+        ('fee',        False, False),
+    ]:
+        val, err = _num(key, required=required, allow_null=allow_null)
+        if err:
+            return None, err
+        if val == '__skip__':
+            continue
+        fields[key] = val
+
+    def _date(key, required=False, allow_null=False):
+        if key not in body:
+            if required and not partial:
+                return '__missing__'
+            return '__skip__'
+        v = body.get(key)
+        if v is None or v == '':
+            if allow_null:
+                return None
+            if required and not partial:
+                return '__missing__'
+            return None
+        try:
+            return datetime.datetime.strptime(str(v)[:10], '%Y-%m-%d').date()
+        except ValueError:
+            return '__invalid__'
+
+    for key, required, allow_null in [
+        ('buy_date',  True,  False),
+        ('sell_date', False, True),
+    ]:
+        d = _date(key, required=required, allow_null=allow_null)
+        if d == '__missing__':
+            return None, _jresp({'error': f'{key} requerido (formato YYYY-MM-DD)'}, 400)
+        if d == '__invalid__':
+            return None, _jresp({'error': f'{key} inválido (formato YYYY-MM-DD)'}, 400)
+        if d == '__skip__':
+            continue
+        fields[key] = d
+
+    if 'note' in body:
+        note = (body.get('note') or '').strip() or None
+        if note and len(note) > 500:
+            note = note[:500]
+        fields['note'] = note
+
+    if 'fee' not in fields and not partial:
+        fields['fee'] = 0.0
+
+    # sell_price y sell_date van de la mano — si hay uno debe haber otro
+    sp_present = 'sell_price' in fields and fields['sell_price'] is not None
+    sd_present = 'sell_date'  in fields and fields['sell_date']  is not None
+    if sp_present != sd_present and not partial:
+        return None, _jresp({'error': 'sell_price y sell_date deben ir juntos'}, 400)
+
+    return fields, None
+
+
+@app.route('/api/trades', methods=['GET'])
+@login_required
+def get_trades():
+    user_id = request.user['sub']
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ut.id, ut.accion_id, ut.qty, ut.buy_price, ut.buy_date,
+                       ut.sell_price, ut.sell_date, ut.fee, ut.note, ut.created_at,
+                       a.simbolo, a.nombre, m.descripcion AS mercado
+                FROM user_trades ut
+                JOIN accion a  ON a.id = ut.accion_id
+                JOIN mercado m ON m.id = a.mercado_id
+                WHERE ut.user_id = %s
+                ORDER BY ut.buy_date DESC, ut.id DESC
+            """, [user_id])
+            rows = cur.fetchall()
+    return _jresp({'items': [_trade_serialize(r) for r in rows]})
+
+
+@app.route('/api/trades', methods=['POST'])
+@login_required
+def add_trade():
+    user_id = request.user['sub']
+    body = request.get_json(silent=True) or {}
+    fields, err = _parse_trade_body(body, partial=False)
+    if err:
+        return err
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM accion WHERE id = %s", [fields['accion_id']])
+            if not cur.fetchone():
+                return _jresp({'error': 'accion_id no existe'}, 404)
+            cur.execute("""
+                INSERT INTO user_trades (user_id, accion_id, qty, buy_price, buy_date,
+                                         sell_price, sell_date, fee, note)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, [
+                user_id,
+                fields['accion_id'],
+                fields['qty'],
+                fields['buy_price'],
+                fields['buy_date'],
+                fields.get('sell_price'),
+                fields.get('sell_date'),
+                fields.get('fee', 0.0),
+                fields.get('note'),
+            ])
+            new_id = cur.lastrowid
+        conn.commit()
+    return _jresp({'ok': True, 'id': new_id}, 201)
+
+
+@app.route('/api/trades/<int:trade_id>', methods=['PATCH'])
+@login_required
+def update_trade(trade_id: int):
+    user_id = request.user['sub']
+    body = request.get_json(silent=True) or {}
+    fields, err = _parse_trade_body(body, partial=True)
+    if err:
+        return err
+    # accion_id no se puede modificar tras creado
+    fields.pop('accion_id', None)
+    if not fields:
+        return _jresp({'error': 'Nada para actualizar'}, 400)
+
+    sets, params = [], []
+    for k, v in fields.items():
+        sets.append(f'{k} = %s')
+        params.append(v)
+    params.extend([trade_id, user_id])
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE user_trades SET {', '.join(sets)} WHERE id = %s AND user_id = %s",
+                params,
+            )
+            if cur.rowcount == 0:
+                # rowcount puede ser 0 si no cambió nada — verificamos existencia
+                cur.execute(
+                    "SELECT id FROM user_trades WHERE id = %s AND user_id = %s",
+                    [trade_id, user_id],
+                )
+                if not cur.fetchone():
+                    return _jresp({'error': 'No encontrado'}, 404)
+        conn.commit()
+    return _jresp({'ok': True})
+
+
+@app.route('/api/trades/<int:trade_id>', methods=['DELETE'])
+@login_required
+def delete_trade(trade_id: int):
+    user_id = request.user['sub']
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM user_trades WHERE id = %s AND user_id = %s",
+                [trade_id, user_id],
+            )
+            if cur.rowcount == 0:
+                return _jresp({'error': 'No encontrado'}, 404)
+        conn.commit()
+    return _jresp({'ok': True})
+
+
 # ── Niveles dibujados por el usuario sobre el chart ───────────────────────────
 
 _PRICE_LEVEL_KINDS = {'support', 'resistance', 'target', 'note'}
@@ -2262,6 +2609,201 @@ def delete_price_level(level_id: int):
     return _jresp({'ok': True})
 
 
+# ── Trendlines (2 puntos) ─────────────────────────────────────────────────────
+
+_TRENDLINE_KINDS = {'support', 'resistance', 'target', 'note'}
+
+_TRENDLINE_DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _trendline_serialize(r: dict) -> dict:
+    # Reconstruye points[]: si hay points_json usarlo; si no, fallback al par t1/p1-t2/p2.
+    points = None
+    raw = r.get('points_json')
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and all(isinstance(p, dict) for p in parsed):
+                points = [{'t': str(p.get('t')), 'p': float(p.get('p'))} for p in parsed
+                          if p.get('t') and p.get('p') is not None]
+        except Exception:
+            points = None
+    if points is None:
+        points = [
+            {'t': r['t1'], 'p': float(r['p1']) if r['p1'] is not None else 0.0},
+            {'t': r['t2'], 'p': float(r['p2']) if r['p2'] is not None else 0.0},
+        ]
+    return {
+        'id':         r['id'],
+        'accion_id':  r['accion_id'],
+        'points':     points,
+        'kind':       r['kind'],
+        'label':      r.get('label'),
+        'created_at': str(r['created_at']) if r.get('created_at') else None,
+    }
+
+
+@app.route('/api/trendlines', methods=['GET'])
+@login_required
+def get_trendlines():
+    user_id = request.user['sub']
+    try:
+        accion_id = int(request.args.get('accion_id') or 0)
+    except ValueError:
+        return _jresp({'error': 'accion_id inválido'}, 400)
+    if accion_id <= 0:
+        return _jresp({'error': 'accion_id requerido'}, 400)
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, accion_id, t1, p1, t2, p2, points_json, kind, label, created_at
+                FROM user_trendlines
+                WHERE user_id = %s AND accion_id = %s
+                ORDER BY created_at DESC
+            """, [user_id, accion_id])
+            rows = cur.fetchall() or []
+    return _jresp({'items': [_trendline_serialize(r) for r in rows]})
+
+
+@app.route('/api/trendlines', methods=['POST'])
+@login_required
+def create_trendline():
+    user_id = request.user['sub']
+    body = request.get_json(silent=True) or {}
+    try:
+        accion_id = int(body.get('accion_id') or 0)
+    except (TypeError, ValueError):
+        return _jresp({'error': 'accion_id requerido'}, 400)
+    if accion_id <= 0:
+        return _jresp({'error': 'accion_id debe ser > 0'}, 400)
+
+    # Nuevo formato: { points: [{t,p}, {t,p}, ...] } con N>=2.
+    # Formato legacy (2 puntos): { t1, p1, t2, p2 } — se acepta por compat.
+    raw_points = body.get('points')
+    points: list[dict] = []
+    if isinstance(raw_points, list) and raw_points:
+        for pt in raw_points:
+            if not isinstance(pt, dict):
+                return _jresp({'error': 'points debe ser lista de {t, p}'}, 400)
+            t = (pt.get('t') or '').strip()
+            try:
+                p = float(pt.get('p'))
+            except (TypeError, ValueError):
+                return _jresp({'error': 'p inválido en points'}, 400)
+            if not _TRENDLINE_DATE_RE.match(t):
+                return _jresp({'error': 't debe ser YYYY-MM-DD en points'}, 400)
+            if p <= 0:
+                return _jresp({'error': 'p debe ser > 0 en points'}, 400)
+            points.append({'t': t, 'p': p})
+    else:
+        # legacy 2-point payload
+        try:
+            p1 = float(body.get('p1'))
+            p2 = float(body.get('p2'))
+        except (TypeError, ValueError):
+            return _jresp({'error': 'points[] (o t1,p1,t2,p2) requerido'}, 400)
+        t1 = (body.get('t1') or '').strip()
+        t2 = (body.get('t2') or '').strip()
+        if not _TRENDLINE_DATE_RE.match(t1) or not _TRENDLINE_DATE_RE.match(t2):
+            return _jresp({'error': 't1 y t2 deben ser YYYY-MM-DD'}, 400)
+        if p1 <= 0 or p2 <= 0:
+            return _jresp({'error': 'p1 y p2 deben ser > 0'}, 400)
+        points = [{'t': t1, 'p': p1}, {'t': t2, 'p': p2}]
+
+    if len(points) < 2:
+        return _jresp({'error': 'se requieren al menos 2 puntos'}, 400)
+    # Orden cronológico + deduplicación por fecha (último gana)
+    points.sort(key=lambda x: x['t'])
+    dedup: dict[str, dict] = {}
+    for pt in points:
+        dedup[pt['t']] = pt
+    points = list(dedup.values())
+    if len(points) < 2:
+        return _jresp({'error': 'se requieren al menos 2 fechas distintas'}, 400)
+
+    kind = (body.get('kind') or 'support').strip().lower()
+    if kind not in _TRENDLINE_KINDS:
+        return _jresp({'error': f'kind debe ser uno de: {sorted(_TRENDLINE_KINDS)}'}, 400)
+    label = body.get('label') or None
+    if label and len(label) > 120:
+        label = label[:120]
+
+    first, last = points[0], points[-1]
+    points_json = json.dumps(points) if len(points) > 2 else None
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM accion WHERE id = %s", [accion_id])
+            if not cur.fetchone():
+                return _jresp({'error': 'accion no existe'}, 404)
+            cur.execute("""
+                INSERT INTO user_trendlines (user_id, accion_id, t1, p1, t2, p2, points_json, kind, label)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, [user_id, accion_id, first['t'], first['p'], last['t'], last['p'],
+                  points_json, kind, label])
+            new_id = cur.lastrowid
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, accion_id, t1, p1, t2, p2, points_json, kind, label, created_at
+                FROM user_trendlines WHERE id = %s
+            """, [new_id])
+            row = cur.fetchone()
+    return _jresp({'item': _trendline_serialize(row)}, 201)
+
+
+@app.route('/api/trendlines/<int:line_id>', methods=['PATCH'])
+@login_required
+def update_trendline(line_id: int):
+    user_id = request.user['sub']
+    body = request.get_json(silent=True) or {}
+    updates, params = [], []
+    if 'kind' in body:
+        k = (body.get('kind') or '').strip().lower()
+        if k not in _TRENDLINE_KINDS:
+            return _jresp({'error': f'kind debe ser uno de: {sorted(_TRENDLINE_KINDS)}'}, 400)
+        updates.append('kind = %s'); params.append(k)
+    if 'label' in body:
+        lbl = body.get('label')
+        if lbl is not None and len(lbl) > 120:
+            lbl = lbl[:120]
+        updates.append('label = %s'); params.append(lbl)
+    if not updates:
+        return _jresp({'error': 'nada para actualizar'}, 400)
+    params.extend([line_id, user_id])
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE user_trendlines SET {', '.join(updates)} WHERE id = %s AND user_id = %s",
+                params,
+            )
+            if cur.rowcount == 0:
+                return _jresp({'error': 'No encontrado'}, 404)
+            cur.execute("""
+                SELECT id, accion_id, t1, p1, t2, p2, points_json, kind, label, created_at
+                FROM user_trendlines WHERE id = %s
+            """, [line_id])
+            row = cur.fetchone()
+        conn.commit()
+    return _jresp({'item': _trendline_serialize(row)})
+
+
+@app.route('/api/trendlines/<int:line_id>', methods=['DELETE'])
+@login_required
+def delete_trendline(line_id: int):
+    user_id = request.user['sub']
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM user_trendlines WHERE id = %s AND user_id = %s",
+                [line_id, user_id],
+            )
+            if cur.rowcount == 0:
+                return _jresp({'error': 'No encontrado'}, 404)
+        conn.commit()
+    return _jresp({'ok': True})
+
+
 # ── Backtest: rotación semanal ────────────────────────────────────────────────
 
 @app.route('/api/backtest/rotation')
@@ -2360,12 +2902,48 @@ try:
     _ensure_users_table()
     _ensure_batch_tables()
     _ensure_watchlist_table()
+    _ensure_trades_table()
     _ensure_price_levels_table()
+    _ensure_trendlines_table()
 except Exception as _bootstrap_err:
     print(f' * WARN bootstrap migrations: {_bootstrap_err}')
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+
+# ── /api/assets/<id>/sr-v2 ────────────────────────────────────────────────────
+#
+# Motor V2 de soportes y resistencias: horizontales (zonas), diagonales
+# (estructurales + aceleración), scoring 0-100, estados, explicaciones.
+
+@app.route('/api/assets/<int:accion_id>/sr-v2')
+def get_sr_v2_endpoint(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _srv2_lock:
+        entry = _srv2_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _SRV2_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        from strategies.sr_engine_v2 import calculate_sr
+        result = calculate_sr(symbol, timeframe='W', fecha=datetime.date.today())
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _srv2_lock:
+        _srv2_cache[symbol] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

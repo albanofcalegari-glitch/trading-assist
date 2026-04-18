@@ -195,6 +195,8 @@ export interface DynamicSupportTier {
   // (piso + tope) en vez de linea.  Default 'ascending' para compat.
   kind?:            'ascending' | 'horizontal'
   zone_top?:        number  // solo si kind='horizontal'
+  fallback?:        boolean // true = solo 2 toques (no hubo recta valida de 3+)
+  touch_points?:    { fecha: string; value: number }[]
 }
 
 export interface DynamicSupports {
@@ -232,6 +234,42 @@ export interface DynamicResistances {
   long:           DynamicResistanceTier | null
   mid:            DynamicResistanceTier | null
   short:          DynamicResistanceTier | null
+}
+
+export interface ChannelBreakdownZone {
+  zone_low:        number
+  zone_high:       number
+  floor:           number
+  ceiling:         number
+  touches:         number
+  first_touch:     string
+  last_touch:      string
+  max_bounce_pct:  number
+}
+
+export interface ChannelBreakdownScenario {
+  scenario:      'BOUNCE_RETEST' | 'NEW_FLOOR' | 'BREAKDOWN' | 'ABOVE_ZONE' | 'BELOW_ZONE'
+  scenario_num:  number
+  signal:        'BUY' | 'SELL' | 'WAIT' | 'SKIP'
+  description:   string
+  entry:         number | null
+  sl:            number | null
+  sl_pct:        number | null
+  zone:          ChannelBreakdownZone | null
+}
+
+export interface ChannelBreakdown {
+  symbol:         string
+  fecha:          string
+  has_breakdown:  boolean
+  channel:        ChannelItem | null
+  price?:         number
+  channel_lower?: number
+  zones:          ChannelBreakdownZone[]
+  scenarios?:     ChannelBreakdownScenario[]
+  best_scenario:  ChannelBreakdownScenario | null
+  near_support?:  boolean
+  reading:        string
 }
 
 export interface UtBotPoint {
@@ -450,6 +488,46 @@ export interface WatchlistPatch {
   note?:          string | null
 }
 
+export interface Trade {
+  id:         number
+  accion_id:  number
+  simbolo:    string
+  nombre:     string
+  mercado:    string
+  qty:        number
+  buy_price:  number
+  buy_date:   string
+  sell_price: number | null
+  sell_date:  string | null
+  fee:        number
+  note:       string | null
+  gross_pnl:  number | null
+  net_pnl:    number | null
+  pct:        number | null
+  created_at: string | null
+}
+
+export interface TradeInput {
+  accion_id:   number
+  qty:         number
+  buy_price:   number
+  buy_date:    string
+  sell_price?: number | null
+  sell_date?:  string | null
+  fee?:        number
+  note?:       string | null
+}
+
+export interface TradePatch {
+  qty?:         number
+  buy_price?:   number
+  buy_date?:    string
+  sell_price?:  number | null
+  sell_date?:   string | null
+  fee?:         number
+  note?:        string | null
+}
+
 export type PriceLevelKind = 'support' | 'resistance' | 'target' | 'note'
 
 export interface PriceLevel {
@@ -472,6 +550,97 @@ export interface PriceLevelPatch {
   price?: number
   kind?:  PriceLevelKind
   label?: string | null
+}
+
+// ── Trendlines (polyline de N puntos, N>=2) ─────────────────────────────────
+// kind reutiliza los 4 tipos de price_levels para consistencia de colores.
+export type TrendlineKind = PriceLevelKind
+
+export interface TrendlinePoint {
+  t: string    // 'YYYY-MM-DD'
+  p: number
+}
+
+export interface Trendline {
+  id:         number
+  accion_id:  number
+  points:     TrendlinePoint[]   // ordenados por t ascendente, N>=2
+  kind:       TrendlineKind
+  label:      string | null
+  created_at: string | null
+}
+
+export interface TrendlineInput {
+  accion_id: number
+  points:    TrendlinePoint[]
+  kind:      TrendlineKind
+  label?:    string | null
+}
+
+export interface TrendlinePatch {
+  kind?:  TrendlineKind
+  label?: string | null
+}
+
+// ── SR Engine V2 ─────────────────────────────────────────────────────────────
+
+export interface SRV2Pivot {
+  fecha: string
+  price: number
+  strength: number
+}
+
+export interface SRV2HorizontalLevel {
+  id:                 string
+  kind:               'horizontal'
+  role:               'support' | 'resistance'
+  center_price:       number
+  zone_min:           number
+  zone_max:           number
+  time_start:         string
+  time_end:           string
+  touches:            number
+  score:              number
+  state:              string   // 'active' | 'tested' | 'weakening' | 'broken' | 'invalidated' | 'flipped'
+  source_pivot_count: number
+  avg_bounce_pct:     number
+  explanation:        string
+}
+
+export interface SRV2Trendline {
+  id:                  string
+  kind:                'diagonal'
+  role:                'support' | 'resistance'
+  classification:      'structural' | 'acceleration'
+  x1:                  string
+  y1:                  number
+  x2:                  string
+  y2:                  number
+  touches:             number
+  violations:          number
+  slope_annual_pct:    number
+  score:               number
+  state:               string
+  distance_pct:        number
+  current_value:       number
+  line_points:         { fecha: string; value: number }[]
+  zone_upper_points:   { fecha: string; value: number }[]
+  zone_lower_points:   { fecha: string; value: number }[]
+  explanation:         string
+}
+
+export interface SRV2Result {
+  symbol:       string
+  timeframe:    string
+  bars:         number
+  price:        number | null
+  atr:          number | null
+  supports:     SRV2HorizontalLevel[]
+  resistances:  SRV2HorizontalLevel[]
+  trendlines:   SRV2Trendline[]
+  pivots_high:  SRV2Pivot[]
+  pivots_low:   SRV2Pivot[]
+  config:       Record<string, number | boolean>
 }
 
 export interface WmaCrossItem {
@@ -526,8 +695,8 @@ export const api = {
   dynamicSupports: (id: number) =>
     get<DynamicSupports>(`/assets/${id}/dynamic-supports`),
 
-  dynamicResistances: (id: number) =>
-    get<DynamicResistances>(`/assets/${id}/dynamic-resistances`),
+  dynamicResistances: (id: number, tf?: 'D' | 'W') =>
+    get<DynamicResistances>(`/assets/${id}/dynamic-resistances${tf ? `?tf=${tf}` : ''}`),
 
   utBot: (id: number, sensitivity?: number, atrPeriod?: number) => {
     const qs = new URLSearchParams()
@@ -542,6 +711,9 @@ export const api = {
 
   channel: (id: number) =>
     get<ChannelData>(`/assets/${id}/channel`),
+
+  channelBreakdown: (id: number) =>
+    get<ChannelBreakdown>(`/assets/${id}/channel-breakdown`),
 
   companyInfo: (id: number) =>
     get<CompanyInfo>(`/assets/${id}/company-info`),
@@ -569,8 +741,17 @@ export const api = {
   watchlist: () =>
     get<{ items: WatchlistItem[] }>('/watchlist'),
 
+  trades: () =>
+    get<{ items: Trade[] }>('/trades'),
+
   priceLevels: (accionId: number) =>
     get<{ items: PriceLevel[] }>(`/price-levels?accion_id=${accionId}`),
+
+  trendlines: (accionId: number) =>
+    get<{ items: Trendline[] }>(`/trendlines?accion_id=${accionId}`),
+
+  srV2: (id: number) =>
+    get<SRV2Result>(`/assets/${id}/sr-v2`),
 }
 
 export async function addWatchlist(input: WatchlistInput) {
@@ -605,6 +786,38 @@ export async function deleteWatchlist(id: number) {
   return data as { ok: boolean }
 }
 
+export async function addTrade(input: TradeInput) {
+  const res = await fetch(BASE + '/trades', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(input),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al crear movimiento')
+  return data as { ok: boolean; id: number }
+}
+
+export async function updateTrade(id: number, patch: TradePatch) {
+  const res = await fetch(BASE + `/trades/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(patch),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al actualizar movimiento')
+  return data as { ok: boolean }
+}
+
+export async function deleteTrade(id: number) {
+  const res = await fetch(BASE + `/trades/${id}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al eliminar movimiento')
+  return data as { ok: boolean }
+}
+
 export async function addPriceLevel(input: PriceLevelInput) {
   const res = await fetch(BASE + '/price-levels', {
     method: 'POST',
@@ -634,6 +847,38 @@ export async function deletePriceLevel(id: number) {
   })
   const data = await res.json()
   if (!res.ok) throw new Error(data.error || 'Error al eliminar nivel')
+  return data as { ok: boolean }
+}
+
+export async function addTrendline(input: TrendlineInput) {
+  const res = await fetch(BASE + '/trendlines', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(input),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al crear trendline')
+  return data.item as Trendline
+}
+
+export async function updateTrendline(id: number, patch: TrendlinePatch) {
+  const res = await fetch(BASE + `/trendlines/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(patch),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al actualizar trendline')
+  return data.item as Trendline
+}
+
+export async function deleteTrendline(id: number) {
+  const res = await fetch(BASE + `/trendlines/${id}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al eliminar trendline')
   return data as { ok: boolean }
 }
 
