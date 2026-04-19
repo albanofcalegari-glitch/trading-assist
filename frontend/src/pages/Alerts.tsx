@@ -16,6 +16,7 @@ const KIND_FILTERS = [
   { value: 'historical_lows', label: 'Mínimos',  icon: TrendingDown },
   { value: 'historical_highs', label: 'Máximos', icon: TrendingUp },
   { value: 'watchlist',       label: 'Watchlist', icon: Star },
+  { value: 'universe_scan',  label: 'Universo',  icon: Activity },
 ]
 
 const KIND_META: Record<string, { color: string; icon: any; label: string }> = {
@@ -28,6 +29,8 @@ const KIND_META: Record<string, { color: string; icon: any; label: string }> = {
   historical_highs:  { color: '#22c55e', icon: TrendingUp,   label: 'Máximos' },
   watchlist:         { color: '#eab308', icon: Star,         label: 'Watchlist' },
   watchlist_summary: { color: '#eab308', icon: Star,         label: 'Watchlist' },
+  universe_scan:         { color: '#06b6d4', icon: Activity,    label: 'Universo' },
+  universe_scan_summary: { color: '#06b6d4', icon: Activity,    label: 'Universo' },
 }
 
 export default function Alerts() {

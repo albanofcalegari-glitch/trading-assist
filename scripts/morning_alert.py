@@ -90,6 +90,26 @@ def step_context():
 
 
 # =============================================================================
+#  PASO 2b — Universe scan (breakouts + todas las señales)
+# =============================================================================
+def step_universe_scan(hoy: date, dry_run: bool = False):
+    print('\n[2b/5] Universe scan (señales BUY/SELL en todo el universo)...')
+    try:
+        from batches.universe_scan import run as run_universe_scan
+        if dry_run:
+            from batches.notifier import ConsoleNotifier
+            notifier = ConsoleNotifier()
+        else:
+            from batches.notifier import make_default_notifier
+            notifier = make_default_notifier()
+        result = run_universe_scan(notifier=notifier, fecha=hoy)
+        print(f'  OK — {result.get("signals_emitted", 0)} señales emitidas, '
+              f'{result.get("signals_skipped", 0)} saltadas')
+    except Exception as e:
+        print(f'  ERROR: {e}')
+
+
+# =============================================================================
 #  PASO 3 — Estrategias corto plazo
 # =============================================================================
 def step_short_term(hoy: date) -> dict:
@@ -279,6 +299,7 @@ def main():
         step_update_ohlcv_extended()
 
     step_context()
+    step_universe_scan(hoy, dry_run=args.dry_run)
     short      = step_short_term(hoy)
     candidates = step_buy_signals(hoy)
 
