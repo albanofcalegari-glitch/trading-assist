@@ -352,7 +352,7 @@ export default function PriceChart({
     } as any)
 
     // ── Dot markers pool: hasta 3 series para puntos de contacto por tier ─────
-    const DOT_POOL_SIZE = 3
+    const DOT_POOL_SIZE = 6
     const dotPool: ISeriesApi<'Line'>[] = []
     for (let i = 0; i < DOT_POOL_SIZE; i++) {
       dotPool.push(chart.addLineSeries({

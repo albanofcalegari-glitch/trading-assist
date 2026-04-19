@@ -762,7 +762,13 @@ def _build_tier(
         'touches':          tl['touches'],
         'violations':       tl['violations'],
         'kind':             tl.get('kind', 'descending'),
+        'fallback':         tl.get('fallback', False),
     }
+    touching = tl.get('touching_idxs', [])
+    out['touch_points'] = [
+        {'fecha': rows[idx]['fecha'].isoformat(), 'value': round(highs[idx], 4)}
+        for idx in touching if idx < n
+    ]
     # Zonas horizontales: floor + ceiling (equivalente a zone_top en supports
     # pero nombrado explicitamente para evitar confusion semantica).
     if 'zone_floor' in tl:
@@ -941,7 +947,7 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
         if abs(mid_tl['anchors'][0] - long_tl['anchors'][0]) <= 8:
             mid_tl = None
 
-    return {
+    result = {
         'symbol':         symbol,
         'timeframe_used': tf,
         'bars_of_data':   n,
@@ -950,6 +956,16 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
         'mid':   _build_tier(mid_tl,   rows, tf) if mid_tl   else None,
         'short': _build_tier(short_tl, rows, tf) if short_tl else None,
     }
+
+    # Fallback W→D: si algun tier quedo None en semanal, intentar en diario.
+    if tf == 'W' and any(result[k] is None for k in ('long', 'mid', 'short')):
+        d_result = get_dynamic_resistances(symbol, fecha, tf='D')
+        if d_result.get('timeframe_used') == 'D':
+            for k in ('long', 'mid', 'short'):
+                if result[k] is None and d_result[k] is not None:
+                    result[k] = d_result[k]
+
+    return result
 
 
 if __name__ == '__main__':

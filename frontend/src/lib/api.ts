@@ -224,6 +224,8 @@ export interface DynamicResistanceTier {
   kind?:            'descending' | 'horizontal'
   zone_floor?:      number  // piso de la banda (solo kind='horizontal')
   zone_ceiling?:    number  // techo = la resistencia (solo kind='horizontal')
+  fallback?:        boolean
+  touch_points?:    { fecha: string; value: number }[]
 }
 
 export interface DynamicResistances {
