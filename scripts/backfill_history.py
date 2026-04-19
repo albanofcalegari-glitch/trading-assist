@@ -139,25 +139,42 @@ def _fetch(
     closes  = q.get('close',  [])
     volumes = q.get('volume', [])
 
-    rows = []
+    # Normalizacion de fecha por intervalo: Yahoo devuelve la vela de la
+    # semana/mes EN CURSO con timestamp = dia actual (no el inicio del
+    # periodo). Sin normalizar, cada dia que corre morning_alert inserta una
+    # fila nueva con fecha distinta, produciendo dientes-de-sierra al final
+    # del historico weekly/monthly.
+    def _normalize(d: date) -> date:
+        if yf_interval == '1wk':
+            return d - timedelta(days=d.weekday())  # lunes de esa semana
+        if yf_interval == '1mo':
+            return d.replace(day=1)
+        return d
+
+    # Dedupe: si Yahoo devuelve varias timestamps que caen en la misma
+    # semana/mes tras normalizar, nos quedamos con la MAS RECIENTE (la que
+    # representa el estado actual del periodo).
+    rows_by_fecha: dict = {}
     for i, ts in enumerate(timestamps):
         try:
             o, h, l, c = opens[i], highs[i], lows[i], closes[i]
             if None in (o, h, l, c):
                 continue
-            rows.append({
+            d_raw = datetime.utcfromtimestamp(ts).date()
+            d = _normalize(d_raw)
+            rows_by_fecha[d] = {
                 'simbolo': symbol,
-                'fecha':   datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d'),
+                'fecha':   d.strftime('%Y-%m-%d'),
                 'open':    round(float(o), 4),
                 'high':    round(float(h), 4),
                 'low':     round(float(l), 4),
                 'close':   round(float(c), 4),
                 'volume':  int(volumes[i]) if volumes[i] is not None else 0,
-            })
+            }
         except (TypeError, IndexError):
             continue
 
-    return rows
+    return [rows_by_fecha[k] for k in sorted(rows_by_fecha.keys())]
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────

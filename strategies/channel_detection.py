@@ -46,6 +46,7 @@ TOUCH_TOL        = 0.05   # tolerancia en log-space (~5% en precio)
 MIN_TOUCHES      = 5      # mínimo de toques totales (lower + upper)
 MIN_CONTAINMENT  = 0.60   # mínimo % de semanas dentro del canal
 MAX_WIDTH_LOG    = 1.0    # máximo ancho en log-space (~172% en precio)
+MAX_BREACH_PCT   = 30.0   # si algún pivot rompe la línea del canal >30%, rechazar
 
 # Horizontes para detección multi-canal
 HORIZONS = [
@@ -198,6 +199,8 @@ def detect_channel(symbol: str, fecha: date = None, *,
             # Métricas lower
             low_touches = 0
             low_violations = 0
+            max_breach_log = math.log(1 + MAX_BREACH_PCT / 100)
+            has_massive_breach = False
             for k in range(n_low):
                 pred = slope * pl_days[k] + ic_low
                 diff = pl_log[k] - pred
@@ -205,6 +208,11 @@ def detect_channel(symbol: str, fecha: date = None, *,
                     low_touches += 1
                 elif diff < -tol:
                     low_violations += 1
+                if diff < -max_breach_log:
+                    has_massive_breach = True
+
+            if has_massive_breach:
+                continue
 
             # Upper: probar cada pivot high como techo
             for hi in range(len(ph_days)):
@@ -220,6 +228,7 @@ def detect_channel(symbol: str, fecha: date = None, *,
                 # Métricas upper
                 up_touches = 0
                 up_violations = 0
+                up_massive_breach = False
                 for hk in range(len(ph_days)):
                     pred = slope * ph_days[hk] + ic_up
                     diff = ph_log[hk] - pred
@@ -227,6 +236,11 @@ def detect_channel(symbol: str, fecha: date = None, *,
                         up_touches += 1
                     elif diff > tol:
                         up_violations += 1
+                    if diff > max_breach_log:
+                        up_massive_breach = True
+
+                if up_massive_breach:
+                    continue
 
                 # ¿Precio actual dentro del canal?
                 support_now = slope * last_days + ic_low

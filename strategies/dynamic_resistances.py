@@ -305,6 +305,7 @@ def _try_fit(
     se queda con el mejor score global.
     """
     exact_kwargs = {k: v for k, v in kwargs.items() if k != 'apply_obsolete'}
+    req_touches = kwargs.get('min_touches', MIN_TOUCHES)
 
     best: Optional[dict] = None
     def keep(cand: Optional[dict]) -> None:
@@ -315,7 +316,7 @@ def _try_fit(
             best = cand
 
     for piv in piv_lists:
-        if len(piv) < MIN_TOUCHES:
+        if len(piv) < req_touches:
             continue
         keep(_fit_regression_log(highs, body_highs, piv, **kwargs))
         keep(_fit_trendline_log(highs, body_highs, piv, strict_wick=True,  **exact_kwargs))
@@ -397,15 +398,21 @@ def _fit_regression_log(
         slope = num / den
         if slope >= 0:  # descending only
             continue
-        intercept = mean_y - slope * mean_x
+        intercept_reg = mean_y - slope * mean_x
 
         chain_ok = True
         for p in chain:
-            if abs(log_wick[p] - (slope * p + intercept)) > reg_tol:
+            if abs(log_wick[p] - (slope * p + intercept_reg)) > reg_tol:
                 chain_ok = False
                 break
         if not chain_ok:
             continue
+
+        # Upper envelope: usar el slope de la regresion pero subir el intercept
+        # para que la linea pase por la mecha mas alta de la cadena. Asi la
+        # linea toca las puntas de las mechas superiores (como Julian dibuja
+        # en TradingView) en vez de flotar por el medio de los cuerpos.
+        intercept = max(log_wick[p] - slope * p for p in chain)
 
         if _line_crosses_any_body(slope, intercept, log_body, i0, i1):
             continue
@@ -767,21 +774,29 @@ def _build_tier(
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None) -> dict:
+def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
+                            tf: Optional[str] = None) -> dict:
     """
     Devuelve 3 resistencias dinamicas (long/mid/short) sobre el historico
     semanal. Fallback a diario si no hay suficientes barras semanales.
+
+    Si se pasa `tf` ('W' o 'D'), fuerza ese timeframe sin fallback.
     """
     fecha = fecha or date.today()
 
     rows: list[dict] = []
-    tf = 'W'
-    for cand in ('W', 'D'):
-        r = _load(symbol, cand, fecha)
-        if r and len(r) >= 80:
-            rows = r
-            tf = cand
-            break
+    if tf in ('W', 'D'):
+        rows = _load(symbol, tf, fecha) or []
+        if not rows or len(rows) < 80:
+            rows = []
+    else:
+        tf = 'W'
+        for cand in ('W', 'D'):
+            r = _load(symbol, cand, fecha)
+            if r and len(r) >= 80:
+                rows = r
+                tf = cand
+                break
 
     if not rows:
         return {
@@ -890,10 +905,23 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None) -> dict:
         n_total=n, apply_obsolete=False,
     )
 
-    # ── short (magenta): horizontal si el precio lateraliza bajo un techo ───
-    closes = [float(r['close']) for r in rows]
-    lows   = [float(r['low'])  for r in rows]
-    short_tl = _detect_sideways_horizontal(highs, body_highs, lows, closes, n, tf)
+    # ── short (magenta): diagonal descendente CP, fallback a horizontal ─────
+    # PRIMERO: diagonal de "lower highs" de la pierna bajista actual, con
+    # anchor1 muy cercano al presente (ultimo ~5%). Relajamos a min_touches=2
+    # porque una resistencia CP recien formada tipicamente solo tiene 2 anclas
+    # claras. Si no hay diagonal valida, cae al detector de lateralizacion.
+    short_tl = _try_fit(
+        highs, body_highs, [piv_short, piv_mid, piv_combined],
+        min_span=span_short, tol_pct=PRICE_TOL_PCT,
+        anchor1_range=(0.95, 0.998),
+        anchor2_min=0.99,
+        min_touches=2,
+        n_total=n, apply_obsolete=False,
+    )
+    if short_tl is None:
+        closes = [float(r['close']) for r in rows]
+        lows   = [float(r['low'])  for r in rows]
+        short_tl = _detect_sideways_horizontal(highs, body_highs, lows, closes, n, tf)
 
     # ── Invalidaciones ───────────────────────────────────────────────────────
     # Long: si el precio esta >50% ABAJO de la proyeccion (linea lejos en lo

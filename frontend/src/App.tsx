@@ -8,11 +8,12 @@ import AssetDetail from '@/pages/AssetDetail'
 import Screener    from '@/pages/Screener'
 import Alerts      from '@/pages/Alerts'
 import Watchlist   from '@/pages/Watchlist'
+import Movimientos from '@/pages/Movimientos'
 import Settings    from '@/pages/Settings'
 import Login       from '@/pages/Login'
 
 function ProtectedRoutes() {
-  const { token } = useAuth()
+  const { token, username } = useAuth()
   if (!token) return <Navigate to="/login" replace />
 
   return (
@@ -24,6 +25,9 @@ function ProtectedRoutes() {
         <Route path="/screener" element={<Screener />} />
         <Route path="/alerts" element={<Alerts />} />
         <Route path="/watchlist" element={<Watchlist />} />
+        {username === 'albano' && (
+          <Route path="/movimientos" element={<Movimientos />} />
+        )}
         <Route path="/settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Route>

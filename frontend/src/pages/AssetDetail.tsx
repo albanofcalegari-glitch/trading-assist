@@ -373,8 +373,6 @@ export default function AssetDetail() {
         continue
       }
       if (!tier.line_points.length) continue
-      // La recta es y=m*x+b en log-space — interpolar solo entre primer y ultimo
-      // punto garantiza linea recta sin artefactos por spacing irregular de barras.
       const pts = tier.line_points
       const firstPt = pts[0]
       const lastPt  = pts[pts.length - 1]
@@ -588,22 +586,21 @@ export default function AssetDetail() {
 
         const buildInterp = (pts: { fecha: string; value: number }[]) => {
           if (!pts.length) return candleDates.map(() => null as number | null)
-          const tsV = pts.map(p => Date.parse(p.fecha))
-          const logV = pts.map(p => Math.log(p.value))
-          const firstTs = tsV[0]
-          const lastTs = tsV[tsV.length - 1]
-          return candleDates.map(d => {
-            const t = Date.parse(d)
-            if (t < firstTs || t > lastTs) return null
-            let lo = 0, hi = tsV.length - 1
-            while (hi - lo > 1) {
-              const mid = (lo + hi) >> 1
-              if (tsV[mid] <= t) lo = mid; else hi = mid
-            }
-            const t0 = tsV[lo], t1 = tsV[hi]
-            if (t1 === t0) return Math.exp(logV[lo])
-            const frac = (t - t0) / (t1 - t0)
-            return Math.exp(logV[lo] + frac * (logV[hi] - logV[lo]))
+          const t0 = Date.parse(pts[0].fecha)
+          const tN = Date.parse(pts[pts.length - 1].fecha)
+          let idx0 = -1, idxN = -1, bd0 = Infinity, bdN = Infinity
+          for (let i = 0; i < candleDates.length; i++) {
+            const ct = Date.parse(candleDates[i])
+            const d0 = Math.abs(ct - t0); if (d0 < bd0) { bd0 = d0; idx0 = i }
+            const dN = Math.abs(ct - tN); if (dN < bdN) { bdN = dN; idxN = i }
+          }
+          if (idx0 < 0 || idxN < 0 || idxN <= idx0) return candleDates.map(() => null as number | null)
+          const log0 = Math.log(pts[0].value)
+          const logN = Math.log(pts[pts.length - 1].value)
+          const logSlope = (logN - log0) / (idxN - idx0)
+          return candleDates.map((_, i) => {
+            if (i < idx0 || i > idxN) return null
+            return Math.exp(log0 + logSlope * (i - idx0))
           })
         }
 
@@ -632,6 +629,93 @@ export default function AssetDetail() {
 
     return { indicators, zones }
   }, [v2Rendered, candles])
+
+  // ── V2: soportes/resistencias dinámicos con recta log-space por bar-index ──
+  // Helper: busca el indice de vela mas cercano a una fecha
+  const findBarIdx = (dates: string[], fecha: string) => {
+    const t = Date.parse(fecha)
+    let best = 0, bestD = Infinity
+    for (let i = 0; i < dates.length; i++) {
+      const d = Math.abs(Date.parse(dates[i]) - t)
+      if (d < bestD) { bestD = d; best = i }
+    }
+    return best
+  }
+
+  const v2DynZones: import('@/components/detail/PriceChart').PriceZone[] = []
+  const v2DynLines: { dates: string[]; values: (number | null)[]; color: string; label: string }[] = []
+  const v2DotLayers: import('@/components/detail/PriceChart').DotMarker[][] = []
+
+  if (dynSupports && showDynSupports && candles.length) {
+    const cd = candles.map(c => c.fecha)
+    const tiers: [keyof DynamicSupports, string, string][] = [
+      ['long',  '#00e676', 'LP'],
+      ['mid',   '#ffd54f', 'MP'],
+      ['short', '#4fc3f7', 'CP'],
+    ]
+    for (const [key, color, label] of tiers) {
+      if (!dynSupTiers[key as 'long' | 'mid' | 'short']) continue
+      const tier = dynSupports[key]
+      if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
+      if (!('line_points' in tier)) continue
+      if (tier.kind === 'horizontal' && typeof tier.zone_top === 'number') {
+        v2DynZones.push({ floor: tier.current_value, top: tier.zone_top, color, label: `Zona ${label}` })
+        continue
+      }
+      const a1v = tier.anchor1.value
+      const a2v = tier.anchor2.value
+      const a1idx = findBarIdx(cd, tier.anchor1.fecha)
+      const a2idx = findBarIdx(cd, tier.anchor2.fecha)
+      if (a2idx <= a1idx) continue
+      const lg1 = Math.log(a1v)
+      const lgS = (Math.log(a2v) - lg1) / (a2idx - a1idx)
+      v2DynLines.push({
+        dates: cd,
+        values: cd.map((_, i) => i < a1idx ? null : Math.exp(lg1 + lgS * (i - a1idx))),
+        color,
+        label: `Soporte ${label}`,
+      })
+      // Dots filtrados: solo touch_points que caen sobre la recta (< 0.5%)
+      const candidates = tier.touch_points?.length ? tier.touch_points : [tier.anchor1, tier.anchor2]
+      const filtered = candidates.filter(tp => {
+        const idx = findBarIdx(cd, tp.fecha)
+        const lineVal = Math.exp(lg1 + lgS * (idx - a1idx))
+        return Math.abs(tp.value - lineVal) / lineVal < 0.005
+      })
+      v2DotLayers.push(filtered.map(tp => ({ fecha: tp.fecha, value: tp.value, color })))
+    }
+  }
+
+  if (dynResistances && showDynResistances && candles.length) {
+    const cd = candles.map(c => c.fecha)
+    const tiers: [keyof DynamicResistances, string, string][] = [
+      ['long',  '#ef4444', 'LP'],
+      ['mid',   '#fb923c', 'MP'],
+      ['short', '#ef4444', 'CP'],
+    ]
+    for (const [key, color, label] of tiers) {
+      const tier = dynResistances[key]
+      if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
+      if (!('line_points' in tier)) continue
+      if (tier.kind === 'horizontal' && typeof tier.zone_floor === 'number' && typeof tier.zone_ceiling === 'number') {
+        v2DynZones.push({ floor: tier.zone_floor, top: tier.zone_ceiling, color, label: `Zona R ${label}` })
+        continue
+      }
+      const a1v = tier.anchor1.value
+      const a2v = tier.anchor2.value
+      const a1idx = findBarIdx(cd, tier.anchor1.fecha)
+      const a2idx = findBarIdx(cd, tier.anchor2.fecha)
+      if (a2idx <= a1idx) continue
+      const lg1 = Math.log(a1v)
+      const lgS = (Math.log(a2v) - lg1) / (a2idx - a1idx)
+      v2DynLines.push({
+        dates: cd,
+        values: cd.map((_, i) => i < a1idx ? null : Math.exp(lg1 + lgS * (i - a1idx))),
+        color,
+        label: `Resistencia ${label}`,
+      })
+    }
+  }
 
   const rsiDivergenceActive = activeStrategies.includes('RSI Divergence — Señal')
 
@@ -1027,8 +1111,9 @@ export default function AssetDetail() {
             <PriceChart
               candles={candles}
               freq={tf}
-              indicators={v2Overlays.indicators}
-              zones={v2Overlays.zones}
+              indicators={v2DynLines}
+              zones={[...v2Overlays.zones, ...v2DynZones]}
+              dotLayers={v2DotLayers}
               height={480}
               viewStartDate={(() => {
                 const minDate = new Date()

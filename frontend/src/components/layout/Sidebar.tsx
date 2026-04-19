@@ -1,17 +1,22 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { NavLink, Link } from 'react-router-dom'
 import {
   LayoutDashboard, ScanLine, Bell, Settings, TrendingUp, X,
-  ChevronsLeft, ChevronsRight, Star,
+  ChevronsLeft, ChevronsRight, Star, BookOpen,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useAuth } from '@/lib/auth'
 
-const NAV = [
+const BASE_NAV = [
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/screener',  icon: ScanLine,         label: 'Screener' },
   { to: '/alerts',    icon: Bell,             label: 'Alertas' },
   { to: '/watchlist', icon: Star,             label: 'Watchlist' },
 ]
+
+const MOVIMIENTOS_ITEM = {
+  to: '/movimientos', icon: BookOpen, label: 'Movimientos',
+}
 
 const NAV_BOTTOM = [
   { to: '/settings', icon: Settings, label: 'Configuración' },
@@ -28,10 +33,15 @@ export default function Sidebar({ open, onClose }: Props) {
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     return localStorage.getItem(COLLAPSE_KEY) === '1'
   })
+  const { username } = useAuth()
 
   useEffect(() => {
     localStorage.setItem(COLLAPSE_KEY, collapsed ? '1' : '0')
   }, [collapsed])
+
+  const NAV = useMemo(() => (
+    username === 'albano' ? [...BASE_NAV, MOVIMIENTOS_ITEM] : BASE_NAV
+  ), [username])
 
   return (
     <>

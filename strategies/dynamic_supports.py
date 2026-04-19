@@ -902,13 +902,21 @@ def _build_tier(
     # Regla Julian (2026-04-14): la linea se proyecta hasta la barra actual,
     # asi el chart muestra exactamente donde estaria el soporte hoy (coincide
     # con el trazado manual que Julian hace en TradingView).
-    line_points = []
+    raw_points = []
     for x in range(i0, n):
         y = math.exp(slope * x + intercept)
-        line_points.append({
+        raw_points.append({
             'fecha': rows[x]['fecha'].isoformat(),
             'value': round(y, 4),
         })
+    # Filtrar puntos con spacing < 5 dias para evitar torceduras en la
+    # interpolacion del frontend (barras parciales al final del historico).
+    line_points = [raw_points[0]]
+    for pt in raw_points[1:]:
+        prev_date = date.fromisoformat(line_points[-1]['fecha'])
+        cur_date  = date.fromisoformat(pt['fecha'])
+        if (cur_date - prev_date).days >= 5:
+            line_points.append(pt)
 
     # current_value = proyeccion de la linea en la ULTIMA barra disponible
     # (aunque la linea visible se corte antes); necesario para distance_pct.
