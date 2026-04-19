@@ -18,17 +18,23 @@ from __future__ import annotations
 from datetime import date
 from typing   import Optional
 
-from strategies import dynamic_supports   as _ds
-from strategies import longterm_support   as _lts
-from strategies import historical_lows    as _hl
-from strategies import historical_highs   as _hh
-from strategies import ut_bot             as _utb
-from strategies import trend_pullback     as _tp
+from strategies import dynamic_supports    as _ds
+from strategies import dynamic_resistances as _dr
+from strategies import longterm_support    as _lts
+from strategies import historical_lows     as _hl
+from strategies import historical_highs    as _hh
+from strategies import ut_bot              as _utb
+from strategies import trend_pullback      as _tp
+
+from db.connection import get_conn as _get_conn
 
 
 # Umbrales
 NEAR_SUPPORT_MAX_PCT    = 3.0   # % máximo sobre el soporte para alertar
 NEAR_RESISTANCE_MAX_PCT = 3.0   # % máximo bajo la resistencia para alertar
+BREAKOUT_MAX_DIST_PCT   = 5.0   # % máximo arriba de la resistencia para considerar breakout fresco
+BREAKOUT_SL_PCT         = 5.0   # Stop Loss: -5% desde la resistencia
+BREAKOUT_TP_RATIO       = 2.0   # Risk:Reward 1:2 → TP = +10%
 
 
 def _fmt_price(v: Optional[float]) -> str:
@@ -87,6 +93,18 @@ def _action_hint(code: str, **ctx) -> str:
     if code == 'TREND_PULLBACK':
         return ('🎯 Setup de compra: tendencia sana + pullback estabilizado. '
                 'Entrada directa con stop bajo el mínimo del pullback.')
+    if code == 'RESISTANCE_BREAKOUT':
+        sl = _fmt_price(ctx.get('sl'))
+        tp = _fmt_price(ctx.get('tp'))
+        res = _fmt_price(ctx.get('resistance'))
+        strength = ctx.get('strength', 1)
+        if strength >= 2:
+            return (f'🚀 Breakout CONFIRMADO (2 velas). Entrada con SL en {sl} (-5%) '
+                    f'y TP en {tp} (+10%, R:R 1:2). La resistencia en {res} ahora '
+                    f'pasa a ser soporte — si vuelve abajo, abortar.')
+        return (f'📈 Breakout (1 vela, pendiente confirmación). Entrada con SL en {sl} '
+                f'(-5%) y TP en {tp} (+10%, R:R 1:2). Si mañana cierra arriba de '
+                f'{res} de nuevo, la señal se fortalece.')
     return ''
 
 
@@ -354,6 +372,100 @@ def _detect_trend_pullback(symbol: str, fecha: date) -> list[dict]:
     return out
 
 
+def _detect_resistance_breakout(symbol: str, fecha: date) -> list[dict]:
+    """Detecta ruptura al alza de resistencia dinámica (breakout → BUY)."""
+    out: list[dict] = []
+    try:
+        r = _dr.get_dynamic_resistances(symbol, fecha)
+    except Exception:
+        return out
+    price = r.get('price')
+    tf    = r.get('timeframe_used')
+    if price is None or tf is None:
+        return out
+
+    prev_closes: list[float] = []
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT close FROM ohlcv_extended
+                   WHERE simbolo = %s AND timeframe = %s AND fecha <= %s
+                   ORDER BY fecha DESC LIMIT 3""",
+                (symbol, tf, fecha),
+            )
+            prev_closes = [float(row['close']) for row in cur.fetchall()]
+        conn.close()
+    except Exception:
+        pass
+
+    for tier_name in ('short', 'mid', 'long'):
+        tier = r.get(tier_name)
+        if not tier or not isinstance(tier, dict):
+            continue
+
+        cur_val  = tier.get('current_value')
+        dist_pct = tier.get('distance_pct', 0)
+        if cur_val is None or cur_val <= 0:
+            continue
+
+        if tier.get('kind') == 'horizontal':
+            res_level = tier.get('zone_ceiling', cur_val)
+        else:
+            res_level = cur_val
+
+        if dist_pct <= 0 or dist_pct > BREAKOUT_MAX_DIST_PCT:
+            continue
+
+        lps = tier.get('line_points', [])
+        prev_res = lps[-2]['value'] if len(lps) >= 2 else res_level
+        prev2_res = lps[-3]['value'] if len(lps) >= 3 else prev_res
+
+        if len(prev_closes) >= 2:
+            yesterday_close = prev_closes[1]
+            if yesterday_close > prev_res * 1.005:
+                if len(prev_closes) >= 3:
+                    day_before = prev_closes[2]
+                    if day_before > prev2_res * 1.005:
+                        continue
+                    strength = 2
+                else:
+                    strength = 2
+            else:
+                strength = 1
+        else:
+            strength = 1
+
+        sl = round(res_level * (1 - BREAKOUT_SL_PCT / 100), 2)
+        tp = round(res_level * (1 + BREAKOUT_SL_PCT * BREAKOUT_TP_RATIO / 100), 2)
+
+        hint = _action_hint('RESISTANCE_BREAKOUT',
+                            sl=sl, tp=tp, resistance=res_level, strength=strength)
+        strength_label = '2 velas confirmando' if strength >= 2 else '1 vela (pendiente confirmación)'
+        body = (f'El precio {_fmt_price(price)} rompió al alza la resistencia dinámica '
+                f'{tier_name} en {_fmt_price(res_level)} (distancia +{dist_pct:.2f}%). '
+                f'Fuerza: {strength_label}.')
+        out.append({
+            'direction': 'BUY',
+            'code':      'RESISTANCE_BREAKOUT',
+            'title':     f'{symbol} · ruptura resistencia {tier_name} +{dist_pct:.1f}%',
+            'body':      _with_action(body, hint),
+            'data': {
+                'tier':           tier_name,
+                'price':          price,
+                'resistance':     res_level,
+                'distance_pct':   round(dist_pct, 3),
+                'sl':             sl,
+                'tp':             tp,
+                'strength':       strength,
+                'strength_label': strength_label,
+                'action':         hint,
+            },
+        })
+        break  # solo el tier más relevante
+    return out
+
+
 # ── Detector agregado ─────────────────────────────────────────────────────────
 
 _DETECTORS = [
@@ -364,6 +476,7 @@ _DETECTORS = [
     _detect_52w_low,
     _detect_52w_high,
     _detect_trend_pullback,
+    _detect_resistance_breakout,
 ]
 
 
