@@ -675,14 +675,6 @@ export default function AssetDetail() {
         color,
         label: `Soporte ${label}`,
       })
-      // Dots filtrados: solo touch_points que caen sobre la recta (< 0.5%)
-      const candidates = tier.touch_points?.length ? tier.touch_points : [tier.anchor1, tier.anchor2]
-      const filtered = candidates.filter(tp => {
-        const idx = findBarIdx(cd, tp.fecha)
-        const lineVal = Math.exp(lg1 + lgS * (idx - a1idx))
-        return Math.abs(tp.value - lineVal) / lineVal < 0.005
-      })
-      v2DotLayers.push(filtered.map(tp => ({ fecha: tp.fecha, value: tp.value, color })))
     }
   }
 
@@ -714,16 +706,6 @@ export default function AssetDetail() {
         color,
         label: `Resistencia ${label}`,
       })
-      // Dots filtrados para resistencias
-      const candidates = (tier as any).touch_points?.length
-        ? (tier as any).touch_points as { fecha: string; value: number }[]
-        : [tier.anchor1, tier.anchor2]
-      const filtered = candidates.filter((tp: { fecha: string; value: number }) => {
-        const idx = findBarIdx(cd, tp.fecha)
-        const lineVal = Math.exp(lg1 + lgS * (idx - a1idx))
-        return Math.abs(tp.value - lineVal) / lineVal < 0.005
-      })
-      v2DotLayers.push(filtered.map((tp: { fecha: string; value: number }) => ({ fecha: tp.fecha, value: tp.value, color })))
     }
   }
 
