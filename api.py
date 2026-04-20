@@ -1319,20 +1319,22 @@ def get_dynamic_supports_endpoint(accion_id: int):
         return _jresp({'error': 'Asset not found'}, 404)
 
     symbol = row['simbolo']
+    tf = flask.request.args.get('tf')
 
+    cache_key = f"{symbol}_{tf or 'auto'}"
     with _dynsup_lock:
-        entry = _dynsup_cache.get(symbol)
+        entry = _dynsup_cache.get(cache_key)
         if entry and (time.time() - entry['ts']) < _DYNSUP_TTL:
             return _jresp(entry['data'])
 
     try:
         from strategies.dynamic_supports import get_dynamic_supports
-        result = get_dynamic_supports(symbol, datetime.date.today())
+        result = get_dynamic_supports(symbol, datetime.date.today(), tf=tf)
     except Exception as e:
         return _jresp({'error': str(e), 'symbol': symbol}, 500)
 
     with _dynsup_lock:
-        _dynsup_cache[symbol] = {'data': result, 'ts': time.time()}
+        _dynsup_cache[cache_key] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 

@@ -694,8 +694,8 @@ export const api = {
   longtermSupport: (id: number, horizon = 'long_term') =>
     get<LongtermSupport>(`/assets/${id}/longterm-support?horizon=${horizon}`),
 
-  dynamicSupports: (id: number) =>
-    get<DynamicSupports>(`/assets/${id}/dynamic-supports`),
+  dynamicSupports: (id: number, tf?: 'D' | 'W') =>
+    get<DynamicSupports>(`/assets/${id}/dynamic-supports${tf ? `?tf=${tf}` : ''}`),
 
   dynamicResistances: (id: number, tf?: 'D' | 'W') =>
     get<DynamicResistances>(`/assets/${id}/dynamic-resistances${tf ? `?tf=${tf}` : ''}`),

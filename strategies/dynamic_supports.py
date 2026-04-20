@@ -965,10 +965,13 @@ def _build_tier(
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def get_dynamic_supports(symbol: str, fecha: Optional[date] = None) -> dict:
+def get_dynamic_supports(symbol: str, fecha: Optional[date] = None,
+                         tf: Optional[str] = None) -> dict:
     """
     Devuelve 3 soportes dinamicos (long/mid/short) sobre el historico semanal.
     Fallback a diario si no hay suficientes barras semanales.
+
+    Si se pasa `tf` ('W' o 'D'), fuerza ese timeframe sin fallback.
 
     Retorna siempre la estructura:
       {
@@ -981,13 +984,18 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None) -> dict:
     fecha = fecha or date.today()
 
     rows: list[dict] = []
-    tf = 'W'
-    for cand in ('W', 'D'):
-        r = _load(symbol, cand, fecha)
-        if r and len(r) >= 80:
-            rows = r
-            tf = cand
-            break
+    if tf in ('W', 'D'):
+        rows = _load(symbol, tf, fecha) or []
+        if not rows or len(rows) < 80:
+            rows = []
+    else:
+        tf = 'W'
+        for cand in ('W', 'D'):
+            r = _load(symbol, cand, fecha)
+            if r and len(r) >= 80:
+                rows = r
+                tf = cand
+                break
 
     if not rows:
         return {

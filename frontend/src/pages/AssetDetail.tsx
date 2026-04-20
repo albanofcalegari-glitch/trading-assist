@@ -59,6 +59,8 @@ export default function AssetDetail() {
   const [dynResistances,    setDynResistances]    = useState<DynamicResistances | null>(null)
   const [showDynResistances,setShowDynResistances]= useState(true)
   const [dynResTf,          setDynResTf]          = useState<'W' | 'D'>('W')
+  const [v2DynSup,          setV2DynSup]          = useState<DynamicSupports | null>(null)
+  const [v2DynRes,          setV2DynRes]          = useState<DynamicResistances | null>(null)
   const [chBreakdown,    setChBreakdown]    = useState<ChannelBreakdown | null>(null)
   const [showUtBot,      setShowUtBot]      = useState(false)
   const [backfilling,    setBackfilling]    = useState(false)
@@ -176,6 +178,17 @@ export default function AssetDetail() {
       .then(setSrV2)
       .catch(() => setSrV2(null))
       .finally(() => setSrV2Loading(false))
+  }, [chartMode, accionId])
+
+  // V2: soportes y resistencias en timeframe D (diario) para rectas precisas
+  useEffect(() => {
+    if (chartMode !== 'v2' || !accionId) return
+    api.dynamicSupports(accionId, 'D')
+      .then(setV2DynSup)
+      .catch(() => setV2DynSup(null))
+    api.dynamicResistances(accionId, 'D')
+      .then(setV2DynRes)
+      .catch(() => setV2DynRes(null))
   }, [chartMode, accionId])
 
   // Helpers CRUD para niveles del usuario — refetch simple post-mutación
@@ -646,7 +659,10 @@ export default function AssetDetail() {
   const v2DynLines: { dates: string[]; values: (number | null)[]; color: string; label: string }[] = []
   const v2DotLayers: import('@/components/detail/PriceChart').DotMarker[][] = []
 
-  if (dynSupports && showDynSupports && candles.length) {
+  const v2SupData = v2DynSup || dynSupports
+  const v2ResData = v2DynRes || dynResistances
+
+  if (v2SupData && showDynSupports && candles.length) {
     const cd = candles.map(c => c.fecha)
     const tiers: [keyof DynamicSupports, string, string][] = [
       ['long',  '#00e676', 'LP'],
@@ -655,7 +671,7 @@ export default function AssetDetail() {
     ]
     for (const [key, color, label] of tiers) {
       if (!dynSupTiers[key as 'long' | 'mid' | 'short']) continue
-      const tier = dynSupports[key]
+      const tier = v2SupData[key]
       if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
       if (!('line_points' in tier)) continue
       if (tier.kind === 'horizontal' && typeof tier.zone_top === 'number') {
@@ -678,7 +694,7 @@ export default function AssetDetail() {
     }
   }
 
-  if (dynResistances && showDynResistances && candles.length) {
+  if (v2ResData && showDynResistances && candles.length) {
     const cd = candles.map(c => c.fecha)
     const tiers: [keyof DynamicResistances, string, string][] = [
       ['long',  '#ef4444', 'LP'],
@@ -686,7 +702,7 @@ export default function AssetDetail() {
       ['short', '#ef4444', 'CP'],
     ]
     for (const [key, color, label] of tiers) {
-      const tier = dynResistances[key]
+      const tier = v2ResData[key]
       if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
       if (!('line_points' in tier)) continue
       if (tier.kind === 'horizontal' && typeof tier.zone_floor === 'number' && typeof tier.zone_ceiling === 'number') {
