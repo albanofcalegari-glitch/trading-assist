@@ -1,0 +1,144 @@
+// This Pine Script™ is subject to the Terms of Use at https://www.tradingview.com/pine-script-docs/
+// © Trading Assist
+
+//@version=6
+indicator("Soporte Dinámico — Recta A→B (sin cruzar cuerpos)", overlay=true, max_bars_back=10000, max_lines_count=10)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+int   pivotWin   = input.int(12, "Pivot window (barras a cada lado)", minval=2, maxval=50)
+float tolPct     = input.float(4.0, "Tolerancia toque (%)", minval=0.5, maxval=15.0)
+int   minSpan    = input.int(40, "Span mínimo (barras entre A y B)", minval=5)
+int   maxSpan    = input.int(1000, "Span máximo", minval=50)
+int   minTouches = input.int(3, "Toques mínimos", minval=2, maxval=10)
+color lineColor  = input.color(color.new(color.lime, 0), "Color de línea")
+int   lineWidth  = input.int(2, "Grosor de línea", minval=1, maxval=5)
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+bodyLow(int idx) =>
+    math.min(open[idx], close[idx])
+
+// ── Pivot lows ──────────────────────────────────────────────────────────────
+// Detecta si la barra `lookback` barras atras es un pivot low
+isPivotLow(int lookback, int win) =>
+    lo = low[lookback]
+    ok = true
+    for k = 1 to win
+        if low[lookback - k] < lo or low[lookback + k] < lo
+            ok := false
+            break
+    ok
+
+// ── Recolectar pivots ───────────────────────────────────────────────────────
+var float[] pivLows = array.new_float(0)
+var int[]   pivIdxs = array.new_int(0)
+
+if barstate.islast
+    array.clear(pivLows)
+    array.clear(pivIdxs)
+    // Scan backwards up to 10000 bars
+    int maxBars = math.min(bar_index, 10000)
+    for lb = pivotWin to maxBars - pivotWin
+        if isPivotLow(lb, pivotWin)
+            array.push(pivLows, low[lb])
+            array.push(pivIdxs, bar_index - lb)
+
+// ── Buscar mejor recta A→B ──────────────────────────────────────────────────
+var line bestLine = na
+
+if barstate.islast
+    int   np       = array.size(pivIdxs)
+    float bestScore = -1e18
+    int   bestA     = -1
+    int   bestB     = -1
+    float bestSlope = 0.0
+    float bestInter = 0.0
+
+    if np >= minTouches
+        // Pivots estan en orden decreciente de bar_index (mas recientes primero)
+        // Invertir para tener cronológico
+        int[] chrIdx  = array.new_int(0)
+        float[] chrLo = array.new_float(0)
+        for k = np - 1 to 0
+            array.push(chrIdx, array.get(pivIdxs, k))
+            array.push(chrLo,  array.get(pivLows, k))
+
+        int nc = array.size(chrIdx)
+        float logTol = math.log(1.0 + tolPct / 100.0)
+
+        for a = 0 to nc - 2
+            int   idxA = array.get(chrIdx, a)
+            float loA  = math.log(array.get(chrLo, a))
+            for b = a + 1 to nc - 1
+                int   idxB = array.get(chrIdx, b)
+                float loB  = math.log(array.get(chrLo, b))
+                int   span = idxB - idxA
+                if span < minSpan or span > maxSpan
+                    continue
+                float sl = (loB - loA) / span
+                if sl <= 0
+                    continue
+                float interc = loA - sl * idxA
+
+                // Check: la recta no cruza cuerpos (line <= body_low para toda
+                // barra entre A y B)
+                bool bodyCross = false
+                for k = 0 to span
+                    int   barIdx  = idxA + k
+                    int   lb      = bar_index - barIdx
+                    if lb < 0 or lb >= maxBars
+                        continue
+                    float lineVal = sl * barIdx + interc
+                    float bLow    = math.log(bodyLow(lb))
+                    if lineVal > bLow
+                        bodyCross := true
+                        break
+
+                if bodyCross
+                    continue
+
+                // Contar toques: pivots cuya mecha está cerca de la recta
+                int touches = 0
+                int violations = 0
+                for p = 0 to nc - 1
+                    int   pIdx = array.get(chrIdx, p)
+                    if pIdx < idxA
+                        continue
+                    float pLo  = math.log(array.get(chrLo, p))
+                    float lineAtP = sl * pIdx + interc
+                    float bLoP = math.log(bodyLow(bar_index - pIdx))
+                    if lineAtP > bLoP + logTol
+                        violations += 1
+                    else if lineAtP >= pLo - logTol
+                        touches += 1
+
+                if touches < minTouches
+                    continue
+
+                float score = touches * 4.0 - violations * 10.0 + span * 0.03
+                if score > bestScore
+                    bestScore := score
+                    bestA     := idxA
+                    bestB     := idxB
+                    bestSlope := sl
+                    bestInter := interc
+
+    // Dibujar la recta si encontramos una
+    if not na(bestLine)
+        line.delete(bestLine)
+    if bestA >= 0
+        // Proyectar la recta desde A hasta la barra actual (o hasta que cruce body)
+        int projEnd = bar_index
+        for k = 1 to bar_index - bestB
+            int barCheck = bestB + k
+            int lb2 = bar_index - barCheck
+            if lb2 < 0
+                break
+            float lv = bestSlope * barCheck + bestInter
+            float bl2 = math.log(bodyLow(lb2))
+            if lv > bl2
+                projEnd := barCheck - 1
+                break
+
+        float y1 = math.exp(bestSlope * bestA + bestInter)
+        float y2 = math.exp(bestSlope * projEnd + bestInter)
+        bestLine := line.new(bestA, y1, projEnd, y2, color=lineColor, width=lineWidth, extend=extend.none)

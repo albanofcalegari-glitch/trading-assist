@@ -1319,7 +1319,7 @@ def get_dynamic_supports_endpoint(accion_id: int):
         return _jresp({'error': 'Asset not found'}, 404)
 
     symbol = row['simbolo']
-    tf = flask.request.args.get('tf')
+    tf = request.args.get('tf')
 
     cache_key = f"{symbol}_{tf or 'auto'}"
     with _dynsup_lock:

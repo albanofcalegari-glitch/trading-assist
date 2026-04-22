@@ -70,7 +70,7 @@ REGRESSION_TOL_PCT = 13.0
 # proyeccion de la linea, esa linea "quedo atras" — el rally la dejo obsoleta.
 # Aplica al tier LONG (diagonal del rally post-bear): ej. GOOGL 2008-2025
 # proyecta $171 pero precio = $314 (+82%) => la linea real es una mas reciente.
-LONG_MAX_ABOVE_PROJECTION_PCT = 50.0
+LONG_MAX_ABOVE_PROJECTION_PCT = 80.0
 
 # Regla Julian (2026-04-14 v4, CRITICA): la linea diagonal NO puede atravesar
 # ningun cuerpo de vela.  Referencia visual: TSLA queda bien porque toca mechas
@@ -83,7 +83,7 @@ LONG_MAX_ABOVE_PROJECTION_PCT = 50.0
 # queda arriba del body_low de aunque sea 1 vela, se descarta.  Tolerancia
 # minima porque es visual: en log-scale una linea 0.5% arriba del cuerpo
 # todavia no se percibe como "cortando", pero mas que eso ya se nota.
-NO_BODY_CROSS_TOL_PCT = 0.5
+NO_BODY_CROSS_TOL_PCT = 1.0
 
 # Regla Julian (2026-04-14, revisada): detectar lateralizacion reciente y trazar
 # soporte horizontal como ZONA.  El approach anterior (ultimos 3 pivots) fallaba
@@ -165,19 +165,19 @@ def _pivot_lows(lows: list[float], win: int, min_fwd: int = 3) -> list[int]:
 # ── Hard constraint: la linea no atraviesa cuerpos de velas ─────────────────
 
 def _line_crosses_any_body(
-    slope:     float,
-    intercept: float,
-    log_body:  list[float],
-    i0:        int,
-    i1:        int,
+    slope:        float,
+    intercept:    float,
+    log_body:     list[float],
+    i0:           int,
+    i1:           int,
+    override_tol: Optional[float] = None,
 ) -> bool:
     """
     Julian (v4): rechaza la linea si `slope*k + intercept > log(body_low[k]) + tol`
-    para ALGUNA barra k en [i0, i1] (inclusive).  Es decir: la linea no puede
-    quedar por arriba del piso del cuerpo de ninguna vela en el rango.  Con
-    tolerancia NO_BODY_CROSS_TOL_PCT para ruido visual irrelevante.
+    para ALGUNA barra k en [i0, i1] (inclusive).  override_tol permite usar
+    una tolerancia adaptativa al slope en vez de la constante global.
     """
-    body_tol = math.log(1 + NO_BODY_CROSS_TOL_PCT / 100)
+    body_tol = override_tol if override_tol is not None else math.log(1 + NO_BODY_CROSS_TOL_PCT / 100)
     for k in range(i0, i1 + 1):
         if slope * k + intercept > log_body[k] + body_tol:
             return True
@@ -199,6 +199,7 @@ def _fit_trendline_log(
     min_touches:    int = MIN_TOUCHES,
     strict_wick:    bool = True,
     max_span:       Optional[int] = None,
+    body_cross_tol: float = 0.006,
 ) -> Optional[dict]:
     """
     Busca la mejor trendline ASCENDENTE (slope > 0) de soporte.
@@ -247,6 +248,9 @@ def _fit_trendline_log(
                 continue
             intercept = log_wick[i] - slope * i
 
+            if any(slope * k + intercept > log_body[k] + body_cross_tol for k in range(i, len(lows))):
+                continue
+
             if max_proj_ratio is not None:
                 proj_last = math.exp(slope * (N - 1) + intercept)
                 if proj_last > last_px * max_proj_ratio:
@@ -274,14 +278,6 @@ def _fit_trendline_log(
             if obsolete:
                 continue
 
-            # Regla Julian (v4, hard): la linea no puede atravesar ningun cuerpo
-            # de vela en [anchor1, anchor2].  Aplica a TODAS las barras entre
-            # anchors (el segmento que la linea representa historicamente).
-            # Despues de anchor2 es proyeccion; si el precio cae por debajo es
-            # BROKEN (status), no invalida la linea.
-            if _line_crosses_any_body(slope, intercept, log_body, i, j):
-                continue
-
             touches = 0
             violations = 0
             violations_post = 0   # violaciones DESPUES de anchor2
@@ -302,14 +298,10 @@ def _fit_trendline_log(
                         violations_post += 1
                     else:
                         violations += 1
-                elif strict_wick:
-                    # solo cuenta si la linea cae cerca de la mecha (tol a ambos lados)
-                    if abs(trend_val - lo) <= log_tol:
-                        touches += 1
-                        touching.append(p)
-                    # else: linea lejos de la mecha (ni tocando ni violando) -> skip
                 elif trend_val >= lo - log_tol:
-                    # modo flexible: linea dentro de [wick - tol, body + tol] -> toque
+                    # Regla Julian (2026-04-20): toque si la linea esta dentro de
+                    # la zona de sombra [wick - tol, body + tol].  La linea puede
+                    # estar "desde la base hasta la punta de mecha".
                     touches += 1
                     touching.append(p)
                 # else: linea debajo de la mecha -> ni toca ni viola, OK
@@ -324,8 +316,8 @@ def _fit_trendline_log(
             # ($344 < $356): 1257 es un low deeper, la linea correcta ancla ahi
             # (1130->1257). Sin este filtro gana 1130->1307 por span aunque
             # salte un pivot clave.
-            DEEPER_LOW_WINDOW = 60
-            DEEPER_LOW_GAP = log_tol * 2
+            DEEPER_LOW_WINDOW = min(60, max(10, int(span * 0.25)))
+            DEEPER_LOW_GAP = log_tol * (2 + span / 80)
             skip_deeper_low = False
             for p in pivots:
                 if p >= j or p <= j - DEEPER_LOW_WINDOW or p < i:
@@ -399,25 +391,26 @@ def _try_fit(
         if best is None or cand['score'] > best['score']:
             best = cand
 
-    # Paso 1: intentar con MIN_TOUCHES (3) — solucion ideal
+    # Paso 1+2: competencia entre recta exacta y regresion.  Ambas se evaluan
+    # y gana la de mayor score.  Antes era secuencial (exacta primero, regresion
+    # solo como fallback), pero en rallies empinados la regresion OLS captura
+    # cadenas largas de higher lows que la recta exacta no alcanza.
     for piv in piv_lists:
         if len(piv) < MIN_TOUCHES:
             continue
-        keep(_fit_regression_log(lows, body_lows, piv, **kwargs))
         keep(_fit_trendline_log(lows, body_lows, piv, strict_wick=True,  **exact_kwargs))
         keep(_fit_trendline_log(lows, body_lows, piv, strict_wick=False, **exact_kwargs))
+        keep(_fit_regression_log(lows, body_lows, piv, **kwargs))
 
     if best is not None:
         best['fallback'] = False
         return best
 
-    # Paso 2: fallback a 2 toques — solo si no hubo ninguna de 3+
-    fallback_kwargs = {**kwargs, 'min_touches': 2}
+    # Paso 3: fallback a 2 toques — solo si no hubo ninguna de 3+
     fallback_exact  = {**exact_kwargs, 'min_touches': 2}
     for piv in piv_lists:
         if len(piv) < 2:
             continue
-        keep(_fit_regression_log(lows, body_lows, piv, **fallback_kwargs))
         keep(_fit_trendline_log(lows, body_lows, piv, strict_wick=True,  **fallback_exact))
         keep(_fit_trendline_log(lows, body_lows, piv, strict_wick=False, **fallback_exact))
 
@@ -453,6 +446,7 @@ def _fit_regression_log(
     min_touches:    int = MIN_TOUCHES,
     apply_obsolete: bool = True,
     max_span:       Optional[int] = None,
+    body_cross_tol: float = 0.006,
 ) -> Optional[dict]:
     """
     Busca la mejor trendline por regresion lineal sobre cadenas de higher lows.
@@ -521,15 +515,10 @@ def _fit_regression_log(
         if not chain_ok:
             continue
 
-        # Lower envelope: usar el slope de la regresion pero bajar el intercept
-        # para que la linea pase por la mecha mas baja de la cadena. Asi la
-        # linea toca las puntas de las mechas (como Julian dibuja en TradingView)
-        # en vez de flotar por el medio de los cuerpos.
-        intercept = min(log_wick[p] - slope * p for p in chain)
+        # Intercept pasa por la mecha del anchor1.
+        intercept = log_wick[i0] - slope * i0
 
-        # Regla Julian (v4, hard): la linea no puede atravesar ningun cuerpo
-        # de vela en [anchor1, anchor2].
-        if _line_crosses_any_body(slope, intercept, log_body, i0, i1):
+        if any(slope * k + intercept > log_body[k] + body_cross_tol for k in range(i0, len(lows))):
             continue
 
         # Regla Julian (2026-04-15): si la regresion proyecta demasiado alto
@@ -580,8 +569,9 @@ def _fit_regression_log(
         # Mismo filtro "deeper low missed" que en _fit_trendline_log: si hay
         # un pivot p en (i1-WINDOW, i1) con wick mas bajo que anchor2 y flotando
         # arriba de la regresion, la cadena deberia haber extendido hasta p.
-        DEEPER_LOW_WINDOW = 60
-        DEEPER_LOW_GAP = math.log(1 + PRICE_TOL_PCT / 100) * 2
+        reg_span = i1 - i0
+        DEEPER_LOW_WINDOW = min(60, max(10, int(reg_span * 0.25)))
+        DEEPER_LOW_GAP = math.log(1 + PRICE_TOL_PCT / 100) * (2 + reg_span / 80)
         skip_deeper_low = False
         for p in pivots:
             if p >= i1 or p <= i1 - DEEPER_LOW_WINDOW or p < i0:
@@ -895,28 +885,20 @@ def _build_tier(
     """
     n = len(rows)
     slope = tl['slope']
-    intercept = tl['intercept']
     i0, i1 = tl['anchors']
     lows = [float(r['low']) for r in rows]
 
-    # Regla Julian (2026-04-14): la linea se proyecta hasta la barra actual,
-    # asi el chart muestra exactamente donde estaria el soporte hoy (coincide
-    # con el trazado manual que Julian hace en TradingView).
-    raw_points = []
+    # Intercept pasa por la mecha del anchor1.
+    # El fitting ya garantizo que no cruza ningun body_low.
+    intercept = math.log(lows[i0]) - slope * i0
+
+    line_points = []
     for x in range(i0, n):
         y = math.exp(slope * x + intercept)
-        raw_points.append({
+        line_points.append({
             'fecha': rows[x]['fecha'].isoformat(),
             'value': round(y, 4),
         })
-    # Filtrar puntos con spacing < 5 dias para evitar torceduras en la
-    # interpolacion del frontend (barras parciales al final del historico).
-    line_points = [raw_points[0]]
-    for pt in raw_points[1:]:
-        prev_date = date.fromisoformat(line_points[-1]['fecha'])
-        cur_date  = date.fromisoformat(pt['fecha'])
-        if (cur_date - prev_date).days >= 5:
-            line_points.append(pt)
 
     # current_value = proyeccion de la linea en la ULTIMA barra disponible
     # (aunque la linea visible se corte antes); necesario para distance_pct.
@@ -1043,7 +1025,7 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None,
     # 2023-2025 que es el que Julian marca.  Para tickers jovenes (PLTR 290w)
     # permitimos hasta 90% del historico — aun no cruzan un bear market largo.
     bars_per_year_tf = {'W': 52, 'D': 252, 'M': 12}.get(tf, 252)
-    long_max_span = min(5 * bars_per_year_tf, int(n * 0.90))
+    long_max_span = min(20 * bars_per_year_tf, int(n * 0.90))
     # piv_combined: union de piv_long + piv_mid. Necesario para capturar
     # lineas exactas donde los 3 touches vienen de listas distintas (ej. MSFT:
     # 2022-10-31 y 2026-03-23 estan en piv_long, pero 2023-01-02 solo en piv_mid).
@@ -1055,8 +1037,12 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None,
     # rompio por debajo desde entonces). Evita que la linea ancle en fondos
     # de rallies anteriores ya terminados (ej. MSFT 2018-12 $94 -> rally
     # termino en 2022-10, ya no es el inicio del rally actual).
-    anchor1_lo_idx = max(int(0.30 * (n - 1)), n - long_max_span)
+    # Para historias cortas (<400 bars, ~IPOs recientes) el fondo estructural
+    # puede estar muy al inicio del historico — bajar el piso a 0.05.
+    anchor1_lo_frac = 0.05 if n < long_max_span * 1.2 else 0.10
+    anchor1_lo_idx = max(int(anchor1_lo_frac * (n - 1)), n - long_max_span)
     anchor1_hi_idx = int(0.98 * (n - 1))
+    long_a2_min = 0.70 if n < 2000 else 0.85
     rally_candidates = []
     for k, p in enumerate(piv_combined):
         if not (anchor1_lo_idx <= p <= anchor1_hi_idx):
@@ -1068,8 +1054,8 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None,
     long_tl = _try_fit(
         lows, body_lows, [piv_long, piv_mid, piv_combined],
         min_span=span_mid, tol_pct=PRICE_TOL_PCT,
-        anchor1_range=(0.30, 0.98),
-        anchor2_min=0.85,
+        anchor1_range=(anchor1_lo_frac, 0.98),
+        anchor2_min=long_a2_min,
         max_span=long_max_span,
         max_proj_ratio=1.5,
         n_total=n, apply_obsolete=True,
@@ -1080,8 +1066,7 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None,
     # preferirlo aunque pierda puntos por vp (precio testeando la linea).
     # Aplica un bonus para que compita con fits posteriores que evitan el
     # fondo y por ende marcan una pendiente mas chata.
-    if rally_candidates:
-        rally_start_idx = rally_candidates[0]
+    for rally_start_idx in rally_candidates:
         piv_long_r     = [p for p in piv_long     if p >= rally_start_idx]
         piv_mid_r      = [p for p in piv_mid      if p >= rally_start_idx]
         piv_combined_r = [p for p in piv_combined if p >= rally_start_idx]
@@ -1091,15 +1076,14 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None,
             lows, body_lows, [piv_long_r, piv_mid_r, piv_combined_r],
             min_span=span_mid, tol_pct=PRICE_TOL_PCT,
             anchor1_range=anchor1_range_lock,
-            anchor2_min=0.85,
+            anchor2_min=long_a2_min,
             max_span=long_max_span,
             max_proj_ratio=1.5,
             n_total=n, apply_obsolete=True,
         )
         if long_tl_locked is not None:
-            # Si el locked existe, preferirlo: es el fit "estructural".
-            # Solo queda el unlocked si el locked falla por completo.
             long_tl = long_tl_locked
+            break
 
     # Dominant-low rescue: si el minimo absoluto es un pivot >=20% debajo del
     # 2do minimo (rally post-IPO / post-bear fuerte), forzar esa ancla aunque
@@ -1109,7 +1093,7 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None,
     rescue_long = _try_dominant_low_rescue(
         lows, body_lows, sorted(set(piv_long + piv_mid)),
         min_span=span_mid, max_span=long_max_span,
-        anchor1_range=(0.30, 0.98), anchor2_min=0.85,
+        anchor1_range=(anchor1_lo_frac, 0.98), anchor2_min=long_a2_min,
         n_total=n, tol_pct=PRICE_TOL_PCT,
     )
     if rescue_long is not None:
@@ -1122,13 +1106,24 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None,
                 long_tl = rescue_long
 
     # ── mid (amarillo): diagonal del rally mas reciente ──────────────────────
-    # Cuando el rally post-bear tiene un sub-rally mas acelerado en los ultimos
-    # meses (ej. GOOGL 2025-04 -> 2026-03, mas empinado que el de 2023-2025).
+    # Regla Julian (2026-04-21): el mid es un soporte ascendente de mediano plazo
+    # — conecta lows recientes con pendiente suave.  NO requiere que anchor2 sea
+    # el ultimo pivot; puede anclar en lows de hace meses con el precio ya lejos
+    # arriba (como el chart de Julian en JNJ: a1=ene-2025, a2=abr-2025, precio
+    # 50% arriba).  anchor2_min relajado a 0.90 para capturar estos casos.
+    if long_tl is not None:
+        long_i1 = long_tl['anchors'][1]
+        if long_i1 > n * 0.90:
+            mid_a1_lo = max(0.70, 1.0 - 500 / max(n, 1))
+        else:
+            mid_a1_lo = max(0.75, (long_i1 + (n - 1 - long_i1) * 0.3) / (n - 1))
+    else:
+        mid_a1_lo = 0.75
     mid_tl = _try_fit(
         lows, body_lows, [piv_mid, piv_short],
         min_span=span_short, tol_pct=PRICE_TOL_PCT,
-        anchor1_range=(0.80, 0.98),
-        anchor2_min=0.97,
+        anchor1_range=(mid_a1_lo, 0.98),
+        anchor2_min=0.90,
         n_total=n, apply_obsolete=False,
     )
 
@@ -1161,7 +1156,9 @@ def get_dynamic_supports(symbol: str, fecha: Optional[date] = None,
     # lo que queremos mostrar ('red zone').  Dejar que _build_tier decida
     # ACTIVE / TESTING / BROKEN y que el usuario vea la linea.  Mid sigue
     # invalidandose porque es una diagonal tactica de corto plazo.
-    if mid_tl  and _tier_is_invalidated_by_trend(mid_tl,  rows): mid_tl  = None
+    # Regla Julian (2026-04-21): NO invalidar mid por tendencia reciente.
+    # El usuario quiere ver la trendline de soporte incluso cuando el precio
+    # la esta testeando / rompiendo — igual que el long.
 
     # Regla Julian (2026-04-15): una sola diagonal ascendente dominante.
     # Si mid comparte anchor1 con long (dentro de 8 bars por distinto pivot

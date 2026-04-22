@@ -143,7 +143,7 @@ export default function AssetDetail() {
       .catch(() => setChBreakdown(null))
 
     // Fetch dynamic supports (long/mid/short trendlines ascendentes en log-space)
-    api.dynamicSupports(accionId)
+    api.dynamicSupports(accionId, 'D')
       .then(setDynSupports)
       .catch(() => setDynSupports(null))
 
@@ -387,19 +387,8 @@ export default function AssetDetail() {
       }
       if (!tier.line_points.length) continue
       const pts = tier.line_points
-      const firstPt = pts[0]
-      const lastPt  = pts[pts.length - 1]
-      const firstTs = Date.parse(firstPt.fecha)
-      const lastTs  = Date.parse(lastPt.fecha)
-      const logFirst = Math.log(firstPt.value)
-      const logLast  = Math.log(lastPt.value)
-      const values = candleDates.map(d => {
-        const t = Date.parse(d)
-        if (t < firstTs || t > lastTs) return null
-        if (lastTs === firstTs) return firstPt.value
-        const frac = (t - firstTs) / (lastTs - firstTs)
-        return Math.exp(logFirst + frac * (logLast - logFirst))
-      })
+      const ptMap = new Map(pts.map((p: any) => [p.fecha, p.value]))
+      const values = candleDates.map(d => ptMap.get(d) ?? null)
       indicatorLines.push({
         dates:  candleDates,
         values,
@@ -436,19 +425,8 @@ export default function AssetDetail() {
       }
       if (!tier.line_points.length) continue
       const pts = tier.line_points
-      const firstPt = pts[0]
-      const lastPt  = pts[pts.length - 1]
-      const firstTs = Date.parse(firstPt.fecha)
-      const lastTs  = Date.parse(lastPt.fecha)
-      const logFirst = Math.log(firstPt.value)
-      const logLast  = Math.log(lastPt.value)
-      const values = candleDates.map(d => {
-        const t = Date.parse(d)
-        if (t < firstTs || t > lastTs) return null
-        if (lastTs === firstTs) return firstPt.value
-        const frac = (t - firstTs) / (lastTs - firstTs)
-        return Math.exp(logFirst + frac * (logLast - logFirst))
-      })
+      const ptMap = new Map(pts.map((p: any) => [p.fecha, p.value]))
+      const values = candleDates.map(d => ptMap.get(d) ?? null)
       indicatorLines.push({
         dates:  candleDates,
         values,
@@ -490,20 +468,7 @@ export default function AssetDetail() {
   }
   const utBotMarkers = showUtBot ? utBot.signals : []
 
-  // Touch-point dot layers: una capa por tier, cada una con su color
   const dotLayers: import('@/components/detail/PriceChart').DotMarker[][] = []
-  if (dynSupports && showDynSupports) {
-    const dotColors: Record<string, string> = { long: '#ff00ff', mid: '#ff8800', short: '#00ffff' }
-    for (const key of ['long', 'mid', 'short'] as const) {
-      if (!dynSupTiers[key]) continue
-      const tier = dynSupports[key]
-      if (!tier || typeof tier !== 'object' || !('touch_points' in tier)) continue
-      if (tier.kind === 'horizontal') continue
-      const tp = (tier as any).touch_points as { fecha: string; value: number }[] | undefined
-      if (!tp || !tp.length) continue
-      dotLayers.push(tp.map(pt => ({ fecha: pt.fecha, value: pt.value, color: dotColors[key] })))
-    }
-  }
   // Build historical low overlay lines (horizontal lines at 52w low / all-time low)
   if (hlSignal && hlSignal.setup_state !== 'NO_SIGNAL' && candles.length) {
     const dates = candles.map(c => c.fecha)
@@ -662,8 +627,8 @@ export default function AssetDetail() {
   const v2SupData = v2DynSup || dynSupports
   const v2ResData = v2DynRes || dynResistances
 
-  if (v2SupData && showDynSupports && candles.length) {
-    const cd = candles.map(c => c.fecha)
+  if (v2SupData && showDynSupports && chartCandles.length) {
+    const cd = chartCandles.map(c => c.fecha)
     const tiers: [keyof DynamicSupports, string, string][] = [
       ['long',  '#00e676', 'LP'],
       ['mid',   '#ffd54f', 'MP'],
@@ -678,13 +643,15 @@ export default function AssetDetail() {
         v2DynZones.push({ floor: tier.current_value, top: tier.zone_top, color, label: `Zona ${label}` })
         continue
       }
-      const a1v = tier.anchor1.value
-      const a2v = tier.anchor2.value
-      const a1idx = findBarIdx(cd, tier.anchor1.fecha)
-      const a2idx = findBarIdx(cd, tier.anchor2.fecha)
+      const pts = tier.line_points
+      if (!pts.length) continue
+      const firstPt = pts[0]
+      const lastPt  = pts[pts.length - 1]
+      const a1idx = findBarIdx(cd, firstPt.fecha)
+      const a2idx = findBarIdx(cd, lastPt.fecha)
       if (a2idx <= a1idx) continue
-      const lg1 = Math.log(a1v)
-      const lgS = (Math.log(a2v) - lg1) / (a2idx - a1idx)
+      const lg1 = Math.log(firstPt.value)
+      const lgS = (Math.log(lastPt.value) - lg1) / (a2idx - a1idx)
       v2DynLines.push({
         dates: cd,
         values: cd.map((_, i) => i < a1idx ? null : Math.exp(lg1 + lgS * (i - a1idx))),
@@ -694,8 +661,8 @@ export default function AssetDetail() {
     }
   }
 
-  if (v2ResData && showDynResistances && candles.length) {
-    const cd = candles.map(c => c.fecha)
+  if (v2ResData && showDynResistances && chartCandles.length) {
+    const cd = chartCandles.map(c => c.fecha)
     const tiers: [keyof DynamicResistances, string, string][] = [
       ['long',  '#ef4444', 'LP'],
       ['mid',   '#fb923c', 'MP'],
@@ -709,13 +676,15 @@ export default function AssetDetail() {
         v2DynZones.push({ floor: tier.zone_floor, top: tier.zone_ceiling, color, label: `Zona R ${label}` })
         continue
       }
-      const a1v = tier.anchor1.value
-      const a2v = tier.anchor2.value
-      const a1idx = findBarIdx(cd, tier.anchor1.fecha)
-      const a2idx = findBarIdx(cd, tier.anchor2.fecha)
+      const pts = tier.line_points
+      if (!pts.length) continue
+      const firstPt = pts[0]
+      const lastPt  = pts[pts.length - 1]
+      const a1idx = findBarIdx(cd, firstPt.fecha)
+      const a2idx = findBarIdx(cd, lastPt.fecha)
       if (a2idx <= a1idx) continue
-      const lg1 = Math.log(a1v)
-      const lgS = (Math.log(a2v) - lg1) / (a2idx - a1idx)
+      const lg1 = Math.log(firstPt.value)
+      const lgS = (Math.log(lastPt.value) - lg1) / (a2idx - a1idx)
       v2DynLines.push({
         dates: cd,
         values: cd.map((_, i) => i < a1idx ? null : Math.exp(lg1 + lgS * (i - a1idx))),
