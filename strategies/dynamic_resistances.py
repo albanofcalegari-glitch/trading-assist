@@ -40,7 +40,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -70,10 +70,9 @@ REGRESSION_TOL_PCT = 13.0
 # quedo atras. Para resistances el mirror: si el precio esta >50% DEBAJO de
 # la proyeccion (i.e. la linea quedo muy arriba), la resistencia ya no es
 # actionable. Misma tolerancia que supports — ajustar si Julian lo pide.
-LONG_MAX_BELOW_PROJECTION_PCT = 50.0
+LONG_MAX_BELOW_PROJECTION_PCT = 80.0
 
-# La linea no puede atravesar ningun cuerpo de vela. Tolerancia visual minima.
-NO_BODY_CROSS_TOL_PCT = 0.5
+NO_BODY_CROSS_TOL_PCT = 0.6
 
 # Sideways (lateralizacion): detectar TECHO horizontal en vez de piso.
 SIDEWAYS_WINDOW_BARS        = 10
@@ -113,12 +112,15 @@ def _load(symbol: str, tf: str, fecha_max: date) -> list[dict]:
 def _pivot_highs(highs: list[float], win: int, min_fwd: int = 3) -> list[int]:
     """
     Detecta pivots altos con ventana simetrica `win`. Espejo de _pivot_lows.
+    Near end-of-data, relaxes min_fwd to allow detecting the most recent bounce.
     """
     n = len(highs)
     out: list[int] = []
     for i in range(win, n):
         right = min(i + win + 1, n)
-        if right - i - 1 < min_fwd:
+        fwd = right - i - 1
+        eff_min_fwd = min_fwd if fwd >= min_fwd else max(1, fwd)
+        if fwd < eff_min_fwd:
             continue
         window = highs[i - win: right]
         if highs[i] == max(window):
@@ -163,20 +165,11 @@ def _fit_trendline_log(
     min_touches:    int = MIN_TOUCHES,
     strict_wick:    bool = True,
     max_span:       Optional[int] = None,
+    body_cross_tol: float = math.log(1 + NO_BODY_CROSS_TOL_PCT / 100),
 ) -> Optional[dict]:
     """
     Busca la mejor trendline DESCENDENTE (slope < 0) de resistencia.
-
-    `strict_wick=True`: touch cuenta solo si la trendline pasa cerca de la
-    MECHA superior (`highs[i]`) con tol — el approach clasico de unir puntas
-    de sombras superiores.
-    `strict_wick=False`: acepta tambien touches en el techo del cuerpo
-    (`body_highs[i]`).
-
-    `min_proj_ratio`: si la proyeccion en la ultima barra queda por debajo
-    de `last_px * min_proj_ratio`, la linea esta "atras" (mercado ya la
-    dejo muy abajo). Equivalente a `max_proj_ratio` en supports pero con
-    sentido invertido.
+    Mirror de _fit_trendline_log en dynamic_supports.py.
     """
     if len(pivots) < 2:
         return None
@@ -208,19 +201,18 @@ def _fit_trendline_log(
                 continue
 
             slope = (log_wick[j] - log_wick[i]) / span
-            if slope >= 0:  # descending only
+            if slope >= 0:
                 continue
             intercept = log_wick[i] - slope * i
+
+            if any(slope * k + intercept < log_body[k] - body_cross_tol for k in range(i, len(highs))):
+                continue
 
             if min_proj_ratio is not None:
                 proj_last = math.exp(slope * (N - 1) + intercept)
                 if proj_last < last_px * min_proj_ratio:
                     continue
 
-            # Obsolete post-anchor: pivot p > j con wick muy DEBAJO de la
-            # linea proyectada → el mercado rompio hacia abajo, la linea
-            # es historia. Solo aplica si el precio actual tambien sigue
-            # debajo de la linea (analogo al criterio de supports).
             obsolete = False
             gap_thr = math.log(1 + OBSOLETE_POST_ANCHOR_GAP_PCT / 100)
             proj_last_val = math.exp(slope * (N - 1) + intercept)
@@ -234,10 +226,6 @@ def _fit_trendline_log(
             if obsolete:
                 continue
 
-            # Hard: la linea no puede atravesar cuerpos en [anchor1, anchor2].
-            if _line_crosses_any_body(slope, intercept, log_body, i, j):
-                continue
-
             touches = 0
             violations = 0
             violations_post = 0
@@ -246,31 +234,22 @@ def _fit_trendline_log(
                 if p < i:
                     continue
                 trend_val = slope * p + intercept
-                hi = log_wick[p]        # techo: la mecha alta
-                lo = log_body[p]        # piso del rango de contacto: cuerpo
+                hi = log_wick[p]
+                lo = log_body[p]
                 if trend_val < lo - log_tol:
-                    # linea pasa por debajo del cuerpo — el close rompio por arriba
                     if p > j:
                         violations_post += 1
                     else:
                         violations += 1
-                elif strict_wick:
-                    if abs(trend_val - hi) <= log_tol:
-                        touches += 1
-                        touching.append(p)
                 elif trend_val <= hi + log_tol:
-                    # linea dentro de [body - tol, wick + tol] → toque
                     touches += 1
                     touching.append(p)
 
             if touches < min_touches:
                 continue
 
-            # Filtro "higher high missed": si existe un pivot p en (j-WINDOW, j)
-            # cuyo wick es MAS ALTO que el de anchor2 AND queda flotando muy
-            # DEBAJO de la linea, la linea deberia haber anclado en p.
-            HIGHER_HIGH_WINDOW = 60
-            HIGHER_HIGH_GAP = log_tol * 2
+            HIGHER_HIGH_WINDOW = min(60, max(10, int(span * 0.25)))
+            HIGHER_HIGH_GAP = log_tol * (2 + span / 80)
             skip_higher_high = False
             for p in pivots:
                 if p >= j or p <= j - HIGHER_HIGH_WINDOW or p < i:
@@ -279,6 +258,9 @@ def _fit_trendline_log(
                     skip_higher_high = True
                     break
             if skip_higher_high:
+                continue
+
+            if any(highs[k] > highs[j] * 1.005 for k in range(j + 1, len(highs))):
                 continue
 
             score = touches * 4.0 - violations * 10.0 - violations_post * 2.0 + span * 0.03
@@ -301,11 +283,10 @@ def _try_fit(
     **kwargs,
 ) -> Optional[dict]:
     """
-    Prueba regresion sobre cadenas de lower-highs + linea exacta strict/flexible,
-    se queda con el mejor score global.
+    Prueba recta exacta strict/flexible + regresion sobre cadenas de lower-highs,
+    se queda con el mejor score global. Fallback a 2 toques si no hay 3+.
     """
     exact_kwargs = {k: v for k, v in kwargs.items() if k != 'apply_obsolete'}
-    req_touches = kwargs.get('min_touches', MIN_TOUCHES)
 
     best: Optional[dict] = None
     def keep(cand: Optional[dict]) -> None:
@@ -316,11 +297,25 @@ def _try_fit(
             best = cand
 
     for piv in piv_lists:
-        if len(piv) < req_touches:
+        if len(piv) < MIN_TOUCHES:
             continue
-        keep(_fit_regression_log(highs, body_highs, piv, **kwargs))
         keep(_fit_trendline_log(highs, body_highs, piv, strict_wick=True,  **exact_kwargs))
         keep(_fit_trendline_log(highs, body_highs, piv, strict_wick=False, **exact_kwargs))
+        keep(_fit_regression_log(highs, body_highs, piv, **kwargs))
+
+    if best is not None:
+        best['fallback'] = False
+        return best
+
+    fallback_exact = {**exact_kwargs, 'min_touches': 2}
+    for piv in piv_lists:
+        if len(piv) < 2:
+            continue
+        keep(_fit_trendline_log(highs, body_highs, piv, strict_wick=True,  **fallback_exact))
+        keep(_fit_trendline_log(highs, body_highs, piv, strict_wick=False, **fallback_exact))
+
+    if best is not None:
+        best['fallback'] = True
     return best
 
 
@@ -349,9 +344,11 @@ def _fit_regression_log(
     min_touches:    int = MIN_TOUCHES,
     apply_obsolete: bool = True,
     max_span:       Optional[int] = None,
+    body_cross_tol: float = math.log(1 + NO_BODY_CROSS_TOL_PCT / 100),
 ) -> Optional[dict]:
     """
     Regresion lineal sobre cadenas de lower-highs en log-space.
+    Mirror de _fit_regression_log en dynamic_supports.py.
     """
     if len(pivots) < min_touches:
         return None
@@ -396,7 +393,7 @@ def _fit_regression_log(
         if den == 0:
             continue
         slope = num / den
-        if slope >= 0:  # descending only
+        if slope >= 0:
             continue
         intercept_reg = mean_y - slope * mean_x
 
@@ -408,13 +405,9 @@ def _fit_regression_log(
         if not chain_ok:
             continue
 
-        # Upper envelope: usar el slope de la regresion pero subir el intercept
-        # para que la linea pase por la mecha mas alta de la cadena. Asi la
-        # linea toca las puntas de las mechas superiores (como Julian dibuja
-        # en TradingView) en vez de flotar por el medio de los cuerpos.
-        intercept = max(log_wick[p] - slope * p for p in chain)
+        intercept = log_wick[i0] - slope * i0
 
-        if _line_crosses_any_body(slope, intercept, log_body, i0, i1):
+        if any(slope * k + intercept < log_body[k] - body_cross_tol for k in range(i0, len(highs))):
             continue
 
         if min_proj_ratio is not None:
@@ -438,15 +431,15 @@ def _fit_regression_log(
         for p in pivots:
             if p < i0 or p in chain_set:
                 continue
-            # violation: close rompio por arriba → body_high > line + tol
             if slope * p + intercept < log_body[p] - viol_tol:
                 if p > i1:
                     violations_post += 1
                 else:
                     violations += 1
 
-        HIGHER_HIGH_WINDOW = 60
-        HIGHER_HIGH_GAP = math.log(1 + PRICE_TOL_PCT / 100) * 2
+        reg_span = i1 - i0
+        HIGHER_HIGH_WINDOW = min(60, max(10, int(reg_span * 0.25)))
+        HIGHER_HIGH_GAP = math.log(1 + PRICE_TOL_PCT / 100) * (2 + reg_span / 80)
         skip_higher_high = False
         for p in pivots:
             if p >= i1 or p <= i1 - HIGHER_HIGH_WINDOW or p < i0:
@@ -455,6 +448,9 @@ def _fit_regression_log(
                 skip_higher_high = True
                 break
         if skip_higher_high:
+            continue
+
+        if any(highs[k] > highs[i1] * 1.005 for k in range(i1 + 1, len(highs))):
             continue
 
         touches = len(chain)
@@ -573,22 +569,22 @@ def _slope_annual_pct(slope_per_bar: float, tf: str) -> float:
     return (math.exp(slope_per_bar * bars_per_year) - 1) * 100
 
 
+INVALIDATE_MIN_RECOVERY_PCT = 40.0
+
 def _tier_is_invalidated_by_trend(tl: dict, rows: list[dict]) -> bool:
     """
-    Si el precio reciente viene SUBIENDO y estamos cerca de la resistencia por
-    arriba (ya la rompio y sigue subiendo), la "resistencia" ya no es
-    resistencia. Espejo del mismo concepto en supports (ahi se aplica cuando
-    el precio viene BAJANDO y la rompe por abajo).
+    Invalida si: precio arriba de la linea, tendencia reciente alcista, Y el
+    precio recupero >40% de la caida desde anchor1. Esto evita invalidar
+    resistencias que el precio apenas cruza (ej OKLO 12% above pero solo
+    14% de recovery) mientras invalida las que claramente se rompieron
+    (ej GOOGL 84% recovery).
     """
     n = len(rows)
     last_close   = float(rows[-1]['close'])
     current_val  = math.exp(tl['slope'] * (n - 1) + tl['intercept'])
     distance_pct = (last_close / current_val - 1) * 100
 
-    # Solo aplica cuando el precio esta ARRIBA de la linea y a menos del
-    # threshold de distancia. Si esta debajo con slope positivo todavia no
-    # rompio — mostrar la linea.
-    if distance_pct <= 0 or distance_pct >= INVALIDATE_MAX_DIST_PCT:
+    if distance_pct <= 0:
         return False
 
     closes = [float(r['close']) for r in rows[-INVALIDATE_RECENT_BARS:]]
@@ -607,7 +603,16 @@ def _tier_is_invalidated_by_trend(tl: dict, rows: list[dict]) -> bool:
     if den == 0:
         return False
     slope_recent = num / den
-    return slope_recent > 0
+    if slope_recent <= 0:
+        return False
+
+    i0 = tl['anchors'][0]
+    anchor1_price = float(rows[i0]['high'])
+    trough = min(float(r['close']) for r in rows[i0:])
+    if anchor1_price <= trough:
+        return False
+    recovery_pct = (last_close - trough) / (anchor1_price - trough) * 100
+    return recovery_pct > INVALIDATE_MIN_RECOVERY_PCT
 
 
 # ── Dominant-high rescue ────────────────────────────────────────────────────
@@ -668,7 +673,7 @@ def _try_dominant_high_rescue(
             continue
         intercept = log_hi_imax - slope * imax
 
-        if _line_crosses_any_body(slope, intercept, log_body, imax, p2):
+        if _line_crosses_any_body(slope, intercept, log_wick, imax, p2):
             continue
 
         obsolete = False
@@ -719,15 +724,31 @@ def _build_tier(
     """
     n = len(rows)
     slope = tl['slope']
-    intercept = tl['intercept']
     i0, i1 = tl['anchors']
     highs = [float(r['high']) for r in rows]
+
+    intercept = math.log(highs[i0]) - slope * i0
 
     line_points = []
     for x in range(i0, n):
         y = math.exp(slope * x + intercept)
+        if x > i1 and y < float(rows[x]['high']):
+            break
         line_points.append({
             'fecha': rows[x]['fecha'].isoformat(),
+            'value': round(y, 4),
+        })
+
+    projection_bars = 8 if tf == 'W' else 40
+    bar_days = 7 if tf == 'W' else 1
+    last_date = rows[-1]['fecha']
+    last_x = n - 1
+    for extra in range(1, projection_bars + 1):
+        x = last_x + extra
+        y = math.exp(slope * x + intercept)
+        proj_date = last_date + timedelta(days=bar_days * extra)
+        line_points.append({
+            'fecha': proj_date.isoformat(),
             'value': round(y, 4),
         })
 
@@ -837,16 +858,14 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
     piv_short = _pivot_highs(highs, 3)
 
     bars_per_year_tf = {'W': 52, 'D': 252, 'M': 12}.get(tf, 252)
-    long_max_span = min(5 * bars_per_year_tf, int(n * 0.90))
+    long_max_span = min(20 * bars_per_year_tf, int(n * 0.90))
     piv_combined = sorted(set(piv_long + piv_mid))
 
     # ── long (rojo): diagonal del bear market vigente ────────────────────────
-    # Espejo de "rally start": el "decline start" = el pivot mas antiguo en el
-    # rango reciente tal que TODOS los pivots posteriores tienen high <= su
-    # high. Es el inicio del bear vigente (el precio nunca rompio por encima
-    # desde entonces).
-    anchor1_lo_idx = max(int(0.30 * (n - 1)), n - long_max_span)
+    anchor1_lo_frac = 0.05 if n < long_max_span * 1.2 else 0.10
+    anchor1_lo_idx = max(int(anchor1_lo_frac * (n - 1)), n - long_max_span)
     anchor1_hi_idx = int(0.98 * (n - 1))
+    long_a2_min = 0.70 if n < 2000 else 0.85
     decline_candidates = []
     for k, p in enumerate(piv_combined):
         if not (anchor1_lo_idx <= p <= anchor1_hi_idx):
@@ -855,21 +874,17 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
         if not later_highs or max(later_highs) <= highs[p]:
             decline_candidates.append(p)
 
-    # min_proj_ratio=0.67 rechaza si la proyeccion queda >50% debajo de last_px
-    # (la linea quedo muy arriba y el mercado ya no la alcanza). Mirror de
-    # max_proj_ratio=1.5 en supports.
     long_tl = _try_fit(
         highs, body_highs, [piv_long, piv_mid, piv_combined],
         min_span=span_mid, tol_pct=PRICE_TOL_PCT,
-        anchor1_range=(0.30, 0.98),
-        anchor2_min=0.85,
+        anchor1_range=(anchor1_lo_frac, 0.98),
+        anchor2_min=long_a2_min,
         max_span=long_max_span,
         min_proj_ratio=1.0 / 1.5,
         n_total=n, apply_obsolete=True,
     )
 
-    if decline_candidates:
-        decline_start_idx = decline_candidates[0]
+    for decline_start_idx in decline_candidates:
         piv_long_r     = [p for p in piv_long     if p >= decline_start_idx]
         piv_mid_r      = [p for p in piv_mid      if p >= decline_start_idx]
         piv_combined_r = [p for p in piv_combined if p >= decline_start_idx]
@@ -879,18 +894,19 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
             highs, body_highs, [piv_long_r, piv_mid_r, piv_combined_r],
             min_span=span_mid, tol_pct=PRICE_TOL_PCT,
             anchor1_range=anchor1_range_lock,
-            anchor2_min=0.85,
+            anchor2_min=long_a2_min,
             max_span=long_max_span,
             min_proj_ratio=1.0 / 1.5,
             n_total=n, apply_obsolete=True,
         )
         if long_tl_locked is not None:
             long_tl = long_tl_locked
+            break
 
     rescue_long = _try_dominant_high_rescue(
         highs, body_highs, sorted(set(piv_long + piv_mid)),
-        min_span=span_mid, max_span=long_max_span,
-        anchor1_range=(0.30, 0.98), anchor2_min=0.85,
+        min_span=span_short, max_span=long_max_span,
+        anchor1_range=(anchor1_lo_frac, 0.98), anchor2_min=long_a2_min,
         n_total=n, tol_pct=PRICE_TOL_PCT,
     )
     if rescue_long is not None:
@@ -903,11 +919,19 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
                 long_tl = rescue_long
 
     # ── mid (naranja): diagonal descendente mas reciente ─────────────────────
+    if long_tl is not None:
+        long_i1 = long_tl['anchors'][1]
+        if long_i1 > n * 0.90:
+            mid_a1_lo = max(0.70, 1.0 - 500 / max(n, 1))
+        else:
+            mid_a1_lo = max(0.75, (long_i1 + (n - 1 - long_i1) * 0.3) / (n - 1))
+    else:
+        mid_a1_lo = 0.75
     mid_tl = _try_fit(
         highs, body_highs, [piv_mid, piv_short],
         min_span=span_short, tol_pct=PRICE_TOL_PCT,
-        anchor1_range=(0.80, 0.98),
-        anchor2_min=0.97,
+        anchor1_range=(mid_a1_lo, 0.98),
+        anchor2_min=0.90,
         n_total=n, apply_obsolete=False,
     )
 
@@ -920,7 +944,7 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
         highs, body_highs, [piv_short, piv_mid, piv_combined],
         min_span=span_short, tol_pct=PRICE_TOL_PCT,
         anchor1_range=(0.95, 0.998),
-        anchor2_min=0.99,
+        anchor2_min=0.985,
         min_touches=2,
         n_total=n, apply_obsolete=False,
     )
@@ -938,14 +962,36 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
         if dist_pct < -LONG_MAX_BELOW_PROJECTION_PCT:
             long_tl = None
 
-    if mid_tl and _tier_is_invalidated_by_trend(mid_tl, rows):
-        mid_tl = None
-
     # Evitar redundancia: si mid comparte anchor1 con long (dentro de 8 bars),
     # dropear mid.
     if long_tl is not None and mid_tl is not None:
         if abs(mid_tl['anchors'][0] - long_tl['anchors'][0]) <= 8:
             mid_tl = None
+
+    # Reclasificar: si long tiene span corto (<80 bars ~1.5y) y mid es None,
+    # es una resistencia de mediano plazo, no estructural → mover a mid.
+    if long_tl is not None and mid_tl is None:
+        long_span = long_tl['anchors'][1] - long_tl['anchors'][0]
+        if long_span < min_span_long * 2:
+            mid_tl = long_tl
+            long_tl = None
+
+    if mid_tl is not None and short_tl is not None:
+        if abs(short_tl['anchors'][0] - mid_tl['anchors'][0]) <= 8:
+            short_tl = None
+
+    if long_tl is not None and short_tl is not None:
+        if abs(short_tl['anchors'][0] - long_tl['anchors'][0]) <= 8:
+            short_tl = None
+
+    # Invalidar tiers donde el precio rompio la resistencia y la tendencia
+    # reciente es alcista (la resistencia dejo de ser valida).
+    if long_tl is not None and _tier_is_invalidated_by_trend(long_tl, rows):
+        long_tl = None
+    if mid_tl is not None and _tier_is_invalidated_by_trend(mid_tl, rows):
+        mid_tl = None
+    if short_tl is not None and _tier_is_invalidated_by_trend(short_tl, rows):
+        short_tl = None
 
     result = {
         'symbol':         symbol,
@@ -956,6 +1002,11 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
         'mid':   _build_tier(mid_tl,   rows, tf) if mid_tl   else None,
         'short': _build_tier(short_tl, rows, tf) if short_tl else None,
     }
+
+    MAX_BROKEN_DIST_PCT = 15.0
+    for k in ('long', 'mid', 'short'):
+        if result[k] is not None and result[k]['distance_pct'] > MAX_BROKEN_DIST_PCT:
+            result[k] = None
 
     # Fallback W→D: si algun tier quedo None en semanal, intentar en diario.
     if tf == 'W' and any(result[k] is None for k in ('long', 'mid', 'short')):

@@ -10,6 +10,7 @@ import Alerts      from '@/pages/Alerts'
 import Watchlist   from '@/pages/Watchlist'
 import Movimientos from '@/pages/Movimientos'
 import Settings    from '@/pages/Settings'
+import ElliottPage from '@/pages/ElliottPage'
 import Login       from '@/pages/Login'
 
 function ProtectedRoutes() {
@@ -25,6 +26,7 @@ function ProtectedRoutes() {
         <Route path="/screener" element={<Screener />} />
         <Route path="/alerts" element={<Alerts />} />
         <Route path="/watchlist" element={<Watchlist />} />
+        <Route path="/elliott" element={<ElliottPage />} />
         {username === 'albano' && (
           <Route path="/movimientos" element={<Movimientos />} />
         )}

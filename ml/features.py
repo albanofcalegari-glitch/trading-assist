@@ -14,6 +14,7 @@ from typing import Optional
 
 from db.connection import get_conn
 from strategies.dynamic_supports import get_dynamic_supports
+from strategies.dynamic_resistances import get_dynamic_resistances
 
 
 # ── Resolución de accion_id (cache simple, hay duplicados en `accion`) ───────
@@ -24,6 +25,7 @@ _ACCION_ID_CACHE: dict[str, Optional[int]] = {}
 # pivots, cambian poco dentro de la misma semana calendario. Reduce las
 # llamadas al backfill (29k rows) de ~200ms cada una a <5ms en cache-hit.
 _DYN_SUPPORTS_CACHE: dict[tuple[str, date], dict] = {}
+_DYN_RESISTANCES_CACHE: dict[tuple[str, date], dict] = {}
 
 
 def _week_key(fecha: date) -> date:
@@ -37,6 +39,15 @@ def _get_dyn_supports_cached(symbol: str, fecha: date) -> dict:
     if r is None:
         r = get_dynamic_supports(symbol, fecha)
         _DYN_SUPPORTS_CACHE[key] = r
+    return r
+
+
+def _get_dyn_resistances_cached(symbol: str, fecha: date) -> dict:
+    key = (symbol, _week_key(fecha))
+    r = _DYN_RESISTANCES_CACHE.get(key)
+    if r is None:
+        r = get_dynamic_resistances(symbol, fecha)
+        _DYN_RESISTANCES_CACHE[key] = r
     return r
 
 
@@ -193,6 +204,39 @@ def extract_features(cur, symbol: str, fecha: date) -> Optional[dict]:
     except Exception:
         pass
 
+    # ── Dynamic resistances (3 tiers: long/mid/short) ──────────────────────────
+    has_res_long = 0
+    res_long_dist_pct: Optional[float] = None
+    has_res_mid = 0
+    res_mid_dist_pct: Optional[float] = None
+    res_mid_slope: Optional[float] = None
+    has_res_short = 0
+    res_short_dist_pct: Optional[float] = None
+    try:
+        dres = _get_dyn_resistances_cached(symbol, fecha)
+        for tier_key, setter in [
+            ('long',  lambda t: None),
+            ('mid',   lambda t: None),
+            ('short', lambda t: None),
+        ]:
+            tier = dres.get(tier_key)
+            if tier is not None:
+                cv = float(tier.get('current_value') or 0)
+                if cv > 0 and price > 0:
+                    dist = round((price / cv - 1) * 100, 3)
+                    if tier_key == 'long':
+                        has_res_long = 1
+                        res_long_dist_pct = dist
+                    elif tier_key == 'mid':
+                        has_res_mid = 1
+                        res_mid_dist_pct = dist
+                        res_mid_slope = float(tier.get('slope_annual_pct', 0))
+                    else:
+                        has_res_short = 1
+                        res_short_dist_pct = dist
+    except Exception:
+        pass
+
     # ── Distancia al ATH (all-time-high) ──────────────────────────────────────
     # dist_to_ath_pct: (price/ath - 1) * 100 — típicamente negativo (precio debajo de ATH).
     dist_to_ath_pct: Optional[float] = None
@@ -221,6 +265,14 @@ def extract_features(cur, symbol: str, fecha: date) -> Optional[dict]:
         'has_dyn_short':        has_dyn_short,
         'dyn_short_dist_pct':   dyn_short_dist_pct,
         'dist_to_ath_pct':      dist_to_ath_pct,
+        # dynamic_resistances (2026-04-23)
+        'has_res_long':         has_res_long,
+        'res_long_dist_pct':    res_long_dist_pct,
+        'has_res_mid':          has_res_mid,
+        'res_mid_dist_pct':     res_mid_dist_pct,
+        'res_mid_slope':        res_mid_slope,
+        'has_res_short':        has_res_short,
+        'res_short_dist_pct':   res_short_dist_pct,
         # macro
         'market_regime':  int(macro['market_regime']) if macro.get('market_regime') is not None else None,
         'vix_percentile': round(float(macro['vix_percentile_1y']), 4) if macro.get('vix_percentile_1y') is not None else None,

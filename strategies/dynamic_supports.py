@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -81,9 +81,9 @@ LONG_MAX_ABOVE_PROJECTION_PCT = 80.0
 # Constraint: para TODA barra k en [anchor1, N-1], la linea tiene que estar
 # por debajo (o justo en) body_low[k] + NO_BODY_CROSS_TOL_PCT.  Si la linea
 # queda arriba del body_low de aunque sea 1 vela, se descarta.  Tolerancia
-# minima porque es visual: en log-scale una linea 0.5% arriba del cuerpo
+# minima porque es visual: en log-scale una linea 0.6% arriba del cuerpo
 # todavia no se percibe como "cortando", pero mas que eso ya se nota.
-NO_BODY_CROSS_TOL_PCT = 1.0
+NO_BODY_CROSS_TOL_PCT = 0.6
 
 # Regla Julian (2026-04-14, revisada): detectar lateralizacion reciente y trazar
 # soporte horizontal como ZONA.  El approach anterior (ultimos 3 pivots) fallaba
@@ -199,7 +199,7 @@ def _fit_trendline_log(
     min_touches:    int = MIN_TOUCHES,
     strict_wick:    bool = True,
     max_span:       Optional[int] = None,
-    body_cross_tol: float = 0.006,
+    body_cross_tol: float = math.log(1 + NO_BODY_CROSS_TOL_PCT / 100),
 ) -> Optional[dict]:
     """
     Busca la mejor trendline ASCENDENTE (slope > 0) de soporte.
@@ -446,7 +446,7 @@ def _fit_regression_log(
     min_touches:    int = MIN_TOUCHES,
     apply_obsolete: bool = True,
     max_span:       Optional[int] = None,
-    body_cross_tol: float = 0.006,
+    body_cross_tol: float = math.log(1 + NO_BODY_CROSS_TOL_PCT / 100),
 ) -> Optional[dict]:
     """
     Busca la mejor trendline por regresion lineal sobre cadenas de higher lows.
@@ -897,6 +897,18 @@ def _build_tier(
         y = math.exp(slope * x + intercept)
         line_points.append({
             'fecha': rows[x]['fecha'].isoformat(),
+            'value': round(y, 4),
+        })
+
+    projection_bars = 8 if tf == 'W' else 40
+    bar_days = 7 if tf == 'W' else 1
+    last_date = rows[-1]['fecha']
+    for extra in range(1, projection_bars + 1):
+        x = n - 1 + extra
+        y = math.exp(slope * x + intercept)
+        proj_date = last_date + timedelta(days=bar_days * extra)
+        line_points.append({
+            'fecha': proj_date.isoformat(),
             'value': round(y, 4),
         })
 

@@ -39,6 +39,14 @@ FEATURE_COLS: list[str] = [
     'has_dyn_short',
     'dyn_short_dist_pct',
     'dist_to_ath_pct',
+    # dynamic_resistances (2026-04-23)
+    'has_res_long',
+    'res_long_dist_pct',
+    'has_res_mid',
+    'res_mid_dist_pct',
+    'res_mid_slope',
+    'has_res_short',
+    'res_short_dist_pct',
 ]
 
 LABEL_COL = 'label_5d_strong'

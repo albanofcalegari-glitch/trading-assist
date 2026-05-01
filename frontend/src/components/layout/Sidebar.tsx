@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { NavLink, Link } from 'react-router-dom'
 import {
   LayoutDashboard, ScanLine, Bell, Settings, TrendingUp, X,
-  ChevronsLeft, ChevronsRight, Star, BookOpen,
+  ChevronsLeft, ChevronsRight, Star, BookOpen, Activity,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -12,6 +12,7 @@ const BASE_NAV = [
   { to: '/screener',  icon: ScanLine,         label: 'Screener' },
   { to: '/alerts',    icon: Bell,             label: 'Alertas' },
   { to: '/watchlist', icon: Star,             label: 'Watchlist' },
+  { to: '/elliott',   icon: Activity,         label: 'Elliott Wave' },
 ]
 
 const MOVIMIENTOS_ITEM = {

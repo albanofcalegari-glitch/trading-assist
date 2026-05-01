@@ -86,6 +86,18 @@ _utbot_cache: dict = {}          # (symbol, sensitivity, atr_period) → {'data'
 _utbot_lock = threading.Lock()
 _UTBOT_TTL  = 3600               # 1 hora
 
+# ── Caché para pivots ─────────────────────────────────────────────────────────
+
+_pivots_cache: dict = {}         # "symbol_tf" → {'data': dict, 'ts': float}
+_pivots_lock = threading.Lock()
+_PIVOTS_TTL  = 3600              # 1 hora
+
+# ── Caché para elliott ────────────────────────────────────────────────────────
+
+_elliott_cache: dict = {}        # symbol → {'data': dict, 'ts': float}
+_elliott_lock = threading.Lock()
+_ELLIOTT_TTL  = 1800             # 30 minutos
+
 # ── Optionals ──────────────────────────────────────────────────────────────────
 try:
     from flask import Flask, jsonify, request
@@ -1335,6 +1347,81 @@ def get_dynamic_supports_endpoint(accion_id: int):
 
     with _dynsup_lock:
         _dynsup_cache[cache_key] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/assets/<id>/pivots ──────────────────────────────────────────────────
+#
+# Devuelve pivot lows y pivot highs detectados sobre el OHLCV del simbolo.
+# Son los mismos pivots que usa el algoritmo de soportes/resistencias dinamicas.
+
+@app.route('/api/assets/<int:accion_id>/pivots')
+def get_pivots_endpoint(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+    tf = (request.args.get('tf') or 'W').strip().upper()
+    if tf not in ('D', 'W'):
+        tf = 'W'
+
+    cache_key = f"{symbol}_{tf}"
+    with _pivots_lock:
+        entry = _pivots_cache.get(cache_key)
+        if entry and (time.time() - entry['ts']) < _PIVOTS_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT fecha, open, high, low, close
+                       FROM ohlcv_extended
+                       WHERE simbolo = %s AND timeframe = %s
+                       ORDER BY fecha ASC""",
+                    (symbol, tf),
+                )
+                rows = cur.fetchall()
+
+        if not rows or len(rows) < 20:
+            result = {'symbol': symbol, 'tf': tf, 'pivot_lows': [], 'pivot_highs': []}
+        else:
+            from strategies.dynamic_supports import _pivot_lows, PIVOT_WIN_W, PIVOT_WIN_W_SML
+            from strategies.dynamic_resistances import _pivot_highs
+
+            lows  = [float(r['low'])  for r in rows]
+            highs = [float(r['high']) for r in rows]
+            base_win = PIVOT_WIN_W if len(rows) >= 400 else PIVOT_WIN_W_SML
+            win = int(base_win * 2.5) if tf == 'D' else base_win
+
+            low_idxs  = _pivot_lows(lows, win)
+            high_idxs = _pivot_highs(highs, win)
+
+            pivot_lows = [
+                {'fecha': str(rows[i]['fecha']), 'value': round(lows[i], 4)}
+                for i in low_idxs
+            ]
+            pivot_highs = [
+                {'fecha': str(rows[i]['fecha']), 'value': round(highs[i], 4)}
+                for i in high_idxs
+            ]
+            result = {
+                'symbol': symbol,
+                'tf': tf,
+                'pivot_lows': pivot_lows,
+                'pivot_highs': pivot_highs,
+            }
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _pivots_lock:
+        _pivots_cache[cache_key] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 
@@ -2943,6 +3030,99 @@ def get_sr_v2_endpoint(accion_id: int):
 
     with _srv2_lock:
         _srv2_cache[symbol] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/assets/<id>/elliott ──────────────────────────────────────────────────
+#
+# Análisis de Ondas de Elliott sobre un activo individual.
+
+@app.route('/api/assets/<int:accion_id>/elliott')
+def get_elliott(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _elliott_lock:
+        entry = _elliott_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _ELLIOTT_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        from strategies.elliott import analyze_elliott
+        result = analyze_elliott(symbol, datetime.date.today())
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _elliott_lock:
+        _elliott_cache[symbol] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/scan/elliott ────────────────────────────────────────────────────────
+#
+# Scan masivo de Elliott sobre el universo activo.  Devuelve resumen por activo.
+
+_elliott_scan_cache: dict = {}
+_elliott_scan_lock = threading.Lock()
+_ELLIOTT_SCAN_TTL = 1800
+
+@app.route('/api/scan/elliott')
+def scan_elliott():
+    market = request.args.get('market', 'USA')
+
+    with _elliott_scan_lock:
+        entry = _elliott_scan_cache.get(market)
+        if entry and (time.time() - entry['ts']) < _ELLIOTT_SCAN_TTL:
+            return _jresp(entry['data'])
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            if market == 'BYMA':
+                cur.execute(
+                    "SELECT id, simbolo, nombre FROM accion WHERE activo = 1 AND simbolo LIKE '%%.BA' ORDER BY simbolo"
+                )
+            else:
+                cur.execute(
+                    "SELECT id, simbolo, nombre FROM accion WHERE activo = 1 AND simbolo NOT LIKE '%%.BA' ORDER BY simbolo"
+                )
+            assets = cur.fetchall()
+
+    from strategies.elliott import analyze_elliott
+    items = []
+    fecha = datetime.date.today()
+
+    for asset in assets:
+        try:
+            res = analyze_elliott(asset['simbolo'], fecha)
+            if res.get('signal') in ('BUY', 'SELL') and res.get('rules_valid'):
+                items.append({
+                    'accion_id': asset['id'],
+                    'simbolo': asset['simbolo'],
+                    'nombre': asset['nombre'],
+                    'signal': res['signal'],
+                    'current_wave': res['current_wave'],
+                    'current_wave_label': res.get('current_wave_label', ''),
+                    'confidence': res['confidence'],
+                    'direction': res.get('direction', ''),
+                    'price': res.get('price', 0),
+                })
+        except Exception:
+            pass
+
+    items.sort(key=lambda x: (-x['confidence'], x['simbolo']))
+    result = {'items': items, 'fecha': str(fecha), 'market': market}
+
+    with _elliott_scan_lock:
+        _elliott_scan_cache[market] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 

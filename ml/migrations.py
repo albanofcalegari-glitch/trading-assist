@@ -73,6 +73,14 @@ _EXTRA_COLUMNS = [
     ('has_dyn_short',      "TINYINT       DEFAULT NULL"),
     ('dyn_short_dist_pct', "DECIMAL(7,3)  DEFAULT NULL"),
     ('dist_to_ath_pct',    "DECIMAL(8,3)  DEFAULT NULL"),
+    # dynamic_resistances (2026-04-23)
+    ('has_res_long',       "TINYINT       DEFAULT NULL"),
+    ('res_long_dist_pct',  "DECIMAL(8,3)  DEFAULT NULL"),
+    ('has_res_mid',        "TINYINT       DEFAULT NULL"),
+    ('res_mid_dist_pct',   "DECIMAL(8,3)  DEFAULT NULL"),
+    ('res_mid_slope',      "DECIMAL(8,3)  DEFAULT NULL"),
+    ('has_res_short',      "TINYINT       DEFAULT NULL"),
+    ('res_short_dist_pct', "DECIMAL(8,3)  DEFAULT NULL"),
 ]
 
 

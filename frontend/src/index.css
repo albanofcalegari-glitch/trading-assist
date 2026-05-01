@@ -47,7 +47,7 @@
 
   --c-text-primary:    15 23 42;        /* slate-900 */
   --c-text-secondary:  71 85 105;       /* slate-600 */
-  --c-text-muted:      148 163 184;     /* slate-400 */
+  --c-text-muted:      100 116 139;     /* slate-500 — mejor contraste sobre blanco */
 
   --c-accent:          59 102 214;      /* un poco más oscuro para contraste */
   --c-accent-hover:    37 78 184;

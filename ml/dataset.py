@@ -81,6 +81,9 @@ INSERT INTO ml_signals (
     atr14_rel, vs_52w_high, rs_sector, pullback_score,
     dist_to_support, dist_to_resistance,
     has_dyn_short, dyn_short_dist_pct, dist_to_ath_pct,
+    has_res_long, res_long_dist_pct,
+    has_res_mid, res_mid_dist_pct, res_mid_slope,
+    has_res_short, res_short_dist_pct,
     market_regime, vix_percentile, spy_return_20d,
     return_1d, return_5d, return_10d, max_drawdown_5d, label_5d_strong
 ) VALUES (
@@ -90,6 +93,9 @@ INSERT INTO ml_signals (
     %(atr14_rel)s, %(vs_52w_high)s, %(rs_sector)s, %(pullback_score)s,
     %(dist_to_support)s, %(dist_to_resistance)s,
     %(has_dyn_short)s, %(dyn_short_dist_pct)s, %(dist_to_ath_pct)s,
+    %(has_res_long)s, %(res_long_dist_pct)s,
+    %(has_res_mid)s, %(res_mid_dist_pct)s, %(res_mid_slope)s,
+    %(has_res_short)s, %(res_short_dist_pct)s,
     %(market_regime)s, %(vix_percentile)s, %(spy_return_20d)s,
     %(return_1d)s, %(return_5d)s, %(return_10d)s, %(max_drawdown_5d)s, %(label_5d_strong)s
 )
@@ -105,6 +111,13 @@ ON DUPLICATE KEY UPDATE
     has_dyn_short=VALUES(has_dyn_short),
     dyn_short_dist_pct=VALUES(dyn_short_dist_pct),
     dist_to_ath_pct=VALUES(dist_to_ath_pct),
+    has_res_long=VALUES(has_res_long),
+    res_long_dist_pct=VALUES(res_long_dist_pct),
+    has_res_mid=VALUES(has_res_mid),
+    res_mid_dist_pct=VALUES(res_mid_dist_pct),
+    res_mid_slope=VALUES(res_mid_slope),
+    has_res_short=VALUES(has_res_short),
+    res_short_dist_pct=VALUES(res_short_dist_pct),
     market_regime=VALUES(market_regime), vix_percentile=VALUES(vix_percentile),
     spy_return_20d=VALUES(spy_return_20d),
     return_1d=VALUES(return_1d), return_5d=VALUES(return_5d), return_10d=VALUES(return_10d),

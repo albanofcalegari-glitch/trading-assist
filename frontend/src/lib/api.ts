@@ -286,6 +286,13 @@ export interface UtBotSignal {
   price: number
 }
 
+export interface PivotsResponse {
+  symbol:      string
+  tf:          string
+  pivot_lows:  { fecha: string; value: number }[]
+  pivot_highs: { fecha: string; value: number }[]
+}
+
 export interface UtBotResponse {
   symbol:       string
   sensitivity:  number
@@ -660,6 +667,53 @@ export interface WmaCrossItem {
   slope?:    number
 }
 
+// ── Elliott Wave types ─────────────────────────────────────────────────────────
+
+export interface ElliottWavePoint {
+  label:     string
+  fecha:     string
+  price:     number
+  bar_index: number
+}
+
+export interface ElliottFibLevel {
+  label: string
+  price: number
+  ratio: string
+}
+
+export interface ElliottResult {
+  symbol:              string
+  fecha:               string
+  wave_count:          ElliottWavePoint[]
+  current_wave:        string
+  current_wave_label:  string
+  signal:              'BUY' | 'SELL' | 'HOLD'
+  signal_reason:       string
+  confidence:          number
+  rules_valid:         boolean
+  rules_detail?:       Record<string, boolean>
+  fib_targets:         ElliottFibLevel[]
+  fib_levels:          ElliottFibLevel[]
+  zigzag_pivots:       { fecha: string; price: number; type: 'high' | 'low' }[]
+  bullish:             boolean
+  direction:           string
+  price?:              number
+  error?:              string
+}
+
+export interface ElliottScanItem {
+  accion_id:          number
+  simbolo:            string
+  nombre:             string
+  signal:             string
+  current_wave:       string
+  current_wave_label: string
+  confidence:         number
+  direction:          string
+  price:              number
+}
+
 // ── Endpoints ──────────────────────────────────────────────────────────────────
 
 export const api = {
@@ -699,6 +753,9 @@ export const api = {
 
   dynamicResistances: (id: number, tf?: 'D' | 'W') =>
     get<DynamicResistances>(`/assets/${id}/dynamic-resistances${tf ? `?tf=${tf}` : ''}`),
+
+  pivots: (id: number, tf: 'D' | 'W' = 'W') =>
+    get<PivotsResponse>(`/assets/${id}/pivots?tf=${tf}`),
 
   utBot: (id: number, sensitivity?: number, atrPeriod?: number) => {
     const qs = new URLSearchParams()
@@ -754,6 +811,14 @@ export const api = {
 
   srV2: (id: number) =>
     get<SRV2Result>(`/assets/${id}/sr-v2`),
+
+  elliott: (id: number) =>
+    get<ElliottResult>(`/assets/${id}/elliott`),
+
+  elliottScan: (market = 'USA') =>
+    get<{ items: ElliottScanItem[]; fecha: string; market: string }>(
+      `/scan/elliott?market=${market}`
+    ),
 }
 
 export async function addWatchlist(input: WatchlistInput) {

@@ -15,7 +15,7 @@ interface IndicatorLine {
 
 export interface ChartMarker {
   fecha: string
-  kind:  'BUY' | 'SELL'
+  kind:  'BUY' | 'SELL' | 'PIVOT_LOW' | 'PIVOT_HIGH'
   price: number
 }
 
@@ -566,10 +566,34 @@ export default function PriceChart({
       for (const d of sortedDates) if (d >= fecha) return d
       return null
     }
+    const seen = new Set<string>()
     const out = markers
       .map(m => {
         const time = snap(m.fecha)
         if (!time) return null
+        const key = `${time}_${m.kind}`
+        if (seen.has(key)) return null
+        seen.add(key)
+        if (m.kind === 'PIVOT_LOW') {
+          return {
+            time: time as any,
+            position: 'belowBar' as const,
+            color: '#00e676',
+            shape: 'circle' as const,
+            text: m.price.toFixed(2),
+            size: 0.5,
+          }
+        }
+        if (m.kind === 'PIVOT_HIGH') {
+          return {
+            time: time as any,
+            position: 'aboveBar' as const,
+            color: '#ff1744',
+            shape: 'circle' as const,
+            text: m.price.toFixed(2),
+            size: 0.5,
+          }
+        }
         return {
           time: time as any,
           position: (m.kind === 'BUY' ? 'belowBar' : 'aboveBar') as 'belowBar' | 'aboveBar',
@@ -580,7 +604,6 @@ export default function PriceChart({
         }
       })
       .filter(Boolean) as any[]
-    // lightweight-charts pide markers ordenados por tiempo
     out.sort((a, b) => (a.time < b.time ? -1 : 1))
     cs.setMarkers(out)
   }, [markers, candles, freq])
@@ -603,13 +626,15 @@ export default function PriceChart({
         pool[i].setData([])
         continue
       }
-      const mapped: { time: any; value: number }[] = []
+      const seen = new Map<string, number>()
       for (const dm of layer) {
         const snapped = snap(dm.fecha)
         if (!snapped) continue
-        mapped.push({ time: snapped as any, value: dm.value })
+        if (!seen.has(snapped)) seen.set(snapped, dm.value)
       }
-      mapped.sort((a, b) => (a.time < b.time ? -1 : 1))
+      const mapped = Array.from(seen.entries())
+        .sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([time, value]) => ({ time: time as any, value }))
       if (!mapped.length) {
         pool[i].applyOptions({ visible: false } as any)
         pool[i].setData([])
@@ -766,16 +791,18 @@ export default function PriceChart({
     const pool = overlayRef.current
     if (!pool.length) return
 
-    // Only use dates that exist in the chart's candle series (weekly/monthly)
-    // to avoid expanding the time scale with daily data points
+    // Use dates in the chart's candle series + any future dates (projection)
     const validDates = chartDatesRef.current
+    const lastChartDate = chartDataRef.current.length
+      ? chartDataRef.current[chartDataRef.current.length - 1].fecha
+      : ''
 
     for (let i = 0; i < pool.length; i++) {
       if (i < indicators.length) {
         const ind = indicators[i]
         const lineData = ind.dates
           .map((d, j) => ({ time: d as any, value: ind.values[j] }))
-          .filter(p => p.value != null && validDates.has(p.time as string)) as { time: any; value: number }[]
+          .filter(p => p.value != null && (validDates.has(p.time as string) || p.time > lastChartDate)) as { time: any; value: number }[]
         pool[i].applyOptions({ color: ind.color, visible: true } as any)
         pool[i].setData(lineData)
       } else {

@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { ArrowLeft, TrendingUp, TrendingDown, Activity, BarChart2, Tv2, AlertTriangle, Trash2, Pencil, X, Check, ChevronDown } from 'lucide-react'
-import { api, backfillAsset, addPriceLevel, updatePriceLevel, deletePriceLevel, addTrendline, updateTrendline, deleteTrendline, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports, type DynamicSupportTier, type DynamicResistances, type DynamicResistanceTier, type PriceLevel, type PriceLevelKind, type Trendline, type TrendlineKind, type ChannelBreakdown, type SRV2Result } from '@/lib/api'
+import { api, backfillAsset, addPriceLevel, updatePriceLevel, deletePriceLevel, addTrendline, updateTrendline, deleteTrendline, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports, type DynamicSupportTier, type DynamicResistances, type DynamicResistanceTier, type PriceLevel, type PriceLevelKind, type Trendline, type TrendlineKind, type ChannelBreakdown, type SRV2Result, type PivotsResponse } from '@/lib/api'
 import { computeV2RenderObjects, type V2RenderObject, type V2RenderZone, type V2RenderDiagonal } from '@/lib/srV2Render'
 import { useAuth } from '@/lib/auth'
 import { fmtPrice, fmtPct, pctClass, fmt, calcRSI, calcADX, resampleOHLCV } from '@/lib/utils'
@@ -43,8 +43,8 @@ export default function AssetDetail() {
   const [loading,   setLoading]   = useState(true)
   const [strategyA, setStrategyA] = useState('(Ninguna)')
   const [strategyB, setStrategyB] = useState('(Ninguna)')
-  const [tf,        setTf]        = useState<'D' | 'W' | 'M'>('W')
-  const [chartMode, setChartMode] = useState<'local' | 'tv' | 'v2'>('local')
+  const [tf,        setTf]        = useState<'D' | 'W' | 'M'>('D')
+  const [chartMode, setChartMode] = useState<'local' | 'tv' | 'v2'>('v2')
   const [companyInfo,    setCompanyInfo]    = useState<CompanyInfo | null>(null)
   const [companyLoading, setCompanyLoading] = useState(true)
   const [tpSignal,       setTpSignal]       = useState<TrendPullbackSignal | null>(null)
@@ -56,13 +56,17 @@ export default function AssetDetail() {
   const [showDynSupports,setShowDynSupports]= useState(true)
   const [dynSupTiers, setDynSupTiers] = useState({ long: true, mid: true, short: true })
   const [dynSupDropdown, setDynSupDropdown] = useState(false)
+  const [overlayDropdown, setOverlayDropdown] = useState(false)
   const [dynResistances,    setDynResistances]    = useState<DynamicResistances | null>(null)
   const [showDynResistances,setShowDynResistances]= useState(true)
-  const [dynResTf,          setDynResTf]          = useState<'W' | 'D'>('W')
+  const [dynResTiers, setDynResTiers] = useState({ long: true, mid: true, short: true })
+  const [dynResTf,          setDynResTf]          = useState<'W' | 'D'>('D')
   const [v2DynSup,          setV2DynSup]          = useState<DynamicSupports | null>(null)
   const [v2DynRes,          setV2DynRes]          = useState<DynamicResistances | null>(null)
   const [chBreakdown,    setChBreakdown]    = useState<ChannelBreakdown | null>(null)
   const [showUtBot,      setShowUtBot]      = useState(false)
+  const [pivots,         setPivots]         = useState<PivotsResponse | null>(null)
+  const [showPivots,     setShowPivots]     = useState(false)
   const [backfilling,    setBackfilling]    = useState(false)
   // Niveles dibujados por el usuario (soporte/resistencia/target/nota) — per-user
   const [priceLevels,    setPriceLevels]    = useState<PriceLevel[]>([])
@@ -168,6 +172,14 @@ export default function AssetDetail() {
       .then(setDynResistances)
       .catch(() => setDynResistances(null))
   }, [accionId, dynResTf])
+
+  // Pivots: siempre en diario (mejor resolución visual)
+  useEffect(() => {
+    if (!accionId) return
+    api.pivots(accionId, 'D')
+      .then(setPivots)
+      .catch(() => setPivots(null))
+  }, [accionId])
 
   // SR V2: lazy-fetch al entrar al tab V2
   useEffect(() => {
@@ -363,6 +375,9 @@ export default function AssetDetail() {
   // Tiers con kind='horizontal' se renderizan como ZONA (priceZones) en vez
   // de como linea; los ascendentes siguen como IndicatorLine interpolada.
   const dynZones: import('@/components/detail/PriceChart').PriceZone[] = []
+  // Log-space interpolation helper: generates a value for EVERY candle date
+  // between the first and last line_point, plus projected future dates.
+  // Avoids null gaps that cause linear interpolation artifacts on daily charts.
   if (dynSupports && showDynSupports && candles.length) {
     const tiers: [keyof DynamicSupports, string, string][] = [
       ['long',  '#00e676', 'LP'],
@@ -370,6 +385,7 @@ export default function AssetDetail() {
       ['short', '#4fc3f7', 'CP'],
     ]
     const candleDates = candles.map(c => c.fecha)
+    const lastCandleDate = candleDates[candleDates.length - 1]
     for (const [key, color, label] of tiers) {
       if (!dynSupTiers[key as 'long' | 'mid' | 'short']) continue
       const tier = dynSupports[key]
@@ -388,9 +404,14 @@ export default function AssetDetail() {
       if (!tier.line_points.length) continue
       const pts = tier.line_points
       const ptMap = new Map(pts.map((p: any) => [p.fecha, p.value]))
-      const values = candleDates.map(d => ptMap.get(d) ?? null)
+      // Candle dates + projected future dates from backend
+      const allDates = [...candleDates]
+      for (const pt of pts) {
+        if (pt.fecha > lastCandleDate) allDates.push(pt.fecha)
+      }
+      const values = allDates.map(d => ptMap.get(d) ?? null)
       indicatorLines.push({
-        dates:  candleDates,
+        dates:  allDates,
         values,
         color,
         label:  `Soporte ${label}`,
@@ -409,7 +430,9 @@ export default function AssetDetail() {
       ['short', '#ef4444', 'CP'],
     ]
     const candleDates = candles.map(c => c.fecha)
+    const lastCandleDateR = candleDates[candleDates.length - 1]
     for (const [key, color, label] of tiers) {
+      if (!dynResTiers[key as 'long' | 'mid' | 'short']) continue
       const tier = dynResistances[key]
       if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
       if (!('line_points' in tier)) continue
@@ -426,9 +449,13 @@ export default function AssetDetail() {
       if (!tier.line_points.length) continue
       const pts = tier.line_points
       const ptMap = new Map(pts.map((p: any) => [p.fecha, p.value]))
-      const values = candleDates.map(d => ptMap.get(d) ?? null)
+      const allDates = [...candleDates]
+      for (const pt of pts) {
+        if (pt.fecha > lastCandleDateR) allDates.push(pt.fecha)
+      }
+      const values = allDates.map(d => ptMap.get(d) ?? null)
       indicatorLines.push({
-        dates:  candleDates,
+        dates:  allDates,
         values,
         color,
         label:  `Resistencia ${label}`,
@@ -467,8 +494,14 @@ export default function AssetDetail() {
     )
   }
   const utBotMarkers = showUtBot ? utBot.signals : []
+  const overlayCount = [showDynSupports, showDynResistances, showChannels, showUtBot, showPivots].filter(Boolean).length
 
   const dotLayers: import('@/components/detail/PriceChart').DotMarker[][] = []
+  const pivotMarkers: import('@/components/detail/PriceChart').ChartMarker[] = []
+  if (pivots && showPivots) {
+    for (const p of pivots.pivot_lows)  pivotMarkers.push({ fecha: p.fecha, kind: 'PIVOT_LOW',  price: p.value })
+    for (const p of pivots.pivot_highs) pivotMarkers.push({ fecha: p.fecha, kind: 'PIVOT_HIGH', price: p.value })
+  }
   // Build historical low overlay lines (horizontal lines at 52w low / all-time low)
   if (hlSignal && hlSignal.setup_state !== 'NO_SIGNAL' && candles.length) {
     const dates = candles.map(c => c.fecha)
@@ -629,6 +662,7 @@ export default function AssetDetail() {
 
   if (v2SupData && showDynSupports && chartCandles.length) {
     const cd = chartCandles.map(c => c.fecha)
+    const lastCd = cd[cd.length - 1]
     const tiers: [keyof DynamicSupports, string, string][] = [
       ['long',  '#00e676', 'LP'],
       ['mid',   '#ffd54f', 'MP'],
@@ -645,16 +679,12 @@ export default function AssetDetail() {
       }
       const pts = tier.line_points
       if (!pts.length) continue
-      const firstPt = pts[0]
-      const lastPt  = pts[pts.length - 1]
-      const a1idx = findBarIdx(cd, firstPt.fecha)
-      const a2idx = findBarIdx(cd, lastPt.fecha)
-      if (a2idx <= a1idx) continue
-      const lg1 = Math.log(firstPt.value)
-      const lgS = (Math.log(lastPt.value) - lg1) / (a2idx - a1idx)
+      const ptMap = new Map(pts.map((p: any) => [p.fecha, p.value]))
+      const allDates = [...cd]
+      for (const pt of pts) { if (pt.fecha > lastCd) allDates.push(pt.fecha) }
       v2DynLines.push({
-        dates: cd,
-        values: cd.map((_, i) => i < a1idx ? null : Math.exp(lg1 + lgS * (i - a1idx))),
+        dates: allDates,
+        values: allDates.map(d => ptMap.get(d) ?? null),
         color,
         label: `Soporte ${label}`,
       })
@@ -669,6 +699,7 @@ export default function AssetDetail() {
       ['short', '#ef4444', 'CP'],
     ]
     for (const [key, color, label] of tiers) {
+      if (!dynResTiers[key as 'long' | 'mid' | 'short']) continue
       const tier = v2ResData[key]
       if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
       if (!('line_points' in tier)) continue
@@ -678,16 +709,13 @@ export default function AssetDetail() {
       }
       const pts = tier.line_points
       if (!pts.length) continue
-      const firstPt = pts[0]
-      const lastPt  = pts[pts.length - 1]
-      const a1idx = findBarIdx(cd, firstPt.fecha)
-      const a2idx = findBarIdx(cd, lastPt.fecha)
-      if (a2idx <= a1idx) continue
-      const lg1 = Math.log(firstPt.value)
-      const lgS = (Math.log(lastPt.value) - lg1) / (a2idx - a1idx)
+      const ptMap = new Map(pts.map((p: any) => [p.fecha, p.value]))
+      const allDates = [...cd]
+      const lastCdR = cd[cd.length - 1]
+      for (const pt of pts) { if (pt.fecha > lastCdR) allDates.push(pt.fecha) }
       v2DynLines.push({
-        dates: cd,
-        values: cd.map((_, i) => i < a1idx ? null : Math.exp(lg1 + lgS * (i - a1idx))),
+        dates: allDates,
+        values: allDates.map(d => ptMap.get(d) ?? null),
         color,
         label: `Resistencia ${label}`,
       })
@@ -871,126 +899,88 @@ export default function AssetDetail() {
         )}
       </div>
 
-      {/* Selector de fuente del gráfico
-          - Gráfico local: chart propio con soportes, resistencias, canales y señales (overlays)
-          - TradingView Live: widget embebido externo, solo visualización, sin overlays propios */}
-      <div className="flex items-center gap-1.5">
-        <button
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
-            chartMode === 'local'
-              ? 'bg-accent text-white border-accent'
-              : 'border-border text-text-muted hover:text-text-secondary'
-          }`}
-          onClick={() => setChartMode('local')}
+      {/* Selector de gráfico + overlays */}
+      <div className="flex items-center gap-2">
+        {/* Combo 1: selector de gráfico */}
+        <select
+          value={chartMode}
+          onChange={e => setChartMode(e.target.value as 'v2' | 'tv')}
+          className="px-2.5 py-1.5 text-xs rounded-md border border-border bg-surface text-text-secondary cursor-pointer focus:outline-none focus:border-accent"
         >
-          <BarChart2 size={12} /> Gráfico local
-        </button>
-        <button
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
-            chartMode === 'v2'
-              ? 'bg-accent text-white border-accent'
-              : 'border-border text-text-muted hover:text-text-secondary'
-          }`}
-          onClick={() => setChartMode('v2')}
-        >
-          <BarChart2 size={12} /> Gráfico local V2
-        </button>
-        <button
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
-            chartMode === 'tv'
-              ? 'bg-accent text-white border-accent'
-              : 'border-border text-text-muted hover:text-text-secondary'
-          }`}
-          onClick={() => setChartMode('tv')}
-        >
-          <Tv2 size={12} /> TradingView Live
-        </button>
-        <span className="mx-1 border-l border-border h-5" />
+          <option value="v2">Gráfico Local</option>
+          <option value="tv">TradingView</option>
+        </select>
+
+        {/* Combo 2: overlays multi-check dropdown */}
         <div className="relative">
           <button
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
-              showDynSupports
-                ? 'bg-[#00e676]/20 text-[#00e676] border-[#00e676]/40'
+            onClick={() => setOverlayDropdown(v => !v)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-md border transition-colors ${
+              overlayCount > 0
+                ? 'bg-accent/15 text-accent border-accent/40'
                 : 'border-border text-text-muted hover:text-text-secondary'
             }`}
-            onClick={() => setShowDynSupports(v => !v)}
-            title="Soportes dinámicos (long/mid/short)"
           >
-            <TrendingUp size={12} /> Soportes
-            <ChevronDown
-              size={10}
-              className="ml-0.5 cursor-pointer"
-              onClick={e => { e.stopPropagation(); setDynSupDropdown(v => !v) }}
-            />
+            Overlays{overlayCount > 0 && ` (${overlayCount})`}
+            <ChevronDown size={10} />
           </button>
-          {dynSupDropdown && showDynSupports && (<>
-            <div className="fixed inset-0 z-40" onClick={() => setDynSupDropdown(false)} />
-            <div className="absolute top-full left-0 mt-1 bg-bg-primary border border-border rounded-md shadow-lg z-50 min-w-[120px]">
-              {([['long', 'LP', '#00e676'], ['mid', 'MP', '#ffd54f'], ['short', 'CP', '#4fc3f7']] as const).map(([k, label, color]) => (
-                <label key={k} className="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-bg-secondary">
-                  <input
-                    type="checkbox"
-                    checked={dynSupTiers[k]}
-                    onChange={() => setDynSupTiers(prev => ({ ...prev, [k]: !prev[k] }))}
-                    className="accent-current"
-                    style={{ accentColor: color }}
-                  />
-                  <span style={{ color }}>{label}</span>
-                </label>
-              ))}
+          {overlayDropdown && (<>
+            <div className="fixed inset-0 z-40" onClick={() => setOverlayDropdown(false)} />
+            <div className="absolute top-full left-0 mt-1 bg-surface border border-border rounded-md shadow-lg z-50 min-w-[180px] py-1">
+              <label className="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-elevated">
+                <input type="checkbox" checked={showDynSupports} onChange={() => setShowDynSupports(v => !v)} className="accent-[#00e676]" />
+                <TrendingUp size={11} className="text-[#00e676]" /> Soportes
+              </label>
+              {showDynSupports && (
+                <div className="pl-7 pb-1">
+                  {([['long', 'LP', '#00e676'], ['mid', 'MP', '#ffd54f'], ['short', 'CP', '#4fc3f7']] as const).map(([k, label, color]) => (
+                    <label key={k} className="flex items-center gap-2 px-3 py-0.5 text-xs cursor-pointer hover:bg-elevated">
+                      <input
+                        type="checkbox"
+                        checked={dynSupTiers[k]}
+                        onChange={() => setDynSupTiers(prev => ({ ...prev, [k]: !prev[k] }))}
+                        style={{ accentColor: color }}
+                      />
+                      <span style={{ color }}>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              <label className="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-elevated">
+                <input type="checkbox" checked={showDynResistances} onChange={() => setShowDynResistances(v => !v)} className="accent-[#ef4444]" />
+                <TrendingDown size={11} className="text-[#ef4444]" /> Resistencias
+              </label>
+              {showDynResistances && (
+                <div className="pl-7 pb-1">
+                  {([['long', 'LP', '#ef4444'], ['mid', 'MP', '#fb923c'], ['short', 'CP', '#ef4444']] as const).map(([k, label, color]) => (
+                    <label key={k} className="flex items-center gap-2 px-3 py-0.5 text-xs cursor-pointer hover:bg-elevated">
+                      <input
+                        type="checkbox"
+                        checked={dynResTiers[k]}
+                        onChange={() => setDynResTiers(prev => ({ ...prev, [k]: !prev[k] }))}
+                        style={{ accentColor: color }}
+                      />
+                      <span style={{ color }}>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              <label className="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-elevated">
+                <input type="checkbox" checked={showChannels} onChange={() => setShowChannels(v => !v)} className="accent-[#00e5ff]" />
+                <TrendingUp size={11} className="text-[#00e5ff]" /> Canales
+              </label>
+              <label className="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-elevated">
+                <input type="checkbox" checked={showUtBot} onChange={() => setShowUtBot(v => !v)} className="accent-[#26a69a]" />
+                <Activity size={11} className="text-[#26a69a]" /> UT Bot
+              </label>
+              <label className="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-elevated">
+                <input type="checkbox" checked={showPivots} onChange={() => setShowPivots(v => !v)} className="accent-[#b388ff]" />
+                <BarChart2 size={11} className="text-[#b388ff]" /> Pivots
+              </label>
             </div>
-          </>)}
+          </>)
+          }
         </div>
-        <button
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
-            showChannels
-              ? 'bg-[#00e5ff]/20 text-[#00e5ff] border-[#00e5ff]/40'
-              : 'border-border text-text-muted hover:text-text-secondary'
-          }`}
-          onClick={() => setShowChannels(v => !v)}
-        >
-          <TrendingUp size={12} /> Canales
-        </button>
-        <button
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
-            showUtBot
-              ? 'bg-[#26a69a]/20 text-[#26a69a] border-[#26a69a]/40'
-              : 'border-border text-text-muted hover:text-text-secondary'
-          }`}
-          onClick={() => setShowUtBot(v => !v)}
-          title="UT Bot trailing stop (sensitivity 2, ATR 10)"
-        >
-          <Activity size={12} /> UT Bot
-        </button>
-        <button
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
-            showDynResistances
-              ? 'bg-[#ef4444]/20 text-[#ef4444] border-[#ef4444]/40'
-              : 'border-border text-text-muted hover:text-text-secondary'
-          }`}
-          onClick={() => setShowDynResistances(v => !v)}
-          title="Resistencias dinámicas (long/mid/short)"
-        >
-          <TrendingDown size={12} /> Resistencias
-        </button>
-        {showDynResistances && (
-          <div className="flex items-center rounded-md border border-border overflow-hidden -ml-1">
-            {(['W', 'D'] as const).map(tf => (
-              <button
-                key={tf}
-                className={`px-2 py-1.5 text-xs transition-colors ${
-                  dynResTf === tf
-                    ? 'bg-[#ef4444]/15 text-[#ef4444]'
-                    : 'text-text-muted hover:text-text-secondary'
-                }`}
-                onClick={() => setDynResTf(tf)}
-                title={`Recalcular resistencias en ${tf === 'W' ? 'semanal' : 'diario'}`}
-              >
-                {tf}
-              </button>
-            ))}
-          </div>
-        )}
         <span className="mx-1 border-l border-border h-5" />
         <button
           className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md border transition-colors ${
@@ -1089,6 +1079,7 @@ export default function AssetDetail() {
               candles={candles}
               freq={tf}
               indicators={v2DynLines}
+              markers={pivotMarkers}
               zones={[...v2Overlays.zones, ...v2DynZones]}
               dotLayers={v2DotLayers}
               height={480}
@@ -1108,7 +1099,7 @@ export default function AssetDetail() {
             candles={candles}
             freq={tf}
             indicators={indicatorLines}
-            markers={utBotMarkers}
+            markers={[...utBotMarkers, ...pivotMarkers]}
             dotLayers={dotLayers}
             zones={dynZones}
             userLevels={priceLevels.map(l => ({
@@ -1318,7 +1309,7 @@ export default function AssetDetail() {
             <button
               onClick={handleBackfill}
               disabled={backfilling}
-              className="px-2 py-1 rounded text-xs bg-bg-secondary/50 border border-border-subtle text-text-muted hover:text-text-primary disabled:opacity-50"
+              className="px-2 py-1 rounded text-xs bg-elevated/50 border border-border-subtle text-text-muted hover:text-text-primary disabled:opacity-50"
               title="Re-descargar histórico desde Yahoo (admin)"
             >
               {backfilling ? '…' : '↻ refrescar histórico'}
