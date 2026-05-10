@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { ArrowLeft, TrendingUp, TrendingDown, Activity, BarChart2, Tv2, AlertTriangle, Trash2, Pencil, X, Check, ChevronDown } from 'lucide-react'
-import { api, backfillAsset, addPriceLevel, updatePriceLevel, deletePriceLevel, addTrendline, updateTrendline, deleteTrendline, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports, type DynamicSupportTier, type DynamicResistances, type DynamicResistanceTier, type PriceLevel, type PriceLevelKind, type Trendline, type TrendlineKind, type ChannelBreakdown, type SRV2Result, type PivotsResponse } from '@/lib/api'
+import { ArrowLeft, TrendingUp, TrendingDown, Activity, BarChart2, Tv2, AlertTriangle, Trash2, Pencil, X, Check, ChevronDown, Bell, BellRing } from 'lucide-react'
+import { api, backfillAsset, addPriceLevel, updatePriceLevel, deletePriceLevel, addTrendline, updateTrendline, deleteTrendline, toggleTelegramAlert, type AssetDetail as IAsset, type Candle, type Indicator, type CompanyInfo, type TrendPullbackSignal, type ChannelData, type ChannelItem, type HistoricalLowSignal, type HistoricalHighSignal, type DynamicSupports, type DynamicSupportTier, type DynamicResistances, type DynamicResistanceTier, type PriceLevel, type PriceLevelKind, type Trendline, type TrendlineKind, type ChannelBreakdown, type SRV2Result, type PivotsResponse, type HorizontalZonesResponse, type AssetSignal } from '@/lib/api'
 import { computeV2RenderObjects, type V2RenderObject, type V2RenderZone, type V2RenderDiagonal } from '@/lib/srV2Render'
 import { useAuth } from '@/lib/auth'
 import { fmtPrice, fmtPct, pctClass, fmt, calcRSI, calcADX, resampleOHLCV } from '@/lib/utils'
@@ -64,9 +64,12 @@ export default function AssetDetail() {
   const [v2DynSup,          setV2DynSup]          = useState<DynamicSupports | null>(null)
   const [v2DynRes,          setV2DynRes]          = useState<DynamicResistances | null>(null)
   const [chBreakdown,    setChBreakdown]    = useState<ChannelBreakdown | null>(null)
+  const [hZones,         setHZones]         = useState<HorizontalZonesResponse | null>(null)
+  const [showHZones,     setShowHZones]     = useState(true)
   const [showUtBot,      setShowUtBot]      = useState(false)
   const [pivots,         setPivots]         = useState<PivotsResponse | null>(null)
   const [showPivots,     setShowPivots]     = useState(false)
+  const [chartVisibleRange, setChartVisibleRange] = useState<{ from: number; to: number } | null>(null)
   const [backfilling,    setBackfilling]    = useState(false)
   // Niveles dibujados por el usuario (soporte/resistencia/target/nota) — per-user
   const [priceLevels,    setPriceLevels]    = useState<PriceLevel[]>([])
@@ -83,6 +86,10 @@ export default function AssetDetail() {
   const [srV2,           setSrV2]           = useState<SRV2Result | null>(null)
   const [srV2Loading,    setSrV2Loading]    = useState(false)
   const [v2InfoTab,      setV2InfoTab]      = useState<string | null>(null)
+  const [signals,        setSignals]        = useState<AssetSignal[]>([])
+  const [signalsBellOpen,setSignalsBellOpen]= useState(false)
+  const [telegramOn,     setTelegramOn]     = useState(false)
+  const [inWatchlist,    setInWatchlist]    = useState(false)
   const { username } = useAuth()
   const isAdmin = username === 'albano'
 
@@ -146,6 +153,11 @@ export default function AssetDetail() {
       .then(setChBreakdown)
       .catch(() => setChBreakdown(null))
 
+    // Fetch horizontal zones (soporte/resistencia horizontal enriquecidas con rechazos diarios)
+    api.horizontalZones(accionId)
+      .then(setHZones)
+      .catch(() => setHZones(null))
+
     // Fetch dynamic supports (long/mid/short trendlines ascendentes en log-space)
     api.dynamicSupports(accionId, 'D')
       .then(setDynSupports)
@@ -163,6 +175,11 @@ export default function AssetDetail() {
     api.trendlines(accionId)
       .then(r => setTrendlines(r.items ?? []))
       .catch(() => setTrendlines([]))
+
+    // Fetch señales de estrategia para este ticker (campana)
+    api.assetSignals(accionId)
+      .then(r => { setSignals(r.items ?? []); setTelegramOn(r.telegram_alerts); setInWatchlist(r.in_watchlist) })
+      .catch(() => { setSignals([]); setTelegramOn(false); setInWatchlist(false) })
   }, [accionId])
 
   // Resistencias dinámicas: re-fetch al cambiar asset o timeframe (W/D)
@@ -324,7 +341,7 @@ export default function AssetDetail() {
   const adxData = chartCandles.length ? calcADX(chartCandles) : { adx: [], plusDI: [], minusDI: [] }
 
   const activeStrategies = [strategyA, strategyB].filter(s => s !== '(Ninguna)')
-  const indicatorLines = buildIndicatorLines(candles, activeStrategies)
+  const indicatorLines = buildIndicatorLines(chartCandles, activeStrategies)
 
   // Build channel overlay lines — multiple horizons with different colors
   // Log-scale chart → exp() lines appear as straight lines (same as PDF/TradingView)
@@ -494,7 +511,7 @@ export default function AssetDetail() {
     )
   }
   const utBotMarkers = showUtBot ? utBot.signals : []
-  const overlayCount = [showDynSupports, showDynResistances, showChannels, showUtBot, showPivots].filter(Boolean).length
+  const overlayCount = [showDynSupports, showDynResistances, showChannels, showUtBot, showPivots, showHZones].filter(Boolean).length
 
   const dotLayers: import('@/components/detail/PriceChart').DotMarker[][] = []
   const pivotMarkers: import('@/components/detail/PriceChart').ChartMarker[] = []
@@ -502,6 +519,30 @@ export default function AssetDetail() {
     for (const p of pivots.pivot_lows)  pivotMarkers.push({ fecha: p.fecha, kind: 'PIVOT_LOW',  price: p.value })
     for (const p of pivots.pivot_highs) pivotMarkers.push({ fecha: p.fecha, kind: 'PIVOT_HIGH', price: p.value })
   }
+  // Build horizontal zones overlay (soporte/resistencia horizontal enriquecidas)
+  if (hZones && showHZones) {
+    for (const z of hZones.resistance_zones) {
+      dynZones.push({
+        floor: z.zone_low,
+        top:   z.zone_high,
+        color: '#ef4444',
+        label: `R ${z.strength === 'strong' ? '★' : ''} $${z.center.toFixed(0)} (${z.total_touches}t)`,
+        floorStyle: 'solid' as const,
+        topStyle:   'solid' as const,
+      })
+    }
+    for (const z of hZones.support_zones) {
+      dynZones.push({
+        floor: z.zone_low,
+        top:   z.zone_high,
+        color: '#22c55e',
+        label: `S ${z.strength === 'strong' ? '★' : ''} $${z.center.toFixed(0)} (${z.total_touches}t)`,
+        floorStyle: 'solid' as const,
+        topStyle:   'solid' as const,
+      })
+    }
+  }
+
   // Build historical low overlay lines (horizontal lines at 52w low / all-time low)
   if (hlSignal && hlSignal.setup_state !== 'NO_SIGNAL' && candles.length) {
     const dates = candles.map(c => c.fecha)
@@ -764,13 +805,78 @@ export default function AssetDetail() {
       {/* Asset header */}
       <div className="card p-4 md:p-5">
         <div className="flex flex-wrap items-start gap-3 md:gap-6">
-          {/* Symbol + name */}
+          {/* Symbol + name + bell */}
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2.5">
               <span className="font-mono text-2xl font-bold text-text-primary tracking-tight">
                 {asset.simbolo}
               </span>
               <span className="badge badge-neutral">{asset.mercado}</span>
+              {/* Campana de señales */}
+              <div className="relative">
+                <button
+                  className={`p-1.5 rounded-lg transition-colors ${signals.length > 0 ? 'text-accent hover:bg-accent/10' : 'text-text-muted hover:bg-surface-alt'}`}
+                  onClick={() => setSignalsBellOpen(v => !v)}
+                  title="Señales de estrategia"
+                >
+                  {signals.length > 0 ? <BellRing size={18} /> : <Bell size={18} />}
+                  {signals.length > 0 && (
+                    <span className="absolute -top-0.5 -right-0.5 bg-accent text-white text-[9px] font-bold rounded-full w-4 h-4 flex items-center justify-center">
+                      {signals.length > 9 ? '9+' : signals.length}
+                    </span>
+                  )}
+                </button>
+                {signalsBellOpen && (
+                  <div className="absolute z-50 top-full left-0 mt-1 w-80 max-h-96 overflow-y-auto card p-0 shadow-xl border border-border">
+                    <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+                      <span className="text-xs font-semibold text-text-primary">Señales — {asset.simbolo}</span>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={telegramOn}
+                          onChange={async (e) => {
+                            const val = e.target.checked
+                            setTelegramOn(val)
+                            try {
+                              await toggleTelegramAlert(accionId, val)
+                            } catch {
+                              setTelegramOn(!val)
+                            }
+                          }}
+                          className="w-3.5 h-3.5 accent-accent"
+                        />
+                        <span className="text-[10px] text-text-muted">Telegram</span>
+                      </label>
+                    </div>
+                    {signals.length === 0 ? (
+                      <p className="text-xs text-text-muted px-3 py-4 text-center">Sin señales recientes (30 días)</p>
+                    ) : (
+                      <ul className="divide-y divide-border">
+                        {signals.map(s => (
+                          <li key={s.id} className="px-3 py-2 hover:bg-surface-alt/50">
+                            <div className="flex items-center gap-2">
+                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                                s.signal_direction === 'BUY' ? 'bg-green-500/15 text-green-400' : s.signal_direction === 'SELL' ? 'bg-red-500/15 text-red-400' : 'bg-gray-500/15 text-gray-400'
+                              }`}>
+                                {s.signal_code || s.kind}
+                              </span>
+                              {s.signal_direction && (
+                                <span className={`text-[10px] ${s.signal_direction === 'BUY' ? 'text-green-400' : 'text-red-400'}`}>
+                                  {s.signal_direction}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[11px] text-text-secondary mt-0.5 line-clamp-2">{s.title}</p>
+                            <p className="text-[9px] text-text-muted mt-0.5">
+                              {new Date(s.created_at).toLocaleDateString('es', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                            </p>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
             <p className="text-sm text-text-secondary mt-0.5 truncate">{asset.nombre}</p>
           </div>
@@ -977,6 +1083,10 @@ export default function AssetDetail() {
                 <input type="checkbox" checked={showPivots} onChange={() => setShowPivots(v => !v)} className="accent-[#b388ff]" />
                 <BarChart2 size={11} className="text-[#b388ff]" /> Pivots
               </label>
+              <label className="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer hover:bg-elevated">
+                <input type="checkbox" checked={showHZones} onChange={() => setShowHZones(v => !v)} className="accent-[#f59e0b]" />
+                <BarChart2 size={11} className="text-[#f59e0b]" /> Zonas H
+              </label>
             </div>
           </>)
           }
@@ -1078,11 +1188,12 @@ export default function AssetDetail() {
             <PriceChart
               candles={candles}
               freq={tf}
-              indicators={v2DynLines}
-              markers={pivotMarkers}
+              indicators={[...v2DynLines, ...indicatorLines]}
+              markers={[...pivotMarkers, ...utBotMarkers]}
               zones={[...v2Overlays.zones, ...v2DynZones]}
               dotLayers={v2DotLayers}
               height={480}
+              onVisibleRangeChange={setChartVisibleRange}
               viewStartDate={(() => {
                 const minDate = new Date()
                 minDate.setFullYear(minDate.getFullYear() - 3)
@@ -1124,10 +1235,8 @@ export default function AssetDetail() {
               setCtxMenu({ price, x: clientX, y: clientY })
             }
             height={480}
+            onVisibleRangeChange={setChartVisibleRange}
             viewStartDate={(() => {
-              // Auto-zoom desde anchor1 del tier LP, pero minimo 3 anios de historia
-              // — si el LP detectado es corto (ej. NVDA con micro-linea reciente),
-              // igual se muestra el contexto multi-anio para no "agrandar" el chart.
               const anchor = dynSupports?.long?.anchor1?.fecha
               const minDate = new Date()
               minDate.setFullYear(minDate.getFullYear() - 3)
@@ -1355,6 +1464,7 @@ export default function AssetDetail() {
           plusDI={adxData.plusDI}
           minusDI={adxData.minusDI}
           height={160}
+          visibleRange={chartVisibleRange}
         />
       )}
 
@@ -1366,6 +1476,7 @@ export default function AssetDetail() {
             rsiValues={rsiValues}
             divergences={divergences}
             height={180}
+            visibleRange={chartVisibleRange}
           />
           <DivergenceInfoPanel
             divergences={divergences}

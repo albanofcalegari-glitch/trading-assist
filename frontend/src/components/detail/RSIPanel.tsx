@@ -21,13 +21,14 @@ interface Props {
   rsiValues:   (number | null)[]
   divergences: Divergence[]
   height?:     number
+  visibleRange?: { from: number; to: number } | null
 }
 
 const BG     = '#0b0d11'
 const BORDER = '#1e2535'
 const TEXT   = '#7c8ca1'
 
-export default function RSIPanel({ candles, rsiValues, divergences, height = 180 }: Props) {
+export default function RSIPanel({ candles, rsiValues, divergences, height = 180, visibleRange }: Props) {
   const ref      = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
 
@@ -45,7 +46,8 @@ export default function RSIPanel({ candles, rsiValues, divergences, height = 180
         textColor:  TEXT,
         fontFamily: 'JetBrains Mono, monospace',
         fontSize:   10,
-      },
+        attributionLogo: false,
+      } as any,
       grid: {
         vertLines: { color: BORDER, style: 0 },
         horzLines: { color: BORDER, style: 0 },
@@ -72,6 +74,14 @@ export default function RSIPanel({ candles, rsiValues, divergences, height = 180
       },
     })
     chartRef.current = chart
+
+    const hideLogo = () => {
+      el.querySelectorAll('a').forEach(a => {
+        if (a.href.includes('tradingview')) (a as HTMLElement).style.display = 'none'
+      })
+    }
+    hideLogo()
+    setTimeout(hideLogo, 200)
 
     // ── Línea RSI ────────────────────────────────────────────────────────────
     const rsiSeries = chart.addLineSeries({
@@ -143,6 +153,11 @@ export default function RSIPanel({ candles, rsiValues, divergences, height = 180
 
     return () => { ro.disconnect(); chart.remove(); chartRef.current = null }
   }, [candles, rsiValues, divergences, height])
+
+  useEffect(() => {
+    if (!chartRef.current || !visibleRange) return
+    try { chartRef.current.timeScale().setVisibleLogicalRange(visibleRange) } catch {}
+  }, [visibleRange])
 
   return (
     <div className="card p-1 overflow-hidden">

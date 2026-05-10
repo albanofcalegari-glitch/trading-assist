@@ -313,6 +313,7 @@ export interface HorizontalZone {
   first_touch:     string
   score:           number
   type:            'support' | 'resistance'
+  strength:        'weak' | 'normal' | 'strong'
   rank:            'primary' | 'secondary' | 'tertiary'
   pivots:          { fecha: string; price: number }[]
 }
@@ -416,6 +417,23 @@ export interface Notification {
   accion_simbolo:   string | null
 }
 
+export interface AssetSignal {
+  id:               number
+  kind:             string
+  title:            string
+  body:             string
+  signal_code:      string | null
+  signal_direction: 'BUY' | 'SELL' | null
+  created_at:       string
+  read_at:          string | null
+}
+
+export interface AssetSignalsResponse {
+  items:            AssetSignal[]
+  telegram_alerts:  boolean
+  in_watchlist:     boolean
+}
+
 export interface CompanyInfo {
   symbol: string
   status: 'OK' | 'NO_DATA'
@@ -474,6 +492,8 @@ export interface WatchlistItem {
   mercado:           string
   qty:               number | null
   avg_buy_price:     number | null
+  stop_loss:         number | null
+  take_profit:       number | null
   note:              string | null
   precio:            number | null
   pct_cambio_dia:    number | null
@@ -488,12 +508,16 @@ export interface WatchlistInput {
   accion_id:      number
   qty?:           number | null
   avg_buy_price?: number | null
+  stop_loss?:     number | null
+  take_profit?:   number | null
   note?:          string | null
 }
 
 export interface WatchlistPatch {
   qty?:           number | null
   avg_buy_price?: number | null
+  stop_loss?:     number | null
+  take_profit?:   number | null
   note?:          string | null
 }
 
@@ -714,6 +738,16 @@ export interface ElliottScanItem {
   price:              number
 }
 
+export interface TrendSma200Item {
+  simbolo:      string
+  nombre:       string
+  accion_id:    number | null
+  price:        number
+  sma200:       number
+  distance_pct: number
+  trend:        'ALCISTA' | 'BAJISTA'
+}
+
 // ── Endpoints ──────────────────────────────────────────────────────────────────
 
 export const api = {
@@ -819,6 +853,14 @@ export const api = {
     get<{ items: ElliottScanItem[]; fecha: string; market: string }>(
       `/scan/elliott?market=${market}`
     ),
+
+  trendsSma200Weekly: () =>
+    get<{ items: TrendSma200Item[]; fecha: string; total: number; alcistas: number; bajistas: number }>(
+      '/trends/sma200-weekly'
+    ),
+
+  assetSignals: (id: number, limit = 30) =>
+    get<AssetSignalsResponse>(`/assets/${id}/signals?limit=${limit}`),
 }
 
 export async function addWatchlist(input: WatchlistInput) {
@@ -851,6 +893,17 @@ export async function deleteWatchlist(id: number) {
   const data = await res.json()
   if (!res.ok) throw new Error(data.error || 'Error al eliminar')
   return data as { ok: boolean }
+}
+
+export async function toggleTelegramAlert(accionId: number, enabled: boolean) {
+  const res = await fetch(BASE + `/assets/${accionId}/telegram-alert`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ enabled }),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al cambiar alerta Telegram')
+  return data as { ok: boolean; telegram_alerts: boolean }
 }
 
 export async function addTrade(input: TradeInput) {

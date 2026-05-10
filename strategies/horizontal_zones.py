@@ -40,6 +40,12 @@ _RECENT_YEARS    = 3       # qué cuenta como "reciente"
 _MAX_ZONES       = 3       # zonas retornadas por tipo (primary + secondary + 1)
 _MERGE_TOL       = 0.05    # zonas con centros a ≤5% se mergean
 
+# ── Enriquecimiento con datos diarios ────────────────────────────────────────
+_DAILY_ENRICH_MONTHS = 6   # meses de datos diarios para contar rechazos
+_DAILY_MIN_GAP       = 10  # días mín entre episodios de rechazo
+_DAILY_TOUCH_WEIGHT  = 0.7 # peso de cada rechazo diario vs pivot semanal
+_DAILY_MAX_REJ       = 6   # máx rechazos diarios por zona (evitar inflación)
+
 # ── Excepción 2-touch (zonas weak) ───────────────────────────────────────────
 _WEAK_MAX_DIST   = 10.0    # max distancia zona-precio para 2-touch
 _WEAK_MAX_AGE_Y  = 2       # ambos pivots dentro de últimos N años
@@ -67,6 +73,95 @@ def _load_weekly(symbol: str, fecha_max: date) -> list[dict]:
             return cur.fetchall()
     finally:
         conn.close()
+
+
+def _load_daily_recent(symbol: str, fecha_max: date) -> list[dict]:
+    """Carga datos diarios recientes para enriquecer zonas con rechazos."""
+    conn = get_conn()
+    try:
+        cutoff = fecha_max - timedelta(days=_DAILY_ENRICH_MONTHS * 30)
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT fecha, high, low, close
+                   FROM ohlcv_extended
+                   WHERE simbolo = %s AND timeframe = 'D'
+                     AND fecha >= %s AND fecha <= %s
+                   ORDER BY fecha ASC""",
+                (symbol, cutoff, fecha_max),
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _enrich_zones_with_daily(zones: list[dict], daily: list[dict], today: date) -> list[dict]:
+    """
+    Enriquece zonas con rechazos diarios: episodios donde el precio entró
+    en la zona pero cerró fuera (rejection). Cada episodio separado por
+    _DAILY_MIN_GAP días cuenta como un toque adicional.
+    """
+    if not daily or not zones:
+        return zones
+
+    cutoff_recent = today - timedelta(days=_RECENT_YEARS * 365)
+
+    for zone in zones:
+        zl, zh = zone['zone_low'], zone['zone_high']
+        is_res = zone['type'] == 'resistance'
+
+        existing_dates = set()
+        for p in zone.get('pivots', []):
+            existing_dates.add(str(p['fecha']))
+
+        rejections = []
+        last_rej = None
+
+        for r in daily:
+            h, l, c = float(r['high']), float(r['low']), float(r['close'])
+            d = r['fecha']
+
+            if is_res:
+                touched = h >= zl
+                rejected = c < zl
+            else:
+                touched = l <= zh
+                rejected = c > zh
+
+            if touched and rejected:
+                if last_rej is None or (d - last_rej).days >= _DAILY_MIN_GAP:
+                    if str(d) not in existing_dates:
+                        rejections.append({'fecha': d, 'price': h if is_res else l})
+                        last_rej = d
+
+        rejections = rejections[:_DAILY_MAX_REJ]
+
+        if rejections:
+            n_rej = len(rejections)
+            n_recent = sum(1 for r in rejections if r['fecha'] >= cutoff_recent)
+
+            zone['daily_rejections'] = n_rej
+            zone['total_touches'] += n_rej
+            zone['recent_touches'] += n_recent
+
+            zone['score'] += n_rej * _DAILY_TOUCH_WEIGHT * 2.0
+            zone['score'] = round(zone['score'], 2)
+
+            t = zone['total_touches']
+            if zone.get('strength') == 'weak' and t >= _MIN_TOUCHES:
+                zone['strength'] = 'normal'
+            if t >= 5:
+                zone['strength'] = 'strong'
+
+            for r in rejections:
+                zone['pivots'].append({'fecha': str(r['fecha']), 'price': round(r['price'], 2), 'source': 'daily'})
+            zone['pivots'].sort(key=lambda p: p['fecha'])
+
+            last_dates = [r['fecha'] for r in rejections]
+            max_rej_date = str(max(last_dates))
+            if max_rej_date > zone['last_touch']:
+                zone['last_touch'] = max_rej_date
+
+    return zones
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,6 +524,13 @@ def detect_horizontal_zones(
         t = z['total_touches']
         z['strength'] = 'weak' if t == 2 else ('strong' if t >= 5 else 'normal')
     resistance_zones = _filter_weak_near_strong(resistance_zones)
+
+    # ── Enriquecer con rechazos diarios ───────────────────────────────────────
+    daily = _load_daily_recent(symbol, fecha)
+    support_zones    = _enrich_zones_with_daily(support_zones, daily, fecha)
+    resistance_zones = _enrich_zones_with_daily(resistance_zones, daily, fecha)
+
+    support_zones    = _assign_ranks(support_zones)[:_MAX_ZONES]
     resistance_zones = _assign_ranks(resistance_zones)[:_MAX_ZONES]
 
     return {

@@ -79,15 +79,54 @@ def _finish_run(conn, run_id: int, status: str, payload: dict | None, error: str
 
 
 def _load_watchlist(cur) -> list[dict]:
-    """Trae (user_id, username, accion_id, simbolo) de todos los usuarios con watchlist no vacía."""
+    """Trae (user_id, username, accion_id, simbolo, stop_loss, take_profit, avg_buy_price) de todos los usuarios con watchlist no vacía."""
     cur.execute("""
-        SELECT uw.user_id, u.username, uw.accion_id, a.simbolo
+        SELECT uw.user_id, u.username, uw.accion_id, a.simbolo,
+               uw.stop_loss, uw.take_profit, uw.avg_buy_price,
+               COALESCE(uw.telegram_alerts, 0) AS telegram_alerts
         FROM user_watchlist uw
         JOIN users  u ON u.id = uw.user_id
         JOIN accion a ON a.id = uw.accion_id
         ORDER BY uw.user_id, a.simbolo
     """)
     return cur.fetchall() or []
+
+
+def _get_current_price(cur, accion_id: int) -> float | None:
+    cur.execute("""
+        SELECT precio_cierre FROM valorhistoricoaccion
+        WHERE accion_id = %s ORDER BY fecha DESC LIMIT 1
+    """, [accion_id])
+    row = cur.fetchone()
+    return float(row['precio_cierre']) if row else None
+
+
+def _check_sl_tp(item: dict, precio: float) -> list[dict]:
+    """Genera señales SL_HIT / TP_HIT si el precio cruzó los niveles configurados."""
+    signals = []
+    sym = item['simbolo']
+    sl = float(item['stop_loss']) if item.get('stop_loss') is not None else None
+    tp = float(item['take_profit']) if item.get('take_profit') is not None else None
+
+    if sl and precio <= sl:
+        pct = round((precio / sl - 1) * 100, 2)
+        signals.append({
+            'code':      'SL_HIT',
+            'direction': 'SELL',
+            'title':     f'🔴 SL alcanzado — {sym} ${precio:.2f} (SL ${sl:.2f})',
+            'body':      f'{sym} tocó o perforó tu Stop Loss.\nPrecio: ${precio:.2f} | SL: ${sl:.2f} ({pct:+.2f}%)\nRevisá tu posición.',
+            'data':      {'precio': precio, 'stop_loss': sl, 'pct_vs_sl': pct},
+        })
+    if tp and precio >= tp:
+        pct = round((precio / tp - 1) * 100, 2)
+        signals.append({
+            'code':      'TP_HIT',
+            'direction': 'BUY',
+            'title':     f'🟢 TP alcanzado — {sym} ${precio:.2f} (TP ${tp:.2f})',
+            'body':      f'{sym} alcanzó o superó tu Take Profit.\nPrecio: ${precio:.2f} | TP: ${tp:.2f} ({pct:+.2f}%)\nConsiderá tomar ganancias.',
+            'data':      {'precio': precio, 'take_profit': tp, 'pct_vs_tp': pct},
+        })
+    return signals
 
 
 def _already_sent(cur, user_id: int, accion_id: int, signal_code: str) -> bool:
@@ -179,18 +218,35 @@ def run(notifier: Notifier | None = None, fecha: _dt.date | None = None) -> dict
         per_user: dict[int, list[dict]] = defaultdict(list)
         errors: list[str] = []
 
+        # Pre-fetch current prices for SL/TP checks
+        precio_cache: dict[int, float | None] = {}
+
         for symbol, subs in symbol_to_users.items():
             try:
-                signals = detect_signals(symbol, fecha)
+                base_signals = detect_signals(symbol, fecha)
             except Exception as e:
                 errors.append(f'{symbol}: {e}')
-                continue
-            if not signals:
-                continue
+                base_signals = []
+
             for sub in subs:
                 user_id    = sub['user_id']
                 accion_id  = sub['accion_id']
-                for sig in signals:
+
+                # Per-user signals = common signals + user-specific SL/TP
+                user_signals = list(base_signals) if base_signals else []
+                if sub.get('stop_loss') is not None or sub.get('take_profit') is not None:
+                    if accion_id not in precio_cache:
+                        try:
+                            with conn.cursor() as cur:
+                                precio_cache[accion_id] = _get_current_price(cur, accion_id)
+                        except Exception as e:
+                            errors.append(f'{symbol} price: {e}')
+                            precio_cache[accion_id] = None
+                    precio = precio_cache[accion_id]
+                    if precio is not None:
+                        user_signals.extend(_check_sl_tp(sub, precio))
+
+                for sig in user_signals:
                     code = sig.get('code')
                     if not code:
                         continue
@@ -213,11 +269,12 @@ def run(notifier: Notifier | None = None, fecha: _dt.date | None = None) -> dict
                         'title':      sig['title'],
                         'notif_id':   notif_id,
                     })
-                    # Notifica a canales externos (Telegram/Console) por cada señal nueva
-                    try:
-                        notifier.notify(KIND, sig['title'], sig['body'], sig.get('data') or {})
-                    except Exception as e:
-                        errors.append(f'notifier {symbol} u{user_id} {code}: {e}')
+                    ALWAYS_TELEGRAM = ('RESISTANCE_BREAKOUT', 'NEAR_DYN_SUPPORT')
+                    if sub.get('telegram_alerts') or code in ALWAYS_TELEGRAM:
+                        try:
+                            notifier.notify(KIND, sig['title'], sig['body'], sig.get('data') or {})
+                        except Exception as e:
+                            errors.append(f'notifier {symbol} u{user_id} {code}: {e}')
 
         n_users = len({i['user_id'] for i in items})
         payload = {

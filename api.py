@@ -316,6 +316,8 @@ def _ensure_watchlist_table():
                     accion_id     INT           NOT NULL,
                     qty           DECIMAL(20,6) NULL,
                     avg_buy_price DECIMAL(20,6) NULL,
+                    stop_loss     DECIMAL(20,6) NULL,
+                    take_profit   DECIMAL(20,6) NULL,
                     note          VARCHAR(500)  NULL,
                     added_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE KEY uq_user_accion (user_id, accion_id),
@@ -324,6 +326,20 @@ def _ensure_watchlist_table():
                     CONSTRAINT fk_uw_accion FOREIGN KEY (accion_id) REFERENCES accion(id) ON DELETE CASCADE
                 )
             """)
+            for col in ('stop_loss', 'take_profit'):
+                cur.execute(f"""
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = DATABASE() AND table_name = 'user_watchlist' AND column_name = '{col}'
+                """)
+                if not cur.fetchone():
+                    cur.execute(f"ALTER TABLE user_watchlist ADD COLUMN {col} DECIMAL(20,6) NULL AFTER avg_buy_price")
+            cur.execute("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = DATABASE() AND table_name = 'user_watchlist' AND column_name = 'telegram_alerts'
+            """)
+            if not cur.fetchone():
+                cur.execute("ALTER TABLE user_watchlist ADD COLUMN telegram_alerts TINYINT(1) NOT NULL DEFAULT 0")
+                print(' * Columna user_watchlist.telegram_alerts creada')
         conn.commit()
     finally:
         conn.close()
@@ -670,12 +686,13 @@ def get_assets():
     limit     = int(request.args.get('limit', 50))
     # Con búsqueda: símbolo exacto primero, luego prefijo, luego resto
     # Sin búsqueda: ordenar por mayor movimiento
-    s_order      = "(CASE WHEN simbolo = %s THEN 0 WHEN simbolo LIKE %s THEN 1 ELSE 2 END), simbolo" if search else "ABS(pct_cambio) DESC, simbolo"
-    s_order_full = "(CASE WHEN a.simbolo = %s THEN 0 WHEN a.simbolo LIKE %s THEN 1 ELSE 2 END), a.simbolo" if search else "ABS(pct_cambio) DESC, a.simbolo"
-    opt_order    = [search.upper(), f"{search.upper()}%"] if search else []
+    search_up = search.upper().strip()
+    s_order      = "(CASE WHEN UPPER(simbolo) = %s THEN 0 WHEN UPPER(simbolo) LIKE %s THEN 1 ELSE 2 END), simbolo" if search else "ABS(pct_cambio) DESC, simbolo"
+    s_order_full = "(CASE WHEN UPPER(a.simbolo) = %s THEN 0 WHEN UPPER(a.simbolo) LIKE %s THEN 1 ELSE 2 END), a.simbolo" if search else "ABS(pct_cambio) DESC, a.simbolo"
+    opt_order    = [search_up, f"{search_up}%"] if search else []
 
-    s_clause   = "AND (a.simbolo LIKE %s OR a.nombre LIKE %s)" if search else ""
-    opt_search = [f"%{search}%", f"%{search}%"] if search else []
+    s_clause   = "AND (UPPER(a.simbolo) LIKE %s OR LOWER(a.nombre) LIKE %s)" if search else ""
+    opt_search = [f"%{search_up}%", f"%{search.lower().strip()}%"] if search else []
 
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -2160,6 +2177,9 @@ def _watchlist_serialize_row(r: dict) -> dict:
     ganancia_abs    = round((precio - avg) * qty, 2)        if (qty is not None and avg is not None and precio is not None) else None
     ganancia_pct    = round((precio / avg - 1) * 100, 2)    if (avg and precio) else None
 
+    sl = float(r['stop_loss'])   if r.get('stop_loss')   is not None else None
+    tp = float(r['take_profit']) if r.get('take_profit') is not None else None
+
     return {
         'id':                r['id'],
         'accion_id':         r['accion_id'],
@@ -2168,6 +2188,8 @@ def _watchlist_serialize_row(r: dict) -> dict:
         'mercado':           r['mercado'],
         'qty':               qty,
         'avg_buy_price':     avg,
+        'stop_loss':         sl,
+        'take_profit':       tp,
         'note':              r.get('note'),
         'precio':            precio,
         'pct_cambio_dia':    pct_dia,
@@ -2186,7 +2208,7 @@ def get_watchlist():
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT uw.id, uw.accion_id, uw.qty, uw.avg_buy_price, uw.note, uw.added_at,
+                SELECT uw.id, uw.accion_id, uw.qty, uw.avg_buy_price, uw.stop_loss, uw.take_profit, uw.note, uw.added_at,
                        a.simbolo, a.nombre, m.descripcion AS mercado,
                        (SELECT v.precio_cierre FROM valorhistoricoaccion v
                         WHERE v.accion_id = uw.accion_id
@@ -2232,8 +2254,10 @@ def add_watchlist():
 
     qty = _parse_num('qty')
     avg = _parse_num('avg_buy_price')
-    if qty is False or avg is False:
-        return _jresp({'error': 'qty y avg_buy_price deben ser numéricos no negativos'}, 400)
+    sl  = _parse_num('stop_loss')
+    tp  = _parse_num('take_profit')
+    if qty is False or avg is False or sl is False or tp is False:
+        return _jresp({'error': 'qty, avg_buy_price, stop_loss y take_profit deben ser numéricos no negativos'}, 400)
 
     note = (body.get('note') or '').strip() or None
     if note and len(note) > 500:
@@ -2251,9 +2275,9 @@ def add_watchlist():
             if cur.fetchone():
                 return _jresp({'error': 'Ya está en la watchlist'}, 409)
             cur.execute("""
-                INSERT INTO user_watchlist (user_id, accion_id, qty, avg_buy_price, note)
-                VALUES (%s, %s, %s, %s, %s)
-            """, [user_id, accion_id, qty, avg, note])
+                INSERT INTO user_watchlist (user_id, accion_id, qty, avg_buy_price, stop_loss, take_profit, note)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, [user_id, accion_id, qty, avg, sl, tp, note])
             new_id = cur.lastrowid
         conn.commit()
     return _jresp({'ok': True, 'id': new_id}, 201)
@@ -2296,6 +2320,21 @@ def update_watchlist(item_id: int):
             except (TypeError, ValueError):
                 return _jresp({'error': 'avg_buy_price debe ser numérico'}, 400)
 
+    for col in ('stop_loss', 'take_profit'):
+        if col in body:
+            v = body[col]
+            if v is None or v == '':
+                updates.append(f'{col} = NULL')
+            else:
+                try:
+                    f = float(v)
+                    if f < 0:
+                        return _jresp({'error': f'{col} no puede ser negativo'}, 400)
+                    updates.append(f'{col} = %s')
+                    params.append(f)
+                except (TypeError, ValueError):
+                    return _jresp({'error': f'{col} debe ser numérico'}, 400)
+
     if 'note' in body:
         note = (body.get('note') or '').strip() or None
         if note and len(note) > 500:
@@ -2333,6 +2372,63 @@ def delete_watchlist(item_id: int):
                 return _jresp({'error': 'No encontrado'}, 404)
         conn.commit()
     return _jresp({'ok': True})
+
+
+@app.route('/api/assets/<int:accion_id>/signals')
+@login_required
+def get_asset_signals(accion_id: int):
+    """Notificaciones de estrategia para un ticker específico (últimos 30 días)."""
+    user_id = request.user['sub']
+    limit = min(int(request.args.get('limit', 30)), 100)
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT n.id, n.kind, n.title, n.body, n.signal_code, n.signal_direction,
+                       n.created_at, n.read_at
+                FROM notification n
+                WHERE n.accion_id = %s
+                  AND (n.user_id IS NULL OR n.user_id = %s)
+                  AND n.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+                ORDER BY n.created_at DESC
+                LIMIT %s
+            """, [accion_id, user_id, limit])
+            rows = cur.fetchall()
+            cur.execute("""
+                SELECT telegram_alerts FROM user_watchlist
+                WHERE user_id = %s AND accion_id = %s
+            """, [user_id, accion_id])
+            wl = cur.fetchone()
+    telegram_on = bool(wl['telegram_alerts']) if wl else False
+    in_watchlist = wl is not None
+    return _jresp({'items': rows, 'telegram_alerts': telegram_on, 'in_watchlist': in_watchlist})
+
+
+@app.route('/api/assets/<int:accion_id>/telegram-alert', methods=['POST'])
+@login_required
+def toggle_telegram_alert(accion_id: int):
+    """Activa/desactiva alertas Telegram para un ticker en la watchlist."""
+    user_id = request.user['sub']
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get('enabled', False))
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM user_watchlist WHERE user_id = %s AND accion_id = %s",
+                [user_id, accion_id],
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.execute(
+                    "INSERT INTO user_watchlist (user_id, accion_id, telegram_alerts) VALUES (%s, %s, %s)",
+                    [user_id, accion_id, int(enabled)],
+                )
+            else:
+                cur.execute(
+                    "UPDATE user_watchlist SET telegram_alerts = %s WHERE id = %s",
+                    [int(enabled), row['id']],
+                )
+        conn.commit()
+    return _jresp({'ok': True, 'telegram_alerts': enabled})
 
 
 # ── Log de movimientos (trades) por usuario ───────────────────────────────────
@@ -3123,6 +3219,93 @@ def scan_elliott():
 
     with _elliott_scan_lock:
         _elliott_scan_cache[market] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/trends/sma200-weekly ─────────────────────────────────────────────────
+#
+# Tendencia de largo plazo de todos los activos con >=201 barras semanales.
+# Calcula SMA200 semanal y clasifica: ALCISTA (precio > SMA200) / BAJISTA.
+
+import threading as _threading_trends
+
+_sma200w_cache: dict | None = None
+_sma200w_cache_ts: float = 0.0
+_sma200w_lock = _threading_trends.Lock()
+_SMA200W_TTL = 3600
+
+
+@app.route('/api/trends/sma200-weekly')
+@login_required
+def trends_sma200_weekly():
+    global _sma200w_cache, _sma200w_cache_ts
+
+    with _sma200w_lock:
+        if _sma200w_cache and (time.time() - _sma200w_cache_ts) < _SMA200W_TTL:
+            return _jresp(_sma200w_cache)
+
+    min_bars = 201
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT simbolo FROM ohlcv_extended
+                WHERE timeframe = 'W'
+                GROUP BY simbolo
+                HAVING COUNT(*) >= %s
+                ORDER BY simbolo
+            """, (min_bars,))
+            symbols = [r['simbolo'] for r in cur.fetchall()]
+
+    items = []
+    for symbol in symbols:
+        try:
+            with _conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT close FROM ohlcv_extended
+                           WHERE simbolo = %s AND timeframe = 'W'
+                           ORDER BY fecha DESC LIMIT 200""",
+                        (symbol,),
+                    )
+                    rows = cur.fetchall()
+                    if len(rows) < 200:
+                        continue
+                    closes = [float(r['close']) for r in reversed(rows)]
+                    sma200 = sum(closes) / 200
+                    price = closes[-1]
+                    dist_pct = round((price / sma200 - 1) * 100, 2)
+
+                    cur.execute(
+                        "SELECT id, nombre FROM accion WHERE simbolo = %s LIMIT 1",
+                        (symbol,),
+                    )
+                    asset = cur.fetchone()
+
+            items.append({
+                'simbolo':     symbol,
+                'nombre':      asset['nombre'] if asset else symbol,
+                'accion_id':   asset['id'] if asset else None,
+                'price':       round(price, 2),
+                'sma200':      round(sma200, 2),
+                'distance_pct': dist_pct,
+                'trend':       'ALCISTA' if price > sma200 else 'BAJISTA',
+            })
+        except Exception:
+            continue
+
+    items.sort(key=lambda x: x['distance_pct'], reverse=True)
+    result = {
+        'items': items,
+        'fecha': str(datetime.date.today()),
+        'total': len(items),
+        'alcistas': sum(1 for i in items if i['trend'] == 'ALCISTA'),
+        'bajistas': sum(1 for i in items if i['trend'] == 'BAJISTA'),
+    }
+
+    with _sma200w_lock:
+        _sma200w_cache = result
+        _sma200w_cache_ts = time.time()
 
     return _jresp(result)
 

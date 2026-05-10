@@ -27,13 +27,14 @@ interface Props {
   plusDI:  (number | null)[]
   minusDI: (number | null)[]
   height?: number
+  visibleRange?: { from: number; to: number } | null
 }
 
 const BG     = '#0b0d11'
 const BORDER = '#1e2535'
 const TEXT   = '#7c8ca1'
 
-export default function ADXPanel({ candles, adx, plusDI, minusDI, height = 180 }: Props) {
+export default function ADXPanel({ candles, adx, plusDI, minusDI, height = 180, visibleRange }: Props) {
   const ref      = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const [showHelp, setShowHelp] = useState(false)
@@ -92,8 +93,8 @@ export default function ADXPanel({ candles, adx, plusDI, minusDI, height = 180 }
 
     // -- ADX line (amarilla, mas gruesa: protagonista) --
     const adxSeries = chart.addLineSeries({
-      color:            '#facc15',
-      lineWidth:        3,
+      color:            '#3b82f6',
+      lineWidth:        2,
       priceLineVisible: false,
       lastValueVisible: true,
       crosshairMarkerVisible: true,
@@ -154,6 +155,11 @@ export default function ADXPanel({ candles, adx, plusDI, minusDI, height = 180 }
     return () => { ro.disconnect(); chart.remove(); chartRef.current = null }
   }, [candles, adx, plusDI, minusDI, height])
 
+  useEffect(() => {
+    if (!chartRef.current || !visibleRange) return
+    try { chartRef.current.timeScale().setVisibleLogicalRange(visibleRange) } catch {}
+  }, [visibleRange])
+
   const lastAdx     = lastNonNull(adx)
   const lastPlus    = lastNonNull(plusDI)
   const lastMinus   = lastNonNull(minusDI)
@@ -173,7 +179,7 @@ export default function ADXPanel({ candles, adx, plusDI, minusDI, height = 180 }
 
         <div className="flex items-center gap-2 text-2xs font-mono">
           <span className="flex items-center gap-1">
-            <span className="inline-block w-3 h-[3px] rounded bg-[#facc15]" />ADX
+            <span className="inline-block w-3 h-[2px] rounded bg-[#3b82f6]" />ADX
             {lastAdx != null && <span className="text-text-muted">{lastAdx.toFixed(0)}</span>}
           </span>
           <span className="flex items-center gap-1">

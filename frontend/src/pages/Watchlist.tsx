@@ -40,6 +40,7 @@ export default function Watchlist() {
   const [loading, setLoading] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const [editItem, setEditItem] = useState<WatchlistItem | null>(null)
+  const [deleteItem, setDeleteItem] = useState<WatchlistItem | null>(null)
   const [error, setError] = useState('')
   const navigate = useNavigate()
 
@@ -59,12 +60,13 @@ export default function Watchlist() {
   useEffect(() => { load() }, [load])
 
   const handleDelete = async (item: WatchlistItem) => {
-    if (!confirm(`¿Quitar ${item.simbolo} de la watchlist?`)) return
     try {
       await deleteWatchlist(item.id)
       setItems(xs => xs.filter(x => x.id !== item.id))
+      setDeleteItem(null)
     } catch (e: any) {
-      alert(e.message || 'Error al eliminar')
+      setError(e.message || 'Error al eliminar')
+      setDeleteItem(null)
     }
   }
 
@@ -129,6 +131,8 @@ export default function Watchlist() {
                 <th className="table-header text-right px-3 py-2.5">Var día</th>
                 <th className="table-header text-right px-3 py-2.5">Último precio</th>
                 <th className="table-header text-right px-3 py-2.5">Precio compra</th>
+                <th className="table-header text-right px-3 py-2.5">SL</th>
+                <th className="table-header text-right px-3 py-2.5">TP</th>
                 <th className="table-header text-right px-3 py-2.5">G/P %</th>
                 <th className="table-header text-right px-3 py-2.5">Valor corriente</th>
                 <th className="table-header text-right px-3 py-2.5 w-24">Acciones</th>
@@ -137,7 +141,7 @@ export default function Watchlist() {
             <tbody>
               {loading && items.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="text-center py-10 text-text-muted text-xs">
+                  <td colSpan={10} className="text-center py-10 text-text-muted text-xs">
                     <Loader2 size={16} className="inline animate-spin mr-2" />
                     Cargando watchlist…
                   </td>
@@ -145,7 +149,7 @@ export default function Watchlist() {
               )}
               {!loading && items.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="text-center py-10 text-text-muted text-xs">
+                  <td colSpan={10} className="text-center py-10 text-text-muted text-xs">
                     Tu watchlist está vacía. Agregá tu primer activo con el botón de arriba.
                   </td>
                 </tr>
@@ -200,6 +204,16 @@ export default function Watchlist() {
                     {it.avg_buy_price != null ? `$${fmtNum(it.avg_buy_price)}` : '—'}
                   </td>
 
+                  {/* SL */}
+                  <td className={cn('px-3 py-2 text-right num', it.stop_loss != null && it.precio != null && it.precio <= it.stop_loss ? 'text-red-400 font-semibold' : 'text-text-muted')}>
+                    {it.stop_loss != null ? `$${fmtNum(it.stop_loss)}` : '—'}
+                  </td>
+
+                  {/* TP */}
+                  <td className={cn('px-3 py-2 text-right num', it.take_profit != null && it.precio != null && it.precio >= it.take_profit ? 'text-green-400 font-semibold' : 'text-text-muted')}>
+                    {it.take_profit != null ? `$${fmtNum(it.take_profit)}` : '—'}
+                  </td>
+
                   {/* G/P % */}
                   <td className={cn('px-3 py-2 text-right num', pctClass(it.ganancia_pct))}>
                     {fmtPct(it.ganancia_pct)}
@@ -222,7 +236,7 @@ export default function Watchlist() {
                       </button>
                       <button
                         className="p-1.5 rounded hover:bg-red-500/10 text-text-muted hover:text-red-400 transition-colors cursor-pointer"
-                        onClick={() => handleDelete(it)}
+                        onClick={() => setDeleteItem(it)}
                         title="Quitar"
                       >
                         <Trash2 size={13} />
@@ -240,7 +254,7 @@ export default function Watchlist() {
                   <td className="px-3 py-2.5 text-xs font-semibold text-text-primary" colSpan={4}>
                     Totales · invertido ${fmtNum(totals.invertido)}
                   </td>
-                  <td className="px-3 py-2.5"></td>
+                  <td className="px-3 py-2.5" colSpan={3}></td>
                   <td className={cn('px-3 py-2.5 text-right num font-semibold', pctClass(totals.ganPct))}>
                     {fmtPct(totals.ganPct)}
                   </td>
@@ -270,6 +284,13 @@ export default function Watchlist() {
           onSaved={() => { setEditItem(null); load() }}
         />
       )}
+      {deleteItem && (
+        <ConfirmDeleteModal
+          item={deleteItem}
+          onClose={() => setDeleteItem(null)}
+          onConfirm={() => handleDelete(deleteItem)}
+        />
+      )}
     </div>
   )
 }
@@ -291,6 +312,8 @@ function AddWatchlistModal({
   const [selected, setSelected] = useState<Asset | null>(null)
   const [qty, setQty] = useState('')
   const [avg, setAvg] = useState('')
+  const [sl,  setSl]  = useState('')
+  const [tp,  setTp]  = useState('')
   const [note, setNote] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -330,6 +353,8 @@ function AddWatchlistModal({
         accion_id:     selected.accion_id,
         qty:           qty ? parseFloat(qty) : null,
         avg_buy_price: avg ? parseFloat(avg) : null,
+        stop_loss:     sl  ? parseFloat(sl)  : null,
+        take_profit:   tp  ? parseFloat(tp)  : null,
         note:          note.trim() || null,
       })
       onAdded()
@@ -480,6 +505,36 @@ function AddWatchlistModal({
                 />
               </div>
             </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-2xs text-text-muted uppercase tracking-wide block mb-1">
+                  Stop Loss (opcional)
+                </label>
+                <input
+                  type="number"
+                  step="any"
+                  min="0"
+                  className="input"
+                  placeholder="0.00"
+                  value={sl}
+                  onChange={(e) => setSl(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="text-2xs text-text-muted uppercase tracking-wide block mb-1">
+                  Take Profit (opcional)
+                </label>
+                <input
+                  type="number"
+                  step="any"
+                  min="0"
+                  className="input"
+                  placeholder="0.00"
+                  value={tp}
+                  onChange={(e) => setTp(e.target.value)}
+                />
+              </div>
+            </div>
             <div>
               <label className="text-2xs text-text-muted uppercase tracking-wide block mb-1">
                 Nota (opcional)
@@ -531,6 +586,8 @@ function EditWatchlistModal({
 }) {
   const [qty,  setQty]  = useState(item.qty != null ? String(item.qty) : '')
   const [avg,  setAvg]  = useState(item.avg_buy_price != null ? String(item.avg_buy_price) : '')
+  const [sl,   setSl]   = useState(item.stop_loss != null ? String(item.stop_loss) : '')
+  const [tp,   setTp]   = useState(item.take_profit != null ? String(item.take_profit) : '')
   const [note, setNote] = useState(item.note || '')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -542,6 +599,8 @@ function EditWatchlistModal({
       await updateWatchlist(item.id, {
         qty:           qty  === '' ? null : parseFloat(qty),
         avg_buy_price: avg  === '' ? null : parseFloat(avg),
+        stop_loss:     sl   === '' ? null : parseFloat(sl),
+        take_profit:   tp   === '' ? null : parseFloat(tp),
         note:          note.trim() || null,
       })
       onSaved()
@@ -605,6 +664,36 @@ function EditWatchlistModal({
             />
           </div>
         </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-2xs text-text-muted uppercase tracking-wide block mb-1">
+              Stop Loss
+            </label>
+            <input
+              type="number"
+              step="any"
+              min="0"
+              className="input"
+              placeholder="0.00"
+              value={sl}
+              onChange={(e) => setSl(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="text-2xs text-text-muted uppercase tracking-wide block mb-1">
+              Take Profit
+            </label>
+            <input
+              type="number"
+              step="any"
+              min="0"
+              className="input"
+              placeholder="0.00"
+              value={tp}
+              onChange={(e) => setTp(e.target.value)}
+            />
+          </div>
+        </div>
         <div>
           <label className="text-2xs text-text-muted uppercase tracking-wide block mb-1">
             Nota
@@ -634,6 +723,64 @@ function EditWatchlistModal({
           >
             {saving && <Loader2 size={13} className="animate-spin" />}
             Guardar
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Modal: confirmar eliminación ─────────────────────────────────────────────
+
+function ConfirmDeleteModal({
+  item,
+  onClose,
+  onConfirm,
+}: {
+  item: WatchlistItem
+  onClose: () => void
+  onConfirm: () => void
+}) {
+  const [deleting, setDeleting] = useState(false)
+
+  const handle = async () => {
+    setDeleting(true)
+    await onConfirm()
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="card-elevated w-full max-w-sm p-5 space-y-4 rounded-xl shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-text-primary">Quitar de la watchlist</h2>
+          <button
+            onClick={onClose}
+            className="p-1 rounded hover:bg-surface text-text-muted hover:text-text-primary cursor-pointer"
+          >
+            <X size={14} />
+          </button>
+        </div>
+
+        <p className="text-xs text-text-muted">
+          ¿Quitar <span className="font-semibold text-text-primary">{item.simbolo}</span> de tu watchlist?
+          Se eliminarán también los niveles de SL/TP configurados.
+        </p>
+
+        <div className="flex items-center justify-end gap-2 pt-2">
+          <button className="btn-ghost text-xs" onClick={onClose}>Cancelar</button>
+          <button
+            className="text-xs px-3 py-1.5 rounded-lg font-medium bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors cursor-pointer"
+            onClick={handle}
+            disabled={deleting}
+          >
+            {deleting && <Loader2 size={13} className="animate-spin inline mr-1" />}
+            Eliminar
           </button>
         </div>
       </div>

@@ -74,6 +74,11 @@ LONG_MAX_BELOW_PROJECTION_PCT = 80.0
 
 NO_BODY_CROSS_TOL_PCT = 0.6
 
+# Body crosses in the last GRACE_BARS bars are allowed — a recent break
+# is exactly what we want to detect (status=BROKEN/TESTING), not filter out.
+BODY_CROSS_GRACE_BARS_W = 4   # ~4 weeks
+BODY_CROSS_GRACE_BARS_D = 20  # ~4 weeks
+
 # Sideways (lateralizacion): detectar TECHO horizontal en vez de piso.
 SIDEWAYS_WINDOW_BARS        = 10
 SIDEWAYS_MAX_REL_STDEV      = 0.08
@@ -166,6 +171,8 @@ def _fit_trendline_log(
     strict_wick:    bool = True,
     max_span:       Optional[int] = None,
     body_cross_tol: float = math.log(1 + NO_BODY_CROSS_TOL_PCT / 100),
+    post_anchor_tol: float = 0.005,
+    grace_bars:     int = 0,
 ) -> Optional[dict]:
     """
     Busca la mejor trendline DESCENDENTE (slope < 0) de resistencia.
@@ -180,6 +187,7 @@ def _fit_trendline_log(
     N        = n_total if n_total is not None else len(highs)
     last_px  = highs[-1]
     best: Optional[dict] = None
+    body_check_end = max(0, len(highs) - grace_bars)
 
     for a in range(len(pivots)):
         if anchor1_range is not None:
@@ -205,7 +213,7 @@ def _fit_trendline_log(
                 continue
             intercept = log_wick[i] - slope * i
 
-            if any(slope * k + intercept < log_body[k] - body_cross_tol for k in range(i, len(highs))):
+            if any(slope * k + intercept < log_body[k] - body_cross_tol for k in range(i, body_check_end)):
                 continue
 
             if min_proj_ratio is not None:
@@ -260,7 +268,7 @@ def _fit_trendline_log(
             if skip_higher_high:
                 continue
 
-            if any(highs[k] > highs[j] * 1.005 for k in range(j + 1, len(highs))):
+            if any(highs[k] > highs[j] * (1 + post_anchor_tol) for k in range(j + 1, len(highs))):
                 continue
 
             score = touches * 4.0 - violations * 10.0 - violations_post * 2.0 + span * 0.03
@@ -345,6 +353,8 @@ def _fit_regression_log(
     apply_obsolete: bool = True,
     max_span:       Optional[int] = None,
     body_cross_tol: float = math.log(1 + NO_BODY_CROSS_TOL_PCT / 100),
+    post_anchor_tol: float = 0.005,
+    grace_bars:     int = 0,
 ) -> Optional[dict]:
     """
     Regresion lineal sobre cadenas de lower-highs en log-space.
@@ -361,6 +371,7 @@ def _fit_regression_log(
     N        = n_total if n_total is not None else len(highs)
     last_px  = highs[-1]
     best: Optional[dict] = None
+    body_check_end = max(0, len(highs) - grace_bars)
 
     for start_k in range(len(pivots) - min_touches + 1):
         chain = _falling_chain(pivots, highs, start_k)
@@ -407,7 +418,7 @@ def _fit_regression_log(
 
         intercept = log_wick[i0] - slope * i0
 
-        if any(slope * k + intercept < log_body[k] - body_cross_tol for k in range(i0, len(highs))):
+        if any(slope * k + intercept < log_body[k] - body_cross_tol for k in range(i0, body_check_end)):
             continue
 
         if min_proj_ratio is not None:
@@ -450,7 +461,7 @@ def _fit_regression_log(
         if skip_higher_high:
             continue
 
-        if any(highs[k] > highs[i1] * 1.005 for k in range(i1 + 1, len(highs))):
+        if any(highs[k] > highs[i1] * (1 + post_anchor_tol) for k in range(i1 + 1, len(highs))):
             continue
 
         touches = len(chain)
@@ -578,6 +589,9 @@ def _tier_is_invalidated_by_trend(tl: dict, rows: list[dict]) -> bool:
     resistencias que el precio apenas cruza (ej OKLO 12% above pero solo
     14% de recovery) mientras invalida las que claramente se rompieron
     (ej GOOGL 84% recovery).
+
+    No invalida si distance < 10% — eso es zona de testing/recien-rota, la
+    resistencia sigue siendo relevante.
     """
     n = len(rows)
     last_close   = float(rows[-1]['close'])
@@ -585,6 +599,9 @@ def _tier_is_invalidated_by_trend(tl: dict, rows: list[dict]) -> bool:
     distance_pct = (last_close / current_val - 1) * 100
 
     if distance_pct <= 0:
+        return False
+
+    if distance_pct < 10.0:
         return False
 
     closes = [float(r['close']) for r in rows[-INVALIDATE_RECENT_BARS:]]
@@ -732,8 +749,6 @@ def _build_tier(
     line_points = []
     for x in range(i0, n):
         y = math.exp(slope * x + intercept)
-        if x > i1 and y < float(rows[x]['high']):
-            break
         line_points.append({
             'fecha': rows[x]['fecha'].isoformat(),
             'value': round(y, 4),
@@ -857,6 +872,8 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
     piv_mid   = _pivot_highs(highs, win_mid_px)
     piv_short = _pivot_highs(highs, 3)
 
+    grace = BODY_CROSS_GRACE_BARS_W if tf == 'W' else BODY_CROSS_GRACE_BARS_D
+
     bars_per_year_tf = {'W': 52, 'D': 252, 'M': 12}.get(tf, 252)
     long_max_span = min(20 * bars_per_year_tf, int(n * 0.90))
     piv_combined = sorted(set(piv_long + piv_mid))
@@ -882,6 +899,7 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
         max_span=long_max_span,
         min_proj_ratio=1.0 / 1.5,
         n_total=n, apply_obsolete=True,
+        grace_bars=grace,
     )
 
     for decline_start_idx in decline_candidates:
@@ -898,6 +916,7 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
             max_span=long_max_span,
             min_proj_ratio=1.0 / 1.5,
             n_total=n, apply_obsolete=True,
+            grace_bars=grace,
         )
         if long_tl_locked is not None:
             long_tl = long_tl_locked
@@ -932,21 +951,25 @@ def get_dynamic_resistances(symbol: str, fecha: Optional[date] = None,
         min_span=span_short, tol_pct=PRICE_TOL_PCT,
         anchor1_range=(mid_a1_lo, 0.98),
         anchor2_min=0.90,
+        post_anchor_tol=0.03,
         n_total=n, apply_obsolete=False,
+        grace_bars=grace,
     )
 
     # ── short (magenta): diagonal descendente CP, fallback a horizontal ─────
     # PRIMERO: diagonal de "lower highs" de la pierna bajista actual, con
-    # anchor1 muy cercano al presente (ultimo ~5%). Relajamos a min_touches=2
-    # porque una resistencia CP recien formada tipicamente solo tiene 2 anclas
-    # claras. Si no hay diagonal valida, cae al detector de lateralizacion.
+    # anchor1 cercano al presente. Relajamos a min_touches=2 porque una
+    # resistencia CP recien formada tipicamente solo tiene 2 anclas claras.
+    # Si no hay diagonal valida, cae al detector de lateralizacion.
     short_tl = _try_fit(
         highs, body_highs, [piv_short, piv_mid, piv_combined],
         min_span=span_short, tol_pct=PRICE_TOL_PCT,
-        anchor1_range=(0.95, 0.998),
-        anchor2_min=0.985,
+        anchor1_range=(0.80, 0.998),
+        anchor2_min=0.96,
         min_touches=2,
+        post_anchor_tol=0.03,
         n_total=n, apply_obsolete=False,
+        grace_bars=grace,
     )
     if short_tl is None:
         closes = [float(r['close']) for r in rows]

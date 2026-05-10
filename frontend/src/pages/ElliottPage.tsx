@@ -63,7 +63,7 @@ export default function ElliottPage() {
     try {
       const [ell, ohlcv] = await Promise.all([
         api.elliott(accionId),
-        api.ohlcv(accionId, 500),
+        api.ohlcvExtended(accionId, 'D'),
       ])
       setDetail(ell)
       setCandles(ohlcv.candles)
@@ -86,17 +86,20 @@ export default function ElliottPage() {
     setDetailLoading(false)
   }, [])
 
-  // Search assets
+  // Search assets — abort stale requests to avoid race conditions
   useEffect(() => {
-    if (search.length < 2) { setSearchResults([]); return }
+    if (search.length < 1) { setSearchResults([]); setSearchOpen(false); return }
+    const abort = new AbortController()
     const timer = setTimeout(async () => {
       try {
-        const res = await api.assets(market, search, 0, 8)
-        setSearchResults(res.items.map(a => ({ id: a.accion_id, simbolo: a.simbolo, nombre: a.nombre })))
-        setSearchOpen(true)
+        const res = await api.assets(market, search, 0, 10)
+        if (abort.signal.aborted) return
+        const items = res.items.map((a: any) => ({ id: a.accion_id, simbolo: a.simbolo, nombre: a.nombre }))
+        setSearchResults(items)
+        setSearchOpen(items.length > 0)
       } catch { /* ignore */ }
-    }, 300)
-    return () => clearTimeout(timer)
+    }, 250)
+    return () => { clearTimeout(timer); abort.abort() }
   }, [search, market])
 
   const signalCounts = {
@@ -145,8 +148,17 @@ export default function ElliottPage() {
             value={search}
             onChange={e => setSearch(e.target.value)}
             onFocus={() => searchResults.length > 0 && setSearchOpen(true)}
-            placeholder="Buscar activo por símbolo o nombre..."
-            className="input w-full pl-9 h-9 text-sm"
+            onBlur={() => setTimeout(() => setSearchOpen(false), 200)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && searchResults.length > 0) {
+                loadDetail(searchResults[0].id)
+                setSearchOpen(false)
+                setSearch('')
+              }
+              if (e.key === 'Escape') { setSearchOpen(false) }
+            }}
+            placeholder="Escribí un símbolo (ej: AAPL, MSFT, TSLA) y seleccioná..."
+            className="input w-full pl-9 h-9 text-sm uppercase"
           />
         </div>
         {searchOpen && searchResults.length > 0 && (

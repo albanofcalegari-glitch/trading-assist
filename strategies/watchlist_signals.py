@@ -35,6 +35,9 @@ NEAR_RESISTANCE_MAX_PCT = 3.0   # % máximo bajo la resistencia para alertar
 BREAKOUT_MAX_DIST_PCT   = 5.0   # % máximo arriba de la resistencia para considerar breakout fresco
 BREAKOUT_SL_PCT         = 5.0   # Stop Loss: -5% desde la resistencia
 BREAKOUT_TP_RATIO       = 2.0   # Risk:Reward 1:2 → TP = +10%
+SMA200_W_NEAR_PCT       = 8.0   # % máximo desde la SMA200 semanal para considerar "cerca"
+SMA200_W_SL_BUFFER_PCT  = 3.0   # SL = SMA200 - 3%
+SMA200_W_MAX_SL_PCT     = 10.0  # solo alertar BUY si riesgo (precio→SL) < 10%
 
 
 def _fmt_price(v: Optional[float]) -> str:
@@ -105,6 +108,23 @@ def _action_hint(code: str, **ctx) -> str:
         return (f'📈 Breakout (1 vela, pendiente confirmación). Entrada con SL en {sl} '
                 f'(-5%) y TP en {tp} (+10%, R:R 1:2). Si mañana cierra arriba de '
                 f'{res} de nuevo, la señal se fortalece.')
+    if code == 'SMA200_W_CROSS':
+        sma_val = _fmt_price(ctx.get('sma200'))
+        direction = ctx.get('direction')
+        cross = ctx.get('cross_type')
+        if direction == 'BUY':
+            sl = _fmt_price(ctx.get('sl'))
+            if cross == 'APPROACHING':
+                return (f'👀 Precio acercándose a la SMA200 semanal ({sma_val}). '
+                        f'Si la toca y rebota o la cruza al alza → compra con SL '
+                        f'debajo de la media ({sl}). Esperá confirmación semanal.')
+            return (f'🎯 Compra: cruce alcista de la SMA200 semanal ({sma_val}). '
+                    f'El SL queda cerca, debajo de la media en {sl}. '
+                    f'Ideal para entrar con riesgo controlado. Si vuelve a cerrar '
+                    f'debajo en semanal, abortar.')
+        return (f'⚠️ Venta: el precio rompió a la baja la SMA200 semanal ({sma_val}). '
+                f'Señal bajista de largo plazo. Cerrar largos o reducir posición. '
+                f'Si la recupera en las próximas semanas, reconsiderar.')
     return ''
 
 
@@ -466,6 +486,146 @@ def _detect_resistance_breakout(symbol: str, fecha: date) -> list[dict]:
     return out
 
 
+def _detect_sma200_weekly(symbol: str, fecha: date) -> list[dict]:
+    """Cruce de precio vs SMA200 semanal.
+    BUY: precio sube a la media o la rompe al alza (SL queda cerca).
+    SELL: precio rompe la media a la baja.
+    """
+    out: list[dict] = []
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT fecha, close
+                   FROM ohlcv_extended
+                   WHERE simbolo = %s AND timeframe = 'W' AND fecha <= %s
+                   ORDER BY fecha DESC LIMIT 210""",
+                (symbol, fecha),
+            )
+            rows = list(cur.fetchall())
+        conn.close()
+    except Exception:
+        return out
+
+    if len(rows) < 201:
+        return out
+
+    rows.reverse()
+    closes = [float(r['close']) for r in rows]
+
+    sma200_now  = sum(closes[-200:]) / 200
+    sma200_prev = sum(closes[-201:-1]) / 200
+
+    price_now  = closes[-1]
+    price_prev = closes[-2]
+
+    dist_pct = (price_now / sma200_now - 1) * 100.0
+    sl = round(sma200_now * (1 - SMA200_W_SL_BUFFER_PCT / 100), 2)
+    sl_risk_pct = round((price_now - sl) / price_now * 100, 2) if price_now > 0 else 99
+
+    # ── CRUCE AL ALZA (BUY) ─────────────────────────────────────────────
+    if price_prev <= sma200_prev * 1.001 and price_now > sma200_now:
+        if sl_risk_pct >= SMA200_W_MAX_SL_PCT:
+            return out
+        hint = _action_hint('SMA200_W_CROSS', direction='BUY',
+                            sma200=sma200_now, sl=sl, cross_type='CROSS_UP')
+        body = (f'Precio {_fmt_price(price_now)} cruzó al alza la SMA200 semanal '
+                f'({_fmt_price(sma200_now)}). Distancia: +{dist_pct:.2f}%.\n'
+                f'SL: {_fmt_price(sl)} (riesgo {sl_risk_pct:.1f}%).')
+        out.append({
+            'direction': 'BUY',
+            'code':      'SMA200_W_CROSS',
+            'title':     f'Alerta cruce SMA semanal: {symbol} cruzó al alza',
+            'body':      _with_action(body, hint),
+            'data': {
+                'price':        price_now,
+                'sma200':       round(sma200_now, 2),
+                'distance_pct': round(dist_pct, 3),
+                'sl':           sl,
+                'sl_risk_pct':  sl_risk_pct,
+                'cross_type':   'CROSS_UP',
+                'action':       hint,
+            },
+        })
+        return out
+
+    # ── CERCA POR ARRIBA, SL TODAVÍA CERCA (BUY) ────────────────────────
+    if price_now > sma200_now and 0 < dist_pct <= SMA200_W_NEAR_PCT:
+        if sl_risk_pct >= SMA200_W_MAX_SL_PCT:
+            return out
+        hint = _action_hint('SMA200_W_CROSS', direction='BUY',
+                            sma200=sma200_now, sl=sl, cross_type='NEAR_ABOVE')
+        body = (f'Precio {_fmt_price(price_now)} está a +{dist_pct:.2f}% sobre la '
+                f'SMA200 semanal ({_fmt_price(sma200_now)}). Cruce reciente, SL '
+                f'queda cerca.\nSL: {_fmt_price(sl)} (riesgo {sl_risk_pct:.1f}%).')
+        out.append({
+            'direction': 'BUY',
+            'code':      'SMA200_W_CROSS',
+            'title':     f'Alerta cruce SMA semanal: {symbol} sobre SMA200 (+{dist_pct:.1f}%)',
+            'body':      _with_action(body, hint),
+            'data': {
+                'price':        price_now,
+                'sma200':       round(sma200_now, 2),
+                'distance_pct': round(dist_pct, 3),
+                'sl':           sl,
+                'sl_risk_pct':  sl_risk_pct,
+                'cross_type':   'NEAR_ABOVE',
+                'action':       hint,
+            },
+        })
+        return out
+
+    # ── ACERCÁNDOSE DESDE ABAJO (BUY, early warning) ─────────────────────
+    if (price_now < sma200_now
+            and abs(dist_pct) <= SMA200_W_NEAR_PCT
+            and price_now > price_prev):
+        if sl_risk_pct >= SMA200_W_MAX_SL_PCT:
+            return out
+        hint = _action_hint('SMA200_W_CROSS', direction='BUY',
+                            sma200=sma200_now, sl=sl, cross_type='APPROACHING')
+        body = (f'Precio {_fmt_price(price_now)} acercándose a la SMA200 semanal '
+                f'({_fmt_price(sma200_now)}) desde abajo. Distancia: {dist_pct:.2f}%.\n'
+                f'Si la cruza al alza, compra con SL en {_fmt_price(sl)} (riesgo {sl_risk_pct:.1f}%).')
+        out.append({
+            'direction': 'BUY',
+            'code':      'SMA200_W_CROSS',
+            'title':     f'Alerta cruce SMA semanal: {symbol} acercándose ({dist_pct:.1f}%)',
+            'body':      _with_action(body, hint),
+            'data': {
+                'price':        price_now,
+                'sma200':       round(sma200_now, 2),
+                'distance_pct': round(dist_pct, 3),
+                'sl':           sl,
+                'sl_risk_pct':  sl_risk_pct,
+                'cross_type':   'APPROACHING',
+                'action':       hint,
+            },
+        })
+        return out
+
+    # ── RUPTURA A LA BAJA (SELL) ─────────────────────────────────────────
+    if price_prev >= sma200_prev * 0.999 and price_now < sma200_now:
+        hint = _action_hint('SMA200_W_CROSS', direction='SELL',
+                            sma200=sma200_now, cross_type='CROSS_DOWN')
+        body = (f'Precio {_fmt_price(price_now)} rompió a la baja la SMA200 semanal '
+                f'({_fmt_price(sma200_now)}). Distancia: {dist_pct:.2f}%.')
+        out.append({
+            'direction': 'SELL',
+            'code':      'SMA200_W_CROSS',
+            'title':     f'Alerta cruce SMA semanal: {symbol} rompió a la baja',
+            'body':      _with_action(body, hint),
+            'data': {
+                'price':        price_now,
+                'sma200':       round(sma200_now, 2),
+                'distance_pct': round(dist_pct, 3),
+                'cross_type':   'CROSS_DOWN',
+                'action':       hint,
+            },
+        })
+
+    return out
+
+
 # ── Detector agregado ─────────────────────────────────────────────────────────
 
 _DETECTORS = [
@@ -477,6 +637,7 @@ _DETECTORS = [
     _detect_52w_high,
     _detect_trend_pullback,
     _detect_resistance_breakout,
+    _detect_sma200_weekly,
 ]
 
 

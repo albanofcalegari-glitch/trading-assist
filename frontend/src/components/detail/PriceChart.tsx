@@ -99,6 +99,7 @@ interface Props {
   // mouse para posicionar el popover. Si no se pasa, el click-derecho nativo
   // del browser queda habilitado.
   onContextMenu?: (args: { price: number; clientX: number; clientY: number }) => void
+  onVisibleRangeChange?: (range: { from: number; to: number }) => void
   height?:       number
   // Fecha (YYYY-MM-DD) desde la que mostrar el chart por default.
   // Si está definida y existe en los datos, reemplaza el DEFAULT_BARS.
@@ -132,6 +133,7 @@ export default function PriceChart({
   drawPreview,
   drawPreviewColor,
   onContextMenu,
+  onVisibleRangeChange,
   height = 550,
   viewStartDate,
 }: Props) {
@@ -153,6 +155,8 @@ export default function PriceChart({
   useLayoutEffect(() => { onContextMenuRef.current = onContextMenu }, [onContextMenu])
   useLayoutEffect(() => { drawModeRef.current    = !!drawMode }, [drawMode])
   useLayoutEffect(() => { onDrawPointRef.current = onDrawPoint }, [onDrawPoint])
+  const onVisibleRangeChangeRef = useRef(onVisibleRangeChange)
+  useLayoutEffect(() => { onVisibleRangeChangeRef.current = onVisibleRangeChange }, [onVisibleRangeChange])
   // Sincroniza el ref con el prop (para que onDblClick y el reset usen el valor vigente)
   useLayoutEffect(() => { viewStartRef.current = viewStartDate }, [viewStartDate])
 
@@ -507,6 +511,15 @@ export default function PriceChart({
     }
     chart.subscribeClick(onChartClick)
 
+    // ── Sync visible range → ADX/RSI panels ────────────────────────────────
+    const onRangeChange = () => {
+      const cb = onVisibleRangeChangeRef.current
+      if (!cb) return
+      const lr = chart.timeScale().getVisibleLogicalRange()
+      if (lr) cb({ from: lr.from, to: lr.to })
+    }
+    chart.timeScale().subscribeVisibleLogicalRangeChange(onRangeChange)
+
     // ── Responsive ────────────────────────────────────────────────────────────
     const ro = new ResizeObserver(entries => {
       for (const entry of entries) chart.applyOptions({ width: entry.contentRect.width })
@@ -521,6 +534,7 @@ export default function PriceChart({
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseup',   onMouseUp)
       try { chart.unsubscribeClick(onChartClick) } catch {}
+      try { chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRangeChange) } catch {}
       if (zoomBox.parentNode) zoomBox.parentNode.removeChild(zoomBox)
       chart.remove()
       chartRef.current = null
@@ -802,7 +816,7 @@ export default function PriceChart({
         const ind = indicators[i]
         const lineData = ind.dates
           .map((d, j) => ({ time: d as any, value: ind.values[j] }))
-          .filter(p => p.value != null && (validDates.has(p.time as string) || p.time > lastChartDate)) as { time: any; value: number }[]
+          .filter(p => p.value != null) as { time: any; value: number }[]
         pool[i].applyOptions({ color: ind.color, visible: true } as any)
         pool[i].setData(lineData)
       } else {
