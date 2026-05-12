@@ -10,6 +10,7 @@ Uso:
 
 import argparse
 import json
+import ssl
 import sys
 import os
 import urllib.request
@@ -81,12 +82,27 @@ def ensure_tables():
         conn.close()
 
 
+def _ssl_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request('https://open.bymadata.com.ar', method='HEAD'),
+            timeout=5, context=ctx,
+        )
+        return ctx
+    except Exception:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+
 def fetch_byma_bonds() -> list[dict]:
     body = json.dumps({"T2": True, "T1": True, "T0": True}).encode()
     req = urllib.request.Request(BYMA_URL, data=body, headers=HEADERS, method='POST')
 
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
             data = json.loads(resp.read().decode())
     except (urllib.error.URLError, urllib.error.HTTPError) as e:
         print(f'  [ERROR] BYMA API: {e}')
