@@ -349,6 +349,7 @@ export default function AssetDetail() {
     long:   { line: '#00e5ff', mid: 'rgba(0,229,255,0.25)' },
     medium: { line: '#FFD700', mid: 'rgba(255,215,0,0.2)' },
     short:  { line: '#00ff88', mid: 'rgba(0,255,136,0.2)' },
+    micro:  { line: '#ff6b9d', mid: 'rgba(255,107,157,0.15)' },
   }
   const channelItems: ChannelItem[] = showChannels ? (channelData?.channels ?? []) : []
   for (const ch of channelItems) {
@@ -378,7 +379,7 @@ export default function AssetDetail() {
       lowerVals.push(l)
       midVals.push(Math.sqrt(u * l))
     }
-    const label = ch.horizon === 'long' ? 'LP' : ch.horizon === 'medium' ? 'MP' : 'CP'
+    const label = ch.horizon === 'long' ? 'LP' : ch.horizon === 'medium' ? 'MP' : ch.horizon === 'micro' ? 'μP' : 'CP'
     indicatorLines.push(
       { dates, values: upperVals, color: colors.line, label: `Canal ${label} Upper` },
       { dates, values: lowerVals, color: colors.line, label: `Canal ${label} Lower` },

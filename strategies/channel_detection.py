@@ -44,15 +44,17 @@ MIN_WEEKS        = 30     # mínimo de semanas de data
 LOOKBACK_YEARS   = 4      # cuántos años de historia para detección
 TOUCH_TOL        = 0.05   # tolerancia en log-space (~5% en precio)
 MIN_TOUCHES      = 5      # mínimo de toques totales (lower + upper)
-MIN_CONTAINMENT  = 0.60   # mínimo % de semanas dentro del canal
+MIN_CONTAINMENT  = 0.50   # mínimo % de semanas dentro del canal
 MAX_WIDTH_LOG    = 1.0    # máximo ancho en log-space (~172% en precio)
 MAX_BREACH_PCT   = 30.0   # si algún pivot rompe la línea del canal >30%, rechazar
 
 # Horizontes para detección multi-canal
+# use_daily=True carga datos diarios directamente (para canales cortos recientes)
 HORIZONS = [
-    {'lookback': 4,   'label': 'long',   'min_pivots': 4, 'min_touches': 5, 'min_weeks': 30, 'min_dx': 60},
-    {'lookback': 2,   'label': 'medium', 'min_pivots': 3, 'min_touches': 4, 'min_weeks': 25, 'min_dx': 40},
-    {'lookback': 1,   'label': 'short',  'min_pivots': 3, 'min_touches': 4, 'min_weeks': 20, 'min_dx': 30},
+    {'lookback': 4,   'label': 'long',   'min_pivots': 4, 'min_touches': 5, 'min_weeks': 30, 'min_dx': 60, 'pivot_window': 5},
+    {'lookback': 2,   'label': 'medium', 'min_pivots': 3, 'min_touches': 4, 'min_weeks': 20, 'min_dx': 30, 'pivot_window': 4},
+    {'lookback': 1,   'label': 'short',  'min_pivots': 3, 'min_touches': 3, 'min_weeks': 15, 'min_dx': 15, 'pivot_window': 3},
+    {'lookback': 0.25, 'label': 'micro', 'min_pivots': 3, 'min_touches': 3, 'min_weeks': 30, 'min_dx': 5,  'pivot_window': 3, 'use_daily': True, 'max_width': 0.50},
 ]
 
 
@@ -61,7 +63,7 @@ HORIZONS = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_weekly(symbol: str, fecha_max: date) -> list[dict]:
-    """Carga histórico semanal desde ohlcv_extended."""
+    """Carga histórico semanal. Si no hay W en DB, agrega D→W on the fly."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -69,6 +71,59 @@ def _load_weekly(symbol: str, fecha_max: date) -> list[dict]:
                 """SELECT fecha, open, high, low, close, volume
                    FROM ohlcv_extended
                    WHERE simbolo = %s AND timeframe = 'W' AND fecha <= %s
+                   ORDER BY fecha ASC""",
+                (symbol, fecha_max),
+            )
+            rows = cur.fetchall()
+            if rows:
+                return rows
+
+            cur.execute(
+                """SELECT fecha, open, high, low, close, volume
+                   FROM ohlcv_extended
+                   WHERE simbolo = %s AND timeframe = 'D' AND fecha <= %s
+                   ORDER BY fecha ASC""",
+                (symbol, fecha_max),
+            )
+            daily = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not daily:
+        return []
+
+    weeks: dict[date, dict] = {}
+    for r in daily:
+        d = r['fecha']
+        monday = d - timedelta(days=d.weekday())
+        if monday not in weeks:
+            weeks[monday] = {
+                'fecha': monday,
+                'open': float(r['open']),
+                'high': float(r['high']),
+                'low': float(r['low']),
+                'close': float(r['close']),
+                'volume': int(r['volume']),
+            }
+        else:
+            w = weeks[monday]
+            w['high'] = max(w['high'], float(r['high']))
+            w['low'] = min(w['low'], float(r['low']))
+            w['close'] = float(r['close'])
+            w['volume'] += int(r['volume'])
+
+    return [weeks[k] for k in sorted(weeks.keys())]
+
+
+def _load_daily(symbol: str, fecha_max: date) -> list[dict]:
+    """Carga histórico diario directo desde ohlcv_extended."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT fecha, open, high, low, close, volume
+                   FROM ohlcv_extended
+                   WHERE simbolo = %s AND timeframe = 'D' AND fecha <= %s
                    ORDER BY fecha ASC""",
                 (symbol, fecha_max),
             )
@@ -125,7 +180,10 @@ def detect_channel(symbol: str, fecha: date = None, *,
                    min_pivots: int = MIN_PIVOTS,
                    min_touches: int = MIN_TOUCHES,
                    min_weeks: int = MIN_WEEKS,
-                   min_dx: int = 60) -> Optional[dict]:
+                   min_dx: int = 60,
+                   pivot_window: int = PIVOT_WINDOW,
+                   use_daily: bool = False,
+                   max_width_log: float = MAX_WIDTH_LOG) -> Optional[dict]:
     """
     Detecta un canal paralelo en log-space para el símbolo dado.
 
@@ -134,7 +192,7 @@ def detect_channel(symbol: str, fecha: date = None, *,
     if fecha is None:
         fecha = date.today()
 
-    rows = _load_weekly(symbol, fecha)
+    rows = _load_daily(symbol, fecha) if use_daily else _load_weekly(symbol, fecha)
     if not rows:
         return None
 
@@ -162,8 +220,8 @@ def detect_channel(symbol: str, fecha: date = None, *,
         return None
 
     # Pivots
-    ph_idx = _find_pivot_highs(highs)
-    pl_idx = _find_pivot_lows(lows)
+    ph_idx = _find_pivot_highs(highs, window=pivot_window)
+    pl_idx = _find_pivot_lows(lows, window=pivot_window)
 
     if len(ph_idx) < min_pivots or len(pl_idx) < min_pivots:
         return None
@@ -222,7 +280,7 @@ def detect_channel(symbol: str, fecha: date = None, *,
                     continue
 
                 width_log = ic_up - ic_low
-                if width_log > MAX_WIDTH_LOG:
+                if width_log > max_width_log:
                     continue
 
                 # Métricas upper
@@ -419,6 +477,9 @@ def detect_channels_multi(symbol: str, fecha: date = None) -> list[dict]:
             min_touches=h['min_touches'],
             min_weeks=h['min_weeks'],
             min_dx=h['min_dx'],
+            pivot_window=h.get('pivot_window', PIVOT_WINDOW),
+            use_daily=h.get('use_daily', False),
+            max_width_log=h.get('max_width', MAX_WIDTH_LOG),
         )
         if ch:
             ch['horizon'] = h['label']

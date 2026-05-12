@@ -29,6 +29,7 @@ from batches.opening              import OpeningBatch
 from batches.weekly_ranking       import WeeklyRankingBatch
 from batches.historical_lows_batch import HistoricalLowsBatch
 from batches.historical_highs_batch import HistoricalHighsBatch
+from batches.bonds_alert            import BondsAlertBatch
 # Conforme se vayan implementando, importar acá:
 # from batches.midday          import MiddayBatch
 
@@ -40,6 +41,7 @@ REGISTRY = {
     'weekly_ranking':  WeeklyRankingBatch,
     'historical_lows': HistoricalLowsBatch,
     'historical_highs': HistoricalHighsBatch,
+    'bonds_alert':     BondsAlertBatch,
     # 'midday':          MiddayBatch,
 }
 

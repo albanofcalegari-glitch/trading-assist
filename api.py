@@ -3310,6 +3310,221 @@ def trends_sma200_weekly():
     return _jresp(result)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# BONOS ARGENTINOS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_bonds_cache: dict | None = None
+_bonds_cache_ts: float = 0.0
+_bonds_lock = threading.Lock()
+_BONDS_TTL = 600
+
+
+def _ensure_bonds_tables():
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bonds_price_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    symbol VARCHAR(10) NOT NULL,
+                    fecha DATE NOT NULL,
+                    price_usd DECIMAL(10,4),
+                    price_ars DECIMAL(14,2),
+                    bid_usd DECIMAL(10,4),
+                    ask_usd DECIMAL(10,4),
+                    volume BIGINT DEFAULT 0,
+                    UNIQUE KEY uq_sym_fecha (symbol, fecha),
+                    INDEX idx_symbol (symbol),
+                    INDEX idx_fecha (fecha)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bonds_tir_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    symbol VARCHAR(10) NOT NULL,
+                    fecha DATE NOT NULL,
+                    tir DECIMAL(8,4) NOT NULL,
+                    paridad DECIMAL(8,4),
+                    duration_mod DECIMAL(8,4),
+                    accrued_interest DECIMAL(8,4),
+                    z_score DECIMAL(6,3),
+                    `signal` VARCHAR(20),
+                    UNIQUE KEY uq_sym_fecha (symbol, fecha),
+                    INDEX idx_symbol (symbol),
+                    INDEX idx_signal (`signal`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+try:
+    _ensure_bonds_tables()
+except Exception:
+    pass
+
+
+@app.route('/api/bonds/dashboard')
+def bonds_dashboard():
+    global _bonds_cache, _bonds_cache_ts
+    with _bonds_lock:
+        if _bonds_cache and (time.time() - _bonds_cache_ts) < _BONDS_TTL:
+            return _jresp(_bonds_cache)
+
+    from strategies.bonds_ar import BONDS as BOND_DEFS, ALL_BOND_SYMBOLS, PAIRS, analyze_bond, calc_zscore_signal, calc_spread_signal
+    from scripts.byma_bonds_fetch import fetch_byma_bonds, _best_usd_price
+
+    raw = fetch_byma_bonds()
+    bonds_out = []
+    tir_map = {}
+
+    conn = _conn()
+    try:
+        for sym in ALL_BOND_SYMBOLS:
+            best = _best_usd_price(raw, sym)
+            if not best:
+                continue
+
+            analysis = analyze_bond(sym, best['price'], datetime.date.today())
+            if not analysis:
+                continue
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT tir FROM bonds_tir_history WHERE symbol = %s ORDER BY fecha DESC LIMIT 60",
+                    (sym,),
+                )
+                tir_hist = [float(r['tir']) for r in cur.fetchall()]
+
+            zscore_data = calc_zscore_signal(analysis['tir'], tir_hist)
+            analysis.update(zscore_data)
+            tir_map[sym] = analysis['tir']
+            bonds_out.append(analysis)
+
+        spreads = []
+        for al_sym, gd_sym in PAIRS:
+            if al_sym not in tir_map or gd_sym not in tir_map:
+                continue
+            spread_bps = round((tir_map[al_sym] - tir_map[gd_sym]) * 100, 1)
+
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT a.tir AS al_tir, g.tir AS gd_tir
+                    FROM bonds_tir_history a
+                    JOIN bonds_tir_history g ON a.fecha = g.fecha AND g.symbol = %s
+                    WHERE a.symbol = %s ORDER BY a.fecha DESC LIMIT 60
+                """, (gd_sym, al_sym))
+                spread_hist = [round((float(r['al_tir']) - float(r['gd_tir'])) * 100, 1) for r in cur.fetchall()]
+
+            sp_signal = calc_spread_signal(spread_bps, spread_hist)
+            spreads.append({'al': al_sym, 'gd': gd_sym, 'spread_bps': spread_bps, **sp_signal})
+    finally:
+        conn.close()
+
+    result = {
+        'bonds': bonds_out,
+        'spreads': spreads,
+        'fecha': str(datetime.date.today()),
+    }
+
+    with _bonds_lock:
+        _bonds_cache = result
+        _bonds_cache_ts = time.time()
+
+    return _jresp(result)
+
+
+@app.route('/api/bonds/<symbol>/history')
+def bonds_history(symbol: str):
+    symbol = symbol.upper()
+    days = int(request.args.get('days', 90))
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT p.fecha, p.price_usd, p.price_ars, p.bid_usd, p.ask_usd, p.volume,
+                       t.tir, t.paridad, t.duration_mod, t.z_score, t.`signal`
+                FROM bonds_price_history p
+                LEFT JOIN bonds_tir_history t ON p.symbol = t.symbol AND p.fecha = t.fecha
+                WHERE p.symbol = %s
+                ORDER BY p.fecha DESC
+                LIMIT %s
+            """, (symbol, days))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return _jresp({
+        'symbol': symbol,
+        'history': [{k: (str(v) if isinstance(v, (datetime.date, datetime.datetime)) else
+                         float(v) if hasattr(v, 'as_integer_ratio') else v)
+                     for k, v in r.items()} for r in rows],
+    })
+
+
+@app.route('/api/bonds/curve')
+def bonds_curve():
+    from strategies.bonds_ar import BONDS as BOND_DEFS, ALL_BOND_SYMBOLS, analyze_bond
+    from scripts.byma_bonds_fetch import fetch_byma_bonds, _best_usd_price
+
+    raw = fetch_byma_bonds()
+    points = []
+    for sym in ALL_BOND_SYMBOLS:
+        best = _best_usd_price(raw, sym)
+        if not best:
+            continue
+        analysis = analyze_bond(sym, best['price'], datetime.date.today())
+        if not analysis or analysis.get('tir') is None:
+            continue
+        points.append({
+            'symbol': sym,
+            'law': BOND_DEFS[sym]['law'],
+            'maturity': BOND_DEFS[sym]['maturity'].isoformat(),
+            'tir': analysis['tir'],
+            'paridad': analysis.get('paridad'),
+            'duration_mod': analysis.get('duration_mod'),
+        })
+
+    points.sort(key=lambda x: x['maturity'])
+    return _jresp({'curve': points, 'fecha': str(datetime.date.today())})
+
+
+@app.route('/api/bonds/spreads')
+def bonds_spreads():
+    from strategies.bonds_ar import PAIRS
+    days = int(request.args.get('days', 90))
+
+    conn = _conn()
+    try:
+        result = []
+        for al_sym, gd_sym in PAIRS:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT a.fecha, a.tir AS al_tir, g.tir AS gd_tir
+                    FROM bonds_tir_history a
+                    JOIN bonds_tir_history g ON a.fecha = g.fecha AND g.symbol = %s
+                    WHERE a.symbol = %s
+                    ORDER BY a.fecha DESC
+                    LIMIT %s
+                """, (gd_sym, al_sym, days))
+                rows = cur.fetchall()
+
+            history = [{
+                'fecha': str(r['fecha']),
+                'al_tir': float(r['al_tir']),
+                'gd_tir': float(r['gd_tir']),
+                'spread_bps': round((float(r['al_tir']) - float(r['gd_tir'])) * 100, 1),
+            } for r in rows]
+
+            result.append({'al': al_sym, 'gd': gd_sym, 'history': history})
+    finally:
+        conn.close()
+
+    return _jresp({'pairs': result})
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8000)

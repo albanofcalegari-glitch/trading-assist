@@ -339,7 +339,7 @@ export interface ChannelItem {
   line_slope:       number
   line_ic_lower:    number
   line_ic_upper:    number
-  horizon:          'long' | 'medium' | 'short'
+  horizon:          'long' | 'medium' | 'short' | 'micro'
 }
 
 export interface ChannelData {
@@ -748,6 +748,75 @@ export interface TrendSma200Item {
   trend:        'ALCISTA' | 'BAJISTA'
 }
 
+// ── Bonds types ───────────────────────────────────────────────────────────────
+
+export interface BondAnalysis {
+  symbol:          string
+  law:             string
+  maturity:        string
+  price_clean:     number
+  price_dirty:     number
+  tir:             number
+  paridad:         number
+  duration_mod:    number
+  accrued_interest: number
+  z_score:         number | null
+  signal:          string | null
+  avg_tir:         number | null
+  std_tir:         number | null
+}
+
+export interface BondSpread {
+  al:              string
+  gd:              string
+  spread_bps:      number
+  spread_z:        number | null
+  spread_signal:   string | null
+  avg_spread:      number | null
+}
+
+export interface BondsDashboard {
+  bonds:   BondAnalysis[]
+  spreads: BondSpread[]
+  fecha:   string
+}
+
+export interface BondHistoryRow {
+  fecha:        string
+  price_usd:    number | null
+  price_ars:    number | null
+  bid_usd:      number | null
+  ask_usd:      number | null
+  volume:       number | null
+  tir:          number | null
+  paridad:      number | null
+  duration_mod: number | null
+  z_score:      number | null
+  signal:       string | null
+}
+
+export interface BondCurvePoint {
+  symbol:       string
+  law:          string
+  maturity:     string
+  tir:          number
+  paridad:      number | null
+  duration_mod: number | null
+}
+
+export interface SpreadHistoryRow {
+  fecha:      string
+  al_tir:     number
+  gd_tir:     number
+  spread_bps: number
+}
+
+export interface SpreadPair {
+  al:      string
+  gd:      string
+  history: SpreadHistoryRow[]
+}
+
 // ── Endpoints ──────────────────────────────────────────────────────────────────
 
 export const api = {
@@ -858,6 +927,18 @@ export const api = {
     get<{ items: TrendSma200Item[]; fecha: string; total: number; alcistas: number; bajistas: number }>(
       '/trends/sma200-weekly'
     ),
+
+  bondsDashboard: () =>
+    get<BondsDashboard>('/bonds/dashboard'),
+
+  bondsHistory: (symbol: string, days = 90) =>
+    get<{ symbol: string; history: BondHistoryRow[] }>(`/bonds/${symbol}/history?days=${days}`),
+
+  bondsCurve: () =>
+    get<{ curve: BondCurvePoint[]; fecha: string }>('/bonds/curve'),
+
+  bondsSpreads: (days = 90) =>
+    get<{ pairs: SpreadPair[] }>(`/bonds/spreads?days=${days}`),
 
   assetSignals: (id: number, limit = 30) =>
     get<AssetSignalsResponse>(`/assets/${id}/signals?limit=${limit}`),

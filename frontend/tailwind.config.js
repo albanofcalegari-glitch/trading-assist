@@ -33,7 +33,8 @@ export default {
         neutral: { DEFAULT: rgb('--c-neutral'), muted: rgb('--c-neutral-muted') },
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', 'sans-serif'],
+        sans: ['DM Sans', 'Inter', 'system-ui', 'sans-serif'],
+        heading: ['Syne', 'DM Sans', 'system-ui', 'sans-serif'],
         mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
       },
       fontSize: {

@@ -12,6 +12,7 @@ import Movimientos from '@/pages/Movimientos'
 import Settings    from '@/pages/Settings'
 import ElliottPage from '@/pages/ElliottPage'
 import Tendencias  from '@/pages/Tendencias'
+import Bonos       from '@/pages/Bonos'
 import Login       from '@/pages/Login'
 
 function ProtectedRoutes() {
@@ -29,6 +30,7 @@ function ProtectedRoutes() {
         <Route path="/watchlist" element={<Watchlist />} />
         <Route path="/elliott" element={<ElliottPage />} />
         <Route path="/tendencias" element={<Tendencias />} />
+        <Route path="/bonos" element={<Bonos />} />
         {username === 'albano' && (
           <Route path="/movimientos" element={<Movimientos />} />
         )}

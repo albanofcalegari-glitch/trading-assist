@@ -3,6 +3,7 @@ import { NavLink, Link } from 'react-router-dom'
 import {
   LayoutDashboard, ScanLine, Bell, Settings, TrendingUp, X,
   ChevronsLeft, ChevronsRight, Star, BookOpen, Activity, BarChart3,
+  Landmark,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -14,6 +15,7 @@ const BASE_NAV = [
   { to: '/watchlist', icon: Star,             label: 'Watchlist' },
   { to: '/elliott',     icon: Activity,         label: 'Elliott Wave' },
   { to: '/tendencias', icon: BarChart3,        label: 'Tendencias' },
+  { to: '/bonos',      icon: Landmark,         label: 'Bonos' },
 ]
 
 const MOVIMIENTOS_ITEM = {
@@ -78,11 +80,11 @@ export default function Sidebar({ open, onClose }: Props) {
             aria-label="Ir al dashboard"
             title="Trading Assist"
           >
-            <div className="w-7 h-7 rounded-md bg-accent/20 flex items-center justify-center shrink-0">
-              <TrendingUp size={14} className="text-accent" />
+            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-accent to-signal flex items-center justify-center shrink-0">
+              <TrendingUp size={14} className="text-white" />
             </div>
             {!collapsed && (
-              <span className="font-semibold text-sm text-text-primary tracking-tight truncate">
+              <span className="font-heading font-semibold text-sm text-text-primary tracking-tight truncate">
                 Trading Assist
               </span>
             )}

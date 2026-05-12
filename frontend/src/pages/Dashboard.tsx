@@ -1,6 +1,9 @@
-import { useState, useEffect, useCallback } from 'react'
-import { RefreshCw, Filter, AlertTriangle, TrendingDown, TrendingUp, Activity } from 'lucide-react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { RefreshCw, Filter, AlertTriangle, TrendingDown, TrendingUp, Activity, Search, X } from 'lucide-react'
 import { api, type Mover, type Asset, type MarketContext } from '@/lib/api'
+import { fmtPrice, fmtPct, pctClass } from '@/lib/utils'
+import { useGapFilter, GAP_OPTIONS, type GapThreshold } from '@/lib/gapFilter'
 import MoverBlock from '@/components/dashboard/MoverBlock'
 import AssetTable from '@/components/dashboard/AssetTable'
 
@@ -9,6 +12,106 @@ const MARKETS = [
   { value: 'USA',  label: 'USA' },
   { value: 'BYMA', label: 'BYMA' },
 ]
+
+function QuickSearch() {
+  const navigate = useNavigate()
+  const [query, setQuery]     = useState('')
+  const [results, setResults] = useState<Asset[]>([])
+  const [open, setOpen]       = useState(false)
+  const [loading, setLoading] = useState(false)
+  const timer = useRef<ReturnType<typeof setTimeout>>()
+  const ref   = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const onOutside = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onOutside)
+    return () => document.removeEventListener('mousedown', onOutside)
+  }, [])
+
+  useEffect(() => {
+    clearTimeout(timer.current)
+    if (query.trim().length < 1) { setResults([]); setOpen(false); return }
+    setLoading(true)
+    timer.current = setTimeout(async () => {
+      try {
+        const { items } = await api.assets('', query, 0, 8)
+        setResults(items)
+        setOpen(true)
+      } finally { setLoading(false) }
+    }, 300)
+  }, [query])
+
+  const go = (id: number) => { setQuery(''); setOpen(false); navigate(`/asset/${id}`) }
+
+  return (
+    <div ref={ref} className="relative w-72">
+      <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted" />
+      <input
+        className="input pl-9 pr-8 h-10 text-sm"
+        placeholder="Buscar activo..."
+        value={query}
+        onChange={e => setQuery(e.target.value)}
+        onFocus={() => results.length && setOpen(true)}
+      />
+      {query && (
+        <button
+          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-primary"
+          onClick={() => { setQuery(''); setOpen(false) }}
+        ><X size={12} /></button>
+      )}
+      {open && results.length > 0 && (
+        <div className="absolute top-full mt-1 w-full z-50 card-elevated overflow-hidden shadow-xl rounded-lg border border-border">
+          {results.map(a => (
+            <button
+              key={a.accion_id}
+              className="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-elevated/70 border-b border-border-subtle last:border-0 text-left transition-colors"
+              onClick={() => go(a.accion_id)}
+            >
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono font-medium text-sm text-text-primary">{a.simbolo}</span>
+                  <span className="text-2xs text-text-muted">{a.mercado}</span>
+                </div>
+                <p className="text-2xs text-text-secondary truncate mt-0.5">{a.nombre}</p>
+              </div>
+              <div className="text-right shrink-0">
+                <p className="font-mono text-xs text-text-primary">{fmtPrice(a.precio)}</p>
+                <p className={`text-2xs ${pctClass(a.pct_cambio)}`}>{fmtPct(a.pct_cambio)}</p>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+      {open && loading && (
+        <div className="absolute top-full mt-1 w-full z-50 card-elevated px-3 py-2 text-xs text-text-muted">Buscando...</div>
+      )}
+    </div>
+  )
+}
+
+function GapFilterControl() {
+  const { threshold, setThreshold } = useGapFilter()
+  return (
+    <div className="flex items-center gap-1 text-2xs" title="Filtro de gap de apertura">
+      <span className="text-text-muted uppercase tracking-wider">Gap</span>
+      <div className="flex items-center border border-border rounded-md overflow-hidden">
+        {GAP_OPTIONS.map(opt => (
+          <button
+            key={opt}
+            onClick={() => setThreshold(opt as GapThreshold)}
+            className={`px-2 py-1 transition-colors ${
+              threshold === opt
+                ? 'bg-accent text-white'
+                : 'text-text-secondary hover:text-text-primary hover:bg-elevated'
+            }`}
+          >{opt === 0 ? 'Off' : `${opt}%`}</button>
+        ))}
+      </div>
+    </div>
+  )
+}
 
 export default function Dashboard() {
   const [movers, setMovers] = useState<{
@@ -107,23 +210,29 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-5">
-      {/* Page title */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-base font-semibold text-text-primary">Dashboard</h1>
-          <p className="text-xs text-text-muted mt-0.5">Resumen del mercado</p>
+      {/* Title row: Dashboard + search + controls */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-5">
+          <h1 className="text-xl font-heading font-bold text-text-primary whitespace-nowrap">Dashboard</h1>
+          <QuickSearch />
         </div>
-        <button
-          className="btn-ghost text-xs gap-1.5"
-          onClick={() => { loadCtx(); loadMovers(); loadAssets(market, search, page) }}
-        >
-          <RefreshCw size={13} className={ctxLoading || mLoading ? 'animate-spin' : ''} />
-          Actualizar
-        </button>
+        <div className="flex items-center gap-3">
+          <GapFilterControl />
+          <button
+            className="btn-ghost text-xs gap-1.5"
+            onClick={() => { loadCtx(); loadMovers(); loadAssets(market, search, page) }}
+          >
+            <RefreshCw size={13} className={ctxLoading || mLoading ? 'animate-spin' : ''} />
+            Actualizar
+          </button>
+        </div>
       </div>
 
-      {/* Market Context */}
-      {ctx && <MarketBar ctx={ctx} updatedAt={ctxUpdated} loading={ctxLoading} />}
+      {/* Resumen de mercado */}
+      <div>
+        <p className="text-xs text-text-muted mb-3">Resumen del mercado</p>
+        {ctx && <MarketBar ctx={ctx} updatedAt={ctxUpdated} loading={ctxLoading} />}
+      </div>
 
       {/* Movers — 1 col móvil, 2 cols sm, 4 cols xl */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 md:gap-4">
