@@ -20,6 +20,7 @@ from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from db.connection import get_conn
+from strategies.utils import touch_quality
 
 
 # ── Config por defecto ────────────────────────────────────────────────────────
@@ -174,8 +175,8 @@ def _count_touches(
     zone_max: float,
     role: str,
     config: dict,
-) -> tuple[int, list[int], float]:
-    """Count touches with min temporal separation. Returns (count, indices, avg_bounce_pct)."""
+) -> tuple[int, list[int], float, list[dict]]:
+    """Count touches with min temporal separation. Returns (count, indices, avg_bounce_pct, touch_qualities)."""
     min_bars = config['min_bars_between_touches']
     tol = config['touch_tolerance_percent'] / 100
     lookfwd = config['bounce_lookforward_bars']
@@ -188,6 +189,9 @@ def _count_touches(
     indices: list[int] = []
     last_touch = -min_bars - 1
     bounces: list[float] = []
+    qualities: list[dict] = []
+
+    center = (zone_min + zone_max) / 2
 
     for i in range(n):
         if i - last_touch < min_bars:
@@ -205,18 +209,19 @@ def _count_touches(
             touches += 1
             indices.append(i)
             last_touch = i
-            # bounce: max opposite movement in lookfwd bars
-            center = (zone_min + zone_max) / 2
             bounce = 0.0
             for j in range(i + 1, min(i + lookfwd + 1, n)):
                 if role == 'support':
                     bounce = max(bounce, float(rows[j]['high']) / center - 1)
                 else:
                     bounce = max(bounce, 1 - float(rows[j]['low']) / center)
-            bounces.append(bounce * 100)
+            bounce_pct = bounce * 100
+            bounces.append(bounce_pct)
+            tq = touch_quality(rows, i, center, role, bounce_pct=bounce_pct)
+            qualities.append(tq)
 
     avg_bounce = sum(bounces) / len(bounces) if bounces else 0
-    return touches, indices, avg_bounce
+    return touches, indices, avg_bounce, qualities
 
 
 def _score_horizontal(
@@ -227,9 +232,17 @@ def _score_horizontal(
     center: float,
     total_bars: int,
     state: str,
+    touch_qualities: list[dict] | None = None,
 ) -> int:
-    # Touches: 25%
+    # Touches: 15% (was 25%)
     touch_s = min(100, max(0, touches * 20))
+
+    # Touch quality: 15% (new)
+    if touch_qualities:
+        avg_q = sum(tq['quality'] for tq in touch_qualities) / len(touch_qualities)
+        quality_s = min(100, avg_q * 100)
+    else:
+        quality_s = 50
 
     # Temporal separation: 10%
     if len(touch_indices) >= 2:
@@ -239,7 +252,7 @@ def _score_horizontal(
     else:
         sep_s = 0
 
-    # Reaction (bounce): 20%
+    # Reaction (bounce): 15% (was 20%)
     react_s = min(100, avg_bounce_pct * 15)
 
     # Cleanness: 15%
@@ -258,7 +271,7 @@ def _score_horizontal(
     state_scores = {'active': 100, 'tested': 80, 'weakening': 50, 'broken': 20, 'invalidated': 10, 'flipped': 90}
     state_s = state_scores.get(state, 50)
 
-    raw = (touch_s * 0.25 + sep_s * 0.10 + react_s * 0.20 +
+    raw = (touch_s * 0.15 + quality_s * 0.15 + sep_s * 0.10 + react_s * 0.15 +
            clean_s * 0.15 + tf_s * 0.15 + state_s * 0.15)
     return int(min(100, max(0, raw)))
 
@@ -292,18 +305,29 @@ def _build_horizontal_levels(
         zone_min = min(min(prices), center - zone_half)
         zone_max = max(max(prices), center + zone_half)
 
+        if role == 'resistance':
+            idx_lo = min(p['idx'] for p in cluster)
+            idx_hi = max(p['idx'] for p in cluster)
+            range_body_tops = [max(float(rows[i]['open']), float(rows[i]['close'])) for i in range(idx_lo, idx_hi + 1)]
+            range_body_bots = sorted(min(float(rows[i]['open']), float(rows[i]['close'])) for i in range(idx_lo, idx_hi + 1))
+            zone_max = max(range_body_tops)
+            zone_min = range_body_bots[len(range_body_bots) // 4]
+            center = (zone_min + zone_max) / 2
+
         # State
-        state = _horizontal_state(last_close, zone_min, zone_max, rows, atrs, config)
+        state = _horizontal_state(last_close, zone_min, zone_max, rows, atrs, config, role)
 
-        touches, t_indices, avg_bounce = _count_touches(rows, zone_min, zone_max, role, config)
+        touches, t_indices, avg_bounce, t_qualities = _count_touches(rows, zone_min, zone_max, role, config)
 
-        score = _score_horizontal(touches, t_indices, avg_bounce, cluster, center, n, state)
+        score = _score_horizontal(touches, t_indices, avg_bounce, cluster, center, n, state, t_qualities)
+
+        avg_quality = sum(tq['quality'] for tq in t_qualities) / len(t_qualities) if t_qualities else 0
 
         earliest_idx = min(p['idx'] for p in cluster)
         explanation = (
             f'Zona de {role} formada por {len(cluster)} pivots entre '
             f'${min(prices):.2f} y ${max(prices):.2f}. '
-            f'{touches} toques con rebote promedio {avg_bounce:.1f}%. '
+            f'{touches} toques (calidad avg {avg_quality:.0%}) con rebote promedio {avg_bounce:.1f}%. '
             f'Estado: {state}.'
         )
 
@@ -321,6 +345,7 @@ def _build_horizontal_levels(
             'state': state,
             'source_pivot_count': len(cluster),
             'avg_bounce_pct': round(avg_bounce, 1),
+            'touch_quality_avg': round(avg_quality, 2),
             'explanation': explanation,
         })
 
@@ -334,13 +359,13 @@ def _horizontal_state(
     rows: list[dict],
     atrs: list[Optional[float]],
     config: dict,
+    role: str = '',
 ) -> str:
     n = len(rows)
     atr = atrs[-1] if atrs[-1] else (zone_max - zone_min)
     break_dist = atr * config['break_distance_atr_multiplier']
     break_n = config['break_close_count']
 
-    # Check last N closes for break
     in_zone = zone_min <= last_close <= zone_max
     above = last_close > zone_max
     below = last_close < zone_min
@@ -352,7 +377,20 @@ def _horizontal_state(
             return 'tested'
         return 'active'
 
-    # Count consecutive closes beyond the zone
+    if role == 'resistance' and below:
+        deep_thresh = zone_max * 1.06
+        consec = 0
+        for i in range(n):
+            if float(rows[i]['close']) > deep_thresh:
+                consec += 1
+                if consec >= 3:
+                    return 'broken'
+            else:
+                consec = 0
+        return 'active'
+    if role == 'support' and above:
+        return 'active'
+
     consec_beyond = 0
     for i in range(n - 1, max(n - 10, -1), -1):
         c = float(rows[i]['close'])
@@ -369,7 +407,6 @@ def _horizontal_state(
             return 'invalidated'
         return 'broken'
 
-    # Price is outside but not enough consecutive closes
     dist = abs(last_close - (zone_min if below else zone_max))
     if dist < break_dist:
         return 'weakening'
@@ -536,7 +573,7 @@ def _fit_diagonals(
             accel_thresh = config['acceleration_slope_annual_pct']
             classification = 'acceleration' if slope_annual > accel_thresh else 'structural'
 
-            score = _score_diagonal(
+            score, avg_tq, tl_qualities = _score_diagonal(
                 touches, touch_idxs, violations, slope_annual,
                 span, n, classification, last_close,
                 slope, intercept, rows, closes, atrs, config,
@@ -595,8 +632,10 @@ def _fit_diagonals(
                 'line_points': line_points,
                 'zone_upper_points': zone_upper,
                 'zone_lower_points': zone_lower,
+                'touch_quality_avg': avg_tq,
                 'explanation': (
-                    f'Trendline {classification} de {role}: {touches} toques, '
+                    f'Trendline {classification} de {role}: {touches} toques '
+                    f'(calidad avg {avg_tq:.0%}), '
                     f'slope {slope_annual:.0f}%/año, {violations} violaciones. '
                     f'Estado: {state}.'
                 ),
@@ -786,8 +825,11 @@ def _score_diagonal(
     closes: list[float],
     atrs: list[Optional[float]],
     config: dict,
-) -> int:
-    # Touches: 25%
+) -> tuple[int, float, list[dict]]:
+    """Returns (score, avg_touch_quality, touch_qualities)."""
+    role = 'support' if slope > 0 else 'resistance'
+
+    # Touches: 15% (was 25%)
     touch_s = min(100, touches * 25)
 
     # Slope: 15% — penalize steep
@@ -806,10 +848,11 @@ def _score_diagonal(
     # Violations: 15%
     viol_s = max(0, 100 - violations * 30)
 
-    # Bounce reaction: 20%
+    # Bounce reaction + touch quality: 15% + 15%
     n = len(rows)
     lookfwd = config['bounce_lookforward_bars']
     bounces: list[float] = []
+    t_qualities: list[dict] = []
     for ti in touch_idxs:
         current_line = math.exp(slope * ti + intercept)
         best_bounce = 0
@@ -818,9 +861,16 @@ def _score_diagonal(
                 best_bounce = max(best_bounce, float(rows[j]['high']) / current_line - 1)
             else:
                 best_bounce = max(best_bounce, 1 - float(rows[j]['low']) / current_line)
-        bounces.append(best_bounce * 100)
+        bounce_pct = best_bounce * 100
+        bounces.append(bounce_pct)
+        tq = touch_quality(rows, ti, current_line, role, bounce_pct=bounce_pct)
+        t_qualities.append(tq)
+
     avg_bounce = sum(bounces) / len(bounces) if bounces else 0
     react_s = min(100, avg_bounce * 15)
+
+    avg_q = sum(tq['quality'] for tq in t_qualities) / len(t_qualities) if t_qualities else 0.5
+    quality_s = min(100, avg_q * 100)
 
     # State: 15%
     n = len(rows)
@@ -841,9 +891,9 @@ def _score_diagonal(
         else:
             state_s = 30
 
-    raw = (touch_s * 0.25 + slope_s * 0.15 + react_s * 0.20 +
+    raw = (touch_s * 0.15 + quality_s * 0.15 + slope_s * 0.15 + react_s * 0.15 +
            viol_s * 0.15 + span_s * 0.10 + state_s * 0.15)
-    return int(min(100, max(0, raw)))
+    return int(min(100, max(0, raw))), round(avg_q, 2), t_qualities
 
 
 def _diagonal_state(

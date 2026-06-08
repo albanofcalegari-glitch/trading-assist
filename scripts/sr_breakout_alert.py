@@ -75,12 +75,31 @@ def _get_last_2_bars(symbol: str) -> list[dict]:
     try:
         with conn.cursor() as cur:
             cur.execute('''
-                SELECT fecha, open, high, low, close
+                SELECT fecha, open, high, low, close, volume
                 FROM ohlcv_extended
                 WHERE simbolo = %s AND timeframe = 'D'
                 ORDER BY fecha DESC LIMIT 2
             ''', (symbol,))
             return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _get_avg_volume(symbol: str, n: int = 20) -> float:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('''
+                SELECT AVG(volume) as avg_vol
+                FROM (
+                    SELECT volume FROM ohlcv_extended
+                    WHERE simbolo = %s AND timeframe = 'D'
+                      AND volume > 0
+                    ORDER BY fecha DESC LIMIT %s
+                ) sub
+            ''', (symbol, n))
+            row = cur.fetchone()
+            return float(row['avg_vol']) if row and row['avg_vol'] else 0
     finally:
         conn.close()
 
@@ -124,7 +143,12 @@ def scan(symbols: list[str]):
             curr_high = float(today['high'])
             curr_low = float(today['low'])
             curr_open = float(today['open'])
+            curr_vol = float(today.get('volume', 0))
             prev_close = float(yesterday['close'])
+
+            avg_vol = _get_avg_volume(symbol)
+            vr = round(curr_vol / avg_vol, 1) if avg_vol > 0 else 0
+            vol_tag = f' [Vol {vr}x]' if vr >= 1.3 else ''
 
             horiz_res = []
             horiz_sup = []
@@ -161,6 +185,7 @@ def scan(symbols: list[str]):
                     'dist_close_pct': round(dist_close, 1),
                     'touches': r['touches'],
                     'anchor1': r['anchor1']['fecha'],
+                    'vol_tag': vol_tag,
                 }
 
                 if dist_close >= RES_BREAK_MIN_PCT and dist_close <= RES_BREAK_MAX_PCT:
@@ -202,6 +227,7 @@ def scan(symbols: list[str]):
                     'low': round(curr_low, 2),
                     'support': round(val_today, 2),
                     'dist_low_pct': round(dist_low, 1),
+                    'vol_tag': vol_tag,
                     'dist_close_pct': round(dist_close, 1),
                     'touches': s['touches'],
                     'anchor1': s['anchor1']['fecha'],
@@ -351,6 +377,7 @@ def format_telegram_message(res_broke, res_touched, sup_bounced, sup_touched, la
             lines.append(
                 f"  `{r['symbol']:6s}` ${r['close']} > R ${r['resistance']} "
                 f"({r['dist_close_pct']:+.1f}%) {r['touches']}t {r['kind']} {r['anchor1']}"
+                f"{r.get('vol_tag', '')}"
             )
         lines.append('')
 
@@ -360,6 +387,7 @@ def format_telegram_message(res_broke, res_touched, sup_bounced, sup_touched, la
             lines.append(
                 f"  `{r['symbol']:6s}` hi ${r['high']} ~ R ${r['resistance']} "
                 f"(c {r['dist_close_pct']:+.1f}%) {r['touches']}t {r['kind']} {r['anchor1']}"
+                f"{r.get('vol_tag', '')}"
             )
         lines.append('')
 
@@ -370,6 +398,7 @@ def format_telegram_message(res_broke, res_touched, sup_bounced, sup_touched, la
                 f"  `{s['symbol']:6s}` lo ${s['low']} ~ S ${s['support']} "
                 f"({s['dist_low_pct']:+.1f}%) -> ${s['close']} "
                 f"{s['touches']}t {s['kind']} {s['anchor1']}"
+                f"{s.get('vol_tag', '')}"
             )
         lines.append('')
 
@@ -380,6 +409,7 @@ def format_telegram_message(res_broke, res_touched, sup_bounced, sup_touched, la
                 f"  `{s['symbol']:6s}` lo ${s['low']} ~ S ${s['support']} "
                 f"({s['dist_low_pct']:+.1f}%) c ${s['close']} "
                 f"{s['touches']}t {s['kind']} {s['anchor1']}"
+                f"{s.get('vol_tag', '')}"
             )
 
     if lateralized:

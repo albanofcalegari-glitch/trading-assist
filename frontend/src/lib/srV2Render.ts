@@ -24,6 +24,7 @@ export interface V2RenderZone {
     state:       string
     touches:     number
     bounce_pct:  number
+    touch_quality_avg: number
     explanation: string
   }
 }
@@ -52,6 +53,7 @@ export interface V2RenderDiagonal {
     violations:      number
     slope_annual_pct: number
     distance_pct:    number
+    touch_quality_avg: number
     explanation:     string
   }
 }
@@ -167,6 +169,7 @@ interface WorkingLevel {
   state:            string
   touches:          number
   avg_bounce_pct:   number
+  touch_quality_avg: number
   source_pivot_count: number
   distance_pct:     number
   last_interaction_bar: number
@@ -233,12 +236,15 @@ export function computeV2RenderObjects(
     const barsSince = Math.max(0, totalBars - level.last_interaction_bar)
     const rs = bandLookup(RECENCY_BANDS, barsSince)
 
+    const qualityBonus = level.touch_quality_avg >= 0.7 ? 0.10 : 0
+
     level.render_score =
       WEIGHTS.normalized_score * ns +
       WEIGHTS.proximity * ps +
       WEIGHTS.timeframe * ts +
       WEIGHTS.state * ss +
-      WEIGHTS.recency * rs
+      WEIGHTS.recency * rs +
+      qualityBonus
   }
 
   // Phase 3: Pruning
@@ -307,6 +313,13 @@ export function computeV2RenderObjects(
     selected.add(pick)
   }
 
+  // Slot 1b: secondary resistance (next horizontal above price)
+  if (resAbove.length > 1) {
+    const pick = resAbove[1]
+    pick.visual_tier = 'secondary'
+    selected.add(pick)
+  }
+
   // Slot 2: primary support (horizontal, below price)
   const supBelow = allLevels
     .filter(l => l.role === 'support' && l.kind === 'horizontal' && l.center_price < currentPrice)
@@ -314,6 +327,13 @@ export function computeV2RenderObjects(
   if (supBelow.length) {
     const pick = supBelow[0]
     pick.visual_tier = 'primary'
+    selected.add(pick)
+  }
+
+  // Slot 2b: secondary support (next horizontal below price)
+  if (supBelow.length > 1) {
+    const pick = supBelow[1]
+    pick.visual_tier = 'secondary'
     selected.add(pick)
   }
 
@@ -391,6 +411,7 @@ export function computeV2RenderObjects(
           state:       level.state,
           touches:     level.touches,
           bounce_pct:  level.avg_bounce_pct,
+          touch_quality_avg: level.touch_quality_avg,
           explanation: level.explanation,
         },
       })
@@ -419,6 +440,7 @@ export function computeV2RenderObjects(
           violations:      level.violations ?? 0,
           slope_annual_pct: level.slope_annual_pct ?? 0,
           distance_pct:    level.distance_pct,
+          touch_quality_avg: level.touch_quality_avg,
           explanation:     level.explanation,
         },
       })
@@ -448,6 +470,7 @@ function horizontalToWorking(h: SRV2HorizontalLevel, totalBars: number, currentP
     state:               h.state,
     touches:             h.touches,
     avg_bounce_pct:      h.avg_bounce_pct,
+    touch_quality_avg:   h.touch_quality_avg ?? 0,
     source_pivot_count:  h.source_pivot_count,
     distance_pct:        distPct,
     last_interaction_bar: totalBars - barsSinceEnd,
@@ -471,6 +494,7 @@ function diagonalToWorking(tl: SRV2Trendline, totalBars: number): WorkingLevel {
     state:                tl.state,
     touches:              tl.touches,
     avg_bounce_pct:       0,
+    touch_quality_avg:    tl.touch_quality_avg ?? 0,
     source_pivot_count:   tl.touches,
     distance_pct:         tl.distance_pct,
     last_interaction_bar: totalBars,
@@ -518,6 +542,9 @@ function mergeOverlapping(levels: WorkingLevel[]): WorkingLevel[] {
             source_pivot_count: a.source_pivot_count + b.source_pivot_count,
             avg_bounce_pct: a.touches + b.touches > 0
               ? (a.avg_bounce_pct * a.touches + b.avg_bounce_pct * b.touches) / (a.touches + b.touches)
+              : 0,
+            touch_quality_avg: a.touches + b.touches > 0
+              ? (a.touch_quality_avg * a.touches + b.touch_quality_avg * b.touches) / (a.touches + b.touches)
               : 0,
             last_interaction_bar: Math.max(a.last_interaction_bar, b.last_interaction_bar),
           }

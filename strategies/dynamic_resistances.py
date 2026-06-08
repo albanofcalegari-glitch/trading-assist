@@ -45,6 +45,7 @@ from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from db.connection import get_conn
+from strategies.utils import touch_quality
 
 
 # ── Constantes (espejo de dynamic_supports.py) ───────────────────────────────
@@ -805,8 +806,15 @@ def _build_tier(
         {'fecha': rows[idx]['fecha'].isoformat(), 'value': round(highs[idx], 4)}
         for idx in touching if idx < n
     ]
-    # Zonas horizontales: floor + ceiling (equivalente a zone_top en supports
-    # pero nombrado explicitamente para evitar confusion semantica).
+    t_qualities = []
+    for idx in touching:
+        if idx < n:
+            line_val = math.exp(slope * idx + intercept) if slope else math.exp(intercept)
+            tq = touch_quality(rows, idx, line_val, 'resistance')
+            t_qualities.append(tq)
+    out['touch_quality_avg'] = round(
+        sum(q['quality'] for q in t_qualities) / len(t_qualities), 2
+    ) if t_qualities else 0
     if 'zone_floor' in tl:
         out['zone_floor']   = round(tl['zone_floor'], 4)
     if 'zone_ceiling' in tl:

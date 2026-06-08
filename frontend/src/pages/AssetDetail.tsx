@@ -1390,6 +1390,9 @@ export default function AssetDetail() {
                           <tr><td className="text-text-muted pr-2">Zona</td><td colSpan={2} className="text-right">${(obj as V2RenderZone).zone_min.toFixed(2)} – ${(obj as V2RenderZone).zone_max.toFixed(2)}</td></tr>
                         )}
                         <tr><td className="text-text-muted pr-2">Toques</td><td colSpan={2} className="text-right">{tt.touches}</td></tr>
+                        {(tt as any).touch_quality_avg > 0 && (
+                          <tr><td className="text-text-muted pr-2">Calidad toques</td><td colSpan={2} className="text-right">{((tt as any).touch_quality_avg * 100).toFixed(0)}%{(tt as any).touch_quality_avg >= 0.7 ? ' ★' : ''}</td></tr>
+                        )}
                         {obj.kind === 'horizontal' && (
                           <tr><td className="text-text-muted pr-2">Rebote prom</td><td colSpan={2} className="text-right">{(tt as V2RenderZone['tooltip']).bounce_pct}%</td></tr>
                         )}

@@ -637,6 +637,7 @@ export interface SRV2HorizontalLevel {
   state:              string   // 'active' | 'tested' | 'weakening' | 'broken' | 'invalidated' | 'flipped'
   source_pivot_count: number
   avg_bounce_pct:     number
+  touch_quality_avg?: number
   explanation:        string
 }
 
@@ -659,6 +660,7 @@ export interface SRV2Trendline {
   line_points:         { fecha: string; value: number }[]
   zone_upper_points:   { fecha: string; value: number }[]
   zone_lower_points:   { fecha: string; value: number }[]
+  touch_quality_avg?:  number
   explanation:         string
 }
 
@@ -738,6 +740,54 @@ export interface ElliottScanItem {
   price:              number
 }
 
+// ── Screener scan types ───────────────────────────────────────────────────────
+
+export interface SRBreakoutItem {
+  accion_id: number | null; simbolo: string; nombre: string; symbol: string
+  tier: string; kind: string; action: string
+  close: number; high?: number; low?: number
+  resistance?: number; support?: number
+  dist_close_pct: number; dist_low_pct?: number
+  touches: number; anchor1: string
+}
+
+export interface SRLateralizedItem {
+  accion_id: number | null; simbolo: string; nombre: string; symbol: string
+  close: number; support: number; resistance: number
+  range_pct: number; sup_touches: number; res_touches: number
+}
+
+export interface SRBreakoutScanResult {
+  status: 'computing' | 'ready'
+  market: string; fecha?: string; cached?: boolean
+  res_broke?: SRBreakoutItem[]; res_touched?: SRBreakoutItem[]
+  sup_bounced?: SRBreakoutItem[]; sup_touched?: SRBreakoutItem[]
+  lateralized?: SRLateralizedItem[]
+}
+
+export interface ChannelScanItem {
+  accion_id: number; simbolo: string; nombre: string
+  horizon: string; channel_type: string; decision: string
+  signal: string; position: number
+  upper_now: number; lower_now: number; price: number
+  reading: string; bounce_confirmed: boolean
+  slope_annual_pct: number
+}
+
+export interface HistLowScanItem {
+  accion_id: number | null; simbolo: string; nombre: string
+  price: number; low_52w: number; distance_52w_pct: number | null
+  setup_state: string; decision: string; reading: string
+  is_all_time_low: boolean; rsi14: number | null
+}
+
+export interface HistHighScanItem {
+  accion_id: number | null; simbolo: string; nombre: string
+  price: number; high_52w: number; distance_52w_pct: number | null
+  setup_state: string; decision: string; reading: string
+  is_all_time_high: boolean; rsi14: number | null
+}
+
 export interface TrendSma200Item {
   simbolo:      string
   nombre:       string
@@ -779,6 +829,56 @@ export interface BondsDashboard {
   bonds:   BondAnalysis[]
   spreads: BondSpread[]
   fecha:   string
+}
+
+export interface CryptoCoin {
+  id:              string
+  symbol:          string
+  name:            string
+  price:           number | null
+  market_cap:      number | null
+  volume_24h:      number | null
+  change_1h_pct:   number | null
+  change_24h_pct:  number | null
+  change_7d_pct:   number | null
+  high_24h:        number | null
+  low_24h:         number | null
+  ath:             number | null
+  ath_change_pct:  number | null
+  sparkline:       number[]
+  last_updated:    string | null
+}
+
+export interface CryptoPricesResponse {
+  coins: CryptoCoin[]
+  ts:    string
+}
+
+export interface CryptoAlert {
+  id:           number
+  coin_id:      string
+  direction:    'below' | 'above'
+  target_price: number
+  label:        string | null
+  active:       boolean
+  triggered_at: string | null
+  created_at:   string | null
+}
+
+export interface CryptoCandle {
+  fecha:  string
+  time:   string
+  open:   number
+  high:   number
+  low:    number
+  close:  number
+  volume: number
+}
+
+export interface CryptoOhlcvResponse {
+  coin_id: string
+  days:    number
+  candles: CryptoCandle[]
 }
 
 export interface BondHistoryRow {
@@ -915,12 +1015,30 @@ export const api = {
   srV2: (id: number) =>
     get<SRV2Result>(`/assets/${id}/sr-v2`),
 
-  elliott: (id: number) =>
-    get<ElliottResult>(`/assets/${id}/elliott`),
+  elliott: (id: number, tf?: 'D' | 'W') =>
+    get<ElliottResult>(`/assets/${id}/elliott${tf ? `?tf=${tf}` : ''}`),
 
-  elliottScan: (market = 'USA') =>
-    get<{ items: ElliottScanItem[]; fecha: string; market: string }>(
-      `/scan/elliott?market=${market}`
+  elliottScan: (market = 'USA', tf?: 'D' | 'W') =>
+    get<{ items: ElliottScanItem[]; fecha: string; market: string; timeframe?: string }>(
+      `/scan/elliott?market=${market}${tf ? `&tf=${tf}` : ''}`
+    ),
+
+  scanSRBreakout: (market = 'USA') =>
+    get<SRBreakoutScanResult>(`/scan/sr-breakout?market=${market}`),
+
+  scanChannels: (market = 'USA') =>
+    get<{ status: string; items?: ChannelScanItem[]; fecha?: string; cached?: boolean }>(
+      `/scan/channels?market=${market}`
+    ),
+
+  scanHistoricalLows: (market = 'USA') =>
+    get<{ status: string; items?: HistLowScanItem[]; fecha?: string; cached?: boolean }>(
+      `/scan/historical-lows?market=${market}`
+    ),
+
+  scanHistoricalHighs: (market = 'USA') =>
+    get<{ status: string; items?: HistHighScanItem[]; fecha?: string; cached?: boolean }>(
+      `/scan/historical-highs?market=${market}`
     ),
 
   trendsSma200Weekly: () =>
@@ -942,6 +1060,15 @@ export const api = {
 
   assetSignals: (id: number, limit = 30) =>
     get<AssetSignalsResponse>(`/assets/${id}/signals?limit=${limit}`),
+
+  cryptoPrices: () =>
+    get<CryptoPricesResponse>('/crypto/prices'),
+
+  cryptoOhlcv: (coinId: string, days = 90) =>
+    get<CryptoOhlcvResponse>(`/crypto/${coinId}/ohlcv?days=${days}`),
+
+  cryptoAlerts: () =>
+    get<{ alerts: CryptoAlert[] }>('/crypto/alerts'),
 }
 
 export async function addWatchlist(input: WatchlistInput) {
@@ -1100,4 +1227,30 @@ export async function backfillAsset(accionId: number) {
   const data = await res.json()
   if (!res.ok) throw new Error(data.error || `Backfill error ${res.status}`)
   return data as { symbol: string; results: Record<string, unknown> }
+}
+
+export async function createCryptoAlert(input: {
+  coin_id: string
+  direction: 'below' | 'above'
+  target_price: number
+  label?: string
+}) {
+  const res = await fetch(BASE + '/crypto/alerts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(input),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al crear alerta')
+  return data as { ok: boolean; id: number }
+}
+
+export async function deleteCryptoAlert(id: number) {
+  const res = await fetch(BASE + `/crypto/alerts/${id}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || 'Error al eliminar alerta')
+  return data as { ok: boolean }
 }

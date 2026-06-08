@@ -32,6 +32,7 @@ from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from db.connection import get_conn
+from strategies.utils import touch_quality
 
 
 # ── Constantes (validadas con Julian sobre AAPL/SHOP/PLTR/NVDA/GOOGL/...) ────
@@ -952,6 +953,15 @@ def _build_tier(
         {'fecha': rows[idx]['fecha'].isoformat(), 'value': round(lows[idx], 4)}
         for idx in touching if idx < n
     ]
+    t_qualities = []
+    for idx in touching:
+        if idx < n:
+            line_val = math.exp(slope * idx + intercept) if slope else math.exp(intercept)
+            tq = touch_quality(rows, idx, line_val, 'support')
+            t_qualities.append(tq)
+    out['touch_quality_avg'] = round(
+        sum(q['quality'] for q in t_qualities) / len(t_qualities), 2
+    ) if t_qualities else 0
     if 'zone_top' in tl:
         out['zone_top'] = round(tl['zone_top'], 4)
     return out
