@@ -117,16 +117,16 @@ const Z_ORDER: Record<VisualTier, number> = {
 
 const PALETTE: Record<string, Record<VisualTier, { fill: string; border: string; label: string }>> = {
   support: {
-    primary:   { fill: 'rgba(0,230,118,0.35)',  border: 'rgba(0,230,118,0.90)',  label: '#00e676' },
-    secondary: { fill: 'rgba(0,230,118,0.22)',  border: 'rgba(0,230,118,0.75)',  label: '#00e676' },
-    tertiary:  { fill: 'rgba(79,195,247,0.14)',  border: 'rgba(79,195,247,0.55)',  label: '#4fc3f7' },
-    ghosted:   { fill: 'rgba(0,230,118,0.08)',  border: 'rgba(0,230,118,0.30)',  label: '#00e67699' },
+    primary:   { fill: 'rgba(0,230,118,0.12)',  border: 'rgba(0,230,118,0.90)',  label: '#00e676' },
+    secondary: { fill: 'rgba(0,230,118,0.08)',  border: 'rgba(0,230,118,0.75)',  label: '#00e676' },
+    tertiary:  { fill: 'rgba(79,195,247,0.05)',  border: 'rgba(79,195,247,0.50)',  label: '#4fc3f7' },
+    ghosted:   { fill: 'rgba(0,230,118,0.03)',  border: 'rgba(0,230,118,0.25)',  label: '#00e67699' },
   },
   resistance: {
-    primary:   { fill: 'rgba(239,68,68,0.35)',  border: 'rgba(239,68,68,0.90)',  label: '#ef4444' },
-    secondary: { fill: 'rgba(239,68,68,0.22)',  border: 'rgba(239,68,68,0.75)',  label: '#ef4444' },
-    tertiary:  { fill: 'rgba(251,146,60,0.14)',  border: 'rgba(251,146,60,0.55)',  label: '#fb923c' },
-    ghosted:   { fill: 'rgba(239,68,68,0.08)',  border: 'rgba(239,68,68,0.30)',  label: '#ef444499' },
+    primary:   { fill: 'rgba(239,68,68,0.10)',  border: 'rgba(239,68,68,0.90)',  label: '#ef4444' },
+    secondary: { fill: 'rgba(239,68,68,0.07)',  border: 'rgba(239,68,68,0.70)',  label: '#ef4444' },
+    tertiary:  { fill: 'rgba(251,146,60,0.05)',  border: 'rgba(251,146,60,0.50)',  label: '#fb923c' },
+    ghosted:   { fill: 'rgba(239,68,68,0.03)',  border: 'rgba(239,68,68,0.25)',  label: '#ef444499' },
   },
 }
 

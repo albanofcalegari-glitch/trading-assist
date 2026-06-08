@@ -442,24 +442,24 @@ export default function AssetDetail() {
   //   magenta  = corto plazo (ultima caida / lateralizacion bajo un techo)
   // Horizontal => zona (zone_floor + zone_ceiling) en vez de linea diagonal.
   if (dynResistances && showDynResistances && candles.length) {
-    const tiers: [keyof DynamicResistances, string, string][] = [
-      ['long',  '#ef4444', 'LP'],
-      ['mid',   '#fb923c', 'MP'],
-      ['short', '#ef4444', 'CP'],
+    const tiers: [keyof DynamicResistances, string, string, string][] = [
+      ['long',  'rgba(239,68,68,0.10)', '#ef4444', 'LP'],
+      ['mid',   'rgba(251,146,60,0.08)', '#fb923c', 'MP'],
+      ['short', 'rgba(239,68,68,0.10)', '#ef4444', 'CP'],
     ]
     const candleDates = candles.map(c => c.fecha)
     const lastCandleDateR = candleDates[candleDates.length - 1]
-    for (const [key, color, label] of tiers) {
+    for (const [key, color, border, label] of tiers) {
       if (!dynResTiers[key as 'long' | 'mid' | 'short']) continue
       const tier = dynResistances[key]
       if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
       if (!('line_points' in tier)) continue
-      // Horizontal: zona con piso + techo (techo = la resistencia)
       if (tier.kind === 'horizontal' && typeof tier.zone_floor === 'number' && typeof tier.zone_ceiling === 'number') {
         dynZones.push({
           floor: tier.zone_floor,
           top:   tier.zone_ceiling,
           color,
+          borderColor: border,
           label: `Zona R ${label}`,
         })
         continue
@@ -475,7 +475,7 @@ export default function AssetDetail() {
       indicatorLines.push({
         dates:  allDates,
         values,
-        color,
+        color: border,
         label:  `Resistencia ${label}`,
       })
     }
@@ -735,18 +735,18 @@ export default function AssetDetail() {
 
   if (v2ResData && showDynResistances && chartCandles.length) {
     const cd = chartCandles.map(c => c.fecha)
-    const tiers: [keyof DynamicResistances, string, string][] = [
-      ['long',  '#ef4444', 'LP'],
-      ['mid',   '#fb923c', 'MP'],
-      ['short', '#ef4444', 'CP'],
+    const tiers: [keyof DynamicResistances, string, string, string][] = [
+      ['long',  'rgba(239,68,68,0.10)', '#ef4444', 'LP'],
+      ['mid',   'rgba(251,146,60,0.08)', '#fb923c', 'MP'],
+      ['short', 'rgba(239,68,68,0.10)', '#ef4444', 'CP'],
     ]
-    for (const [key, color, label] of tiers) {
+    for (const [key, color, border, label] of tiers) {
       if (!dynResTiers[key as 'long' | 'mid' | 'short']) continue
       const tier = v2ResData[key]
       if (!tier || typeof tier === 'string' || typeof tier === 'number') continue
       if (!('line_points' in tier)) continue
       if (tier.kind === 'horizontal' && typeof tier.zone_floor === 'number' && typeof tier.zone_ceiling === 'number') {
-        v2DynZones.push({ floor: tier.zone_floor, top: tier.zone_ceiling, color, label: `Zona R ${label}` })
+        v2DynZones.push({ floor: tier.zone_floor, top: tier.zone_ceiling, color, borderColor: border, label: `Zona R ${label}` })
         continue
       }
       const pts = tier.line_points
@@ -758,7 +758,7 @@ export default function AssetDetail() {
       v2DynLines.push({
         dates: allDates,
         values: allDates.map(d => ptMap.get(d) ?? null),
-        color,
+        color: border,
         label: `Resistencia ${label}`,
       })
     }
