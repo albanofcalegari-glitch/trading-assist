@@ -80,6 +80,12 @@ _srv2_cache: dict = {}           # symbol → {'data': dict, 'ts': float}
 _srv2_lock = threading.Lock()
 _SRV2_TTL  = 3600                # 1 hora
 
+# ── Caché para tiered-sr ──────────────────────────────────────────────────────
+
+_tiered_cache: dict = {}         # symbol → {'data': dict, 'ts': float}
+_tiered_lock = threading.Lock()
+_TIERED_TTL  = 3600              # 1 hora
+
 # ── Caché para ut-bot ─────────────────────────────────────────────────────────
 
 _utbot_cache: dict = {}          # (symbol, sensitivity, atr_period) → {'data': dict, 'ts': float}
@@ -119,7 +125,6 @@ MYSQL_CONFIG = dict(
     host='localhost', user='root', password='123456',
     db='trading_assist', charset='utf8mb4',
     cursorclass=pymysql.cursors.DictCursor,
-    ssl={'ssl_disabled': False},
 )
 
 USA_MARKETS = ('NASDAQ', 'NYSE', 'NYSE_AMERICAN', 'NYSE_ARCA', 'CBOE_BZX')
@@ -145,8 +150,10 @@ JWT_EXP_HOURS = 24
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
+_BCRYPT_ROUNDS = 10
+
 def _hash_pw(plain: str) -> str:
-    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)).decode()
 
 
 def _check_pw(plain: str, hashed: str) -> bool:
@@ -446,18 +453,22 @@ def auth_login():
     password = body.get('password') or ''
     if not username or not password:
         return jsonify({'error': 'Usuario y contraseña requeridos'}), 400
-    conn = pymysql.connect(**MYSQL_CONFIG)
-    try:
+    with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, username, password_hash, investor_profile FROM users WHERE username = %s",
                 (username,),
             )
             user = cur.fetchone()
-    finally:
-        conn.close()
     if not user or not _check_pw(password, user['password_hash']):
         return jsonify({'error': 'Credenciales incorrectas'}), 401
+    if user['password_hash'].startswith('$2b$12$'):
+        new_hash = _hash_pw(password)
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
+                            (new_hash, user['id']))
+            conn.commit()
     token = _make_token(user['id'], user['username'])
     return jsonify({
         'token': token,
@@ -469,16 +480,13 @@ def auth_login():
 @app.route('/api/auth/me', methods=['GET'])
 @login_required
 def auth_me():
-    conn = pymysql.connect(**MYSQL_CONFIG)
-    try:
+    with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT username, investor_profile FROM users WHERE id = %s",
                 (request.user['sub'],),
             )
             row = cur.fetchone() or {}
-    finally:
-        conn.close()
     return jsonify({
         'username': row.get('username') or request.user['user'],
         'investor_profile': row.get('investor_profile'),
@@ -494,16 +502,13 @@ def auth_set_profile():
         return jsonify({
             'error': f'Perfil inválido. Debe ser uno de: {", ".join(VALID_INVESTOR_PROFILES)}'
         }), 400
-    conn = pymysql.connect(**MYSQL_CONFIG)
-    try:
+    with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE users SET investor_profile = %s WHERE id = %s",
                 (profile, request.user['sub']),
             )
         conn.commit()
-    finally:
-        conn.close()
     return jsonify({'ok': True, 'investor_profile': profile})
 
 
@@ -517,8 +522,7 @@ def auth_change_password():
         return jsonify({'error': 'Contraseña actual y nueva requeridas'}), 400
     if len(new_pw) < 6:
         return jsonify({'error': 'La nueva contraseña debe tener al menos 6 caracteres'}), 400
-    conn = pymysql.connect(**MYSQL_CONFIG)
-    try:
+    with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT password_hash FROM users WHERE id = %s", (request.user['sub'],))
             user = cur.fetchone()
@@ -527,8 +531,6 @@ def auth_change_password():
             cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
                         (_hash_pw(new_pw), request.user['sub']))
         conn.commit()
-    finally:
-        conn.close()
     return jsonify({'ok': True, 'message': 'Contraseña actualizada'})
 
 
@@ -553,10 +555,59 @@ def _jresp(data, status=200):
     )
 
 
-# ── DB helpers ─────────────────────────────────────────────────────────────────
+# ── DB connection pool ─────────────────────────────────────────────────────────
+
+import queue as _queue
+
+_pool = _queue.Queue(maxsize=0)
+_POOL_MAX = 8
+
+class _PooledConn:
+    """Context manager that returns connections to pool instead of closing."""
+    __slots__ = ('conn', '_returned')
+
+    def __init__(self, conn):
+        self.conn = conn
+        self._returned = False
+
+    def cursor(self):
+        return self.conn.cursor()
+
+    def commit(self):
+        return self.conn.commit()
+
+    def rollback(self):
+        return self.conn.rollback()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._return()
+
+    def close(self):
+        self._return()
+
+    def _return(self):
+        if self._returned:
+            return
+        self._returned = True
+        try:
+            self.conn.ping(reconnect=True)
+            _pool.put_nowait(self.conn)
+        except Exception:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
 def _conn():
-    return pymysql.connect(**MYSQL_CONFIG)
+    try:
+        conn = _pool.get_nowait()
+        conn.ping(reconnect=True)
+        return _PooledConn(conn)
+    except (_queue.Empty, Exception):
+        return _PooledConn(pymysql.connect(**MYSQL_CONFIG))
 
 
 def _last_two_dates(cur, market: str | None = None):
@@ -1477,6 +1528,42 @@ def get_dynamic_resistances_endpoint(accion_id: int):
 
     with _dynres_lock:
         _dynres_cache[cache_key] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
+
+
+# ── /api/assets/<id>/tiered-sr ─────────────────────────────────────────────────
+#
+# Soportes y resistencias con clasificacion behavioral:
+#   historical  — estructural, semanal
+#   accelerated — diagonal empinada, diario (cuando hay aceleracion)
+#   tactical    — horizontal (lateralizacion)
+
+@app.route('/api/assets/<int:accion_id>/tiered-sr')
+def get_tiered_sr_endpoint(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+
+    with _tiered_lock:
+        entry = _tiered_cache.get(symbol)
+        if entry and (time.time() - entry['ts']) < _TIERED_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        from strategies.tiered_sr import get_tiered_sr
+        result = get_tiered_sr(symbol, datetime.date.today())
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _tiered_lock:
+        _tiered_cache[symbol] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 
@@ -3083,6 +3170,30 @@ def _warm_cache():
 # ── Bootstrap (corre al import del módulo, ej. bajo gunicorn) ─────────────────
 # Las migraciones son idempotentes (CREATE TABLE IF NOT EXISTS / ALTER ... IF
 # NOT COLUMN), así que es seguro ejecutarlas en cada arranque/worker.
+def _ensure_crypto_alerts_table():
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS crypto_alerts (
+                    id          INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id     INT           NOT NULL,
+                    coin_id     VARCHAR(30)   NOT NULL,
+                    direction   VARCHAR(10)   NOT NULL DEFAULT 'below',
+                    target_price DECIMAL(20,6) NOT NULL,
+                    label       VARCHAR(120)  NULL,
+                    active      TINYINT(1)    NOT NULL DEFAULT 1,
+                    triggered_at DATETIME     NULL,
+                    created_at  TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_ca_user (user_id),
+                    INDEX idx_ca_active (active, coin_id),
+                    CONSTRAINT fk_ca_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
 try:
     _ensure_users_table()
     _ensure_batch_tables()
@@ -3090,6 +3201,7 @@ try:
     _ensure_trades_table()
     _ensure_price_levels_table()
     _ensure_trendlines_table()
+    _ensure_crypto_alerts_table()
 except Exception as _bootstrap_err:
     print(f' * WARN bootstrap migrations: {_bootstrap_err}')
 
@@ -3130,6 +3242,65 @@ def get_sr_v2_endpoint(accion_id: int):
     return _jresp(result)
 
 
+# ── /api/assets/<id>/events — Eventos probabilísticos ────────────────────────
+
+@app.route('/api/assets/<int:accion_id>/events')
+def get_asset_events(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+    fecha_str = request.args.get('fecha', '')
+    if fecha_str:
+        fecha = datetime.datetime.strptime(fecha_str, '%Y-%m-%d').date()
+    else:
+        fecha = datetime.date.today()
+
+    try:
+        from ml.probability_engine import analyze_event_probability
+        from db.connection import get_conn as _ml_conn
+        conn2 = _ml_conn()
+        try:
+            with conn2.cursor() as cur:
+                cur.execute("""
+                    SELECT event_type, event_detail, event_strength, fecha
+                    FROM ml_events WHERE symbol=%s AND fecha=%s
+                    ORDER BY event_strength DESC
+                """, (symbol, fecha))
+                events = cur.fetchall()
+        finally:
+            conn2.close()
+
+        results = []
+        for ev in events:
+            prob = analyze_event_probability(symbol, fecha, ev['event_type'])
+            results.append({
+                'event_type':     ev['event_type'],
+                'event_detail':   ev.get('event_detail'),
+                'event_strength': float(ev['event_strength']) if ev.get('event_strength') else 0,
+                'prob_up_5d':     round(prob.prob_up_5d, 3),
+                'prob_up_10d':    round(prob.prob_up_10d, 3),
+                'expected_ret_5d':  round(prob.expected_ret_5d, 4),
+                'expected_ret_10d': round(prob.expected_ret_10d, 4),
+                'confidence':     round(prob.confidence, 3),
+                'n_total':        prob.n_total,
+                'n_sector':       prob.n_sector,
+                'n_similar':      prob.n_similar,
+                'global_win_rate':  round(prob.global_win_rate_5d, 3),
+                'sector_win_rate':  round(prob.sector_win_rate_5d, 3),
+                'similar_win_rate': round(prob.similar_win_rate_5d, 3),
+                'sector':         prob.sector,
+                'top_analogues':  prob.top_analogues[:5],
+            })
+        return _jresp({'symbol': symbol, 'fecha': str(fecha), 'events': results})
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+
 # ── /api/assets/<id>/elliott ──────────────────────────────────────────────────
 #
 # Análisis de Ondas de Elliott sobre un activo individual.
@@ -3145,20 +3316,23 @@ def get_elliott(accion_id: int):
         return _jresp({'error': 'Asset not found'}, 404)
 
     symbol = row['simbolo']
+    tf_arg = (request.args.get('tf') or '').strip().upper()
+    tf = tf_arg if tf_arg in ('D', 'W') else 'D'
+    cache_key = f'{symbol}::{tf}'
 
     with _elliott_lock:
-        entry = _elliott_cache.get(symbol)
+        entry = _elliott_cache.get(cache_key)
         if entry and (time.time() - entry['ts']) < _ELLIOTT_TTL:
             return _jresp(entry['data'])
 
     try:
         from strategies.elliott import analyze_elliott
-        result = analyze_elliott(symbol, datetime.date.today())
+        result = analyze_elliott(symbol, datetime.date.today(), tf=tf)
     except Exception as e:
         return _jresp({'error': str(e), 'symbol': symbol}, 500)
 
     with _elliott_lock:
-        _elliott_cache[symbol] = {'data': result, 'ts': time.time()}
+        _elliott_cache[cache_key] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 
@@ -3174,9 +3348,12 @@ _ELLIOTT_SCAN_TTL = 1800
 @app.route('/api/scan/elliott')
 def scan_elliott():
     market = request.args.get('market', 'USA')
+    tf_arg = (request.args.get('tf') or '').strip().upper()
+    tf = tf_arg if tf_arg in ('D', 'W') else 'D'
+    scan_key = f'{market}::{tf}'
 
     with _elliott_scan_lock:
-        entry = _elliott_scan_cache.get(market)
+        entry = _elliott_scan_cache.get(scan_key)
         if entry and (time.time() - entry['ts']) < _ELLIOTT_SCAN_TTL:
             return _jresp(entry['data'])
 
@@ -3198,7 +3375,7 @@ def scan_elliott():
 
     for asset in assets:
         try:
-            res = analyze_elliott(asset['simbolo'], fecha)
+            res = analyze_elliott(asset['simbolo'], fecha, tf=tf)
             if res.get('signal') in ('BUY', 'SELL') and res.get('rules_valid'):
                 items.append({
                     'accion_id': asset['id'],
@@ -3215,10 +3392,10 @@ def scan_elliott():
             pass
 
     items.sort(key=lambda x: (-x['confidence'], x['simbolo']))
-    result = {'items': items, 'fecha': str(fecha), 'market': market}
+    result = {'items': items, 'fecha': str(fecha), 'market': market, 'timeframe': tf}
 
     with _elliott_scan_lock:
-        _elliott_scan_cache[market] = {'data': result, 'ts': time.time()}
+        _elliott_scan_cache[scan_key] = {'data': result, 'ts': time.time()}
 
     return _jresp(result)
 
@@ -3523,6 +3700,438 @@ def bonds_spreads():
         conn.close()
 
     return _jresp({'pairs': result})
+
+
+# ── Screener: generic scan infrastructure ──────────────────────────────────────
+
+_screener_cache: dict = {}       # key → {market → {data, ts}}
+_screener_running: dict = {}     # key → set of markets running
+_screener_lock = threading.Lock()
+
+
+def _get_scan_assets(market: str) -> list[dict]:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            if market == 'BYMA':
+                cur.execute(
+                    "SELECT id, simbolo, nombre FROM accion WHERE activo = 1 AND simbolo LIKE '%%.BA' ORDER BY simbolo"
+                )
+            elif market == 'USA':
+                cur.execute(
+                    "SELECT id, simbolo, nombre FROM accion WHERE activo = 1 AND simbolo NOT LIKE '%%.BA' ORDER BY simbolo"
+                )
+            else:
+                cur.execute(
+                    "SELECT id, simbolo, nombre FROM accion WHERE activo = 1 ORDER BY simbolo"
+                )
+            return cur.fetchall()
+
+
+def _scan_endpoint_generic(strategy_key: str, ttl: int, compute_fn):
+    market = request.args.get('market', 'USA')
+
+    with _screener_lock:
+        cache = _screener_cache.setdefault(strategy_key, {})
+        running = _screener_running.setdefault(strategy_key, set())
+
+        entry = cache.get(market)
+        if entry and (time.time() - entry['ts']) < ttl:
+            return _jresp({**entry['data'], 'cached': True, 'status': 'ready'})
+
+        if market in running:
+            return _jresp({'status': 'computing', 'market': market})
+
+        running.add(market)
+
+    def _bg():
+        try:
+            result = compute_fn(market)
+            with _screener_lock:
+                cache[market] = {'data': result, 'ts': time.time()}
+                running.discard(market)
+        except Exception as e:
+            print(f' * ERROR scan {strategy_key} ({market}): {e}')
+            import traceback; traceback.print_exc()
+            with _screener_lock:
+                running.discard(market)
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return _jresp({'status': 'computing', 'market': market})
+
+
+# ── /api/scan/sr-breakout ────────────────────────────────────────────────────
+
+@app.route('/api/scan/sr-breakout')
+def scan_sr_breakout():
+    def compute(market):
+        from scripts.sr_breakout_alert import scan as sr_scan, _get_symbols
+        all_symbols = _get_symbols()
+        if market == 'BYMA':
+            symbols = [s for s in all_symbols if s.endswith('.BA')]
+        elif market == 'USA':
+            symbols = [s for s in all_symbols if not s.endswith('.BA')]
+        else:
+            symbols = all_symbols
+
+        res_broke, res_touched, sup_bounced, sup_touched, lateralized = sr_scan(symbols)
+
+        all_syms = set()
+        for lst in [res_broke, res_touched, sup_bounced, sup_touched, lateralized]:
+            for item in lst:
+                all_syms.add(item['symbol'])
+
+        sym_info = {}
+        if all_syms:
+            with _conn() as conn:
+                with conn.cursor() as cur:
+                    fmt = ','.join(['%s'] * len(all_syms))
+                    cur.execute(
+                        f"SELECT id, simbolo, nombre FROM accion WHERE simbolo IN ({fmt})",
+                        list(all_syms)
+                    )
+                    for r in cur.fetchall():
+                        sym_info[r['simbolo']] = {'accion_id': r['id'], 'nombre': r['nombre']}
+
+        def enrich(lst):
+            for item in lst:
+                info = sym_info.get(item['symbol'], {})
+                item['accion_id'] = info.get('accion_id')
+                item['nombre'] = info.get('nombre', '')
+            return lst
+
+        return {
+            'res_broke': enrich(res_broke),
+            'res_touched': enrich(res_touched),
+            'sup_bounced': enrich(sup_bounced),
+            'sup_touched': enrich(sup_touched),
+            'lateralized': enrich(lateralized),
+            'fecha': str(datetime.date.today()),
+            'market': market,
+        }
+
+    return _scan_endpoint_generic('sr_breakout', 1800, compute)
+
+
+# ── /api/scan/channels ───────────────────────────────────────────────────────
+
+@app.route('/api/scan/channels')
+def scan_channels():
+    def compute(market):
+        assets = _get_scan_assets(market)
+        from strategies.channel_detection import detect_channels_multi
+        items = []
+        fecha = datetime.date.today()
+
+        for idx, asset in enumerate(assets):
+            if idx % 50 == 0:
+                print(f'  channel scan {idx}/{len(assets)}...')
+            try:
+                channels = detect_channels_multi(asset['simbolo'], fecha)
+                if not channels:
+                    continue
+                for ch in channels:
+                    if ch.get('stale'):
+                        continue
+                    if ch['decision'] in ('NEAR_SUPPORT', 'NEAR_RESISTANCE',
+                                          'BELOW_SUPPORT', 'ABOVE_RESISTANCE'):
+                        items.append({
+                            'accion_id':        asset['id'],
+                            'simbolo':          asset['simbolo'],
+                            'nombre':           asset['nombre'],
+                            'horizon':          ch.get('horizon', ''),
+                            'channel_type':     ch['channel_type'],
+                            'decision':         ch['decision'],
+                            'signal':           ch.get('signal', 'HOLD'),
+                            'position':         ch['position'],
+                            'upper_now':        ch['upper_now'],
+                            'lower_now':        ch['lower_now'],
+                            'price':            ch.get('last_close', 0),
+                            'reading':          ch['reading'],
+                            'bounce_confirmed': ch.get('bounce_confirmed', False),
+                            'slope_annual_pct': ch.get('slope_annual_pct', 0),
+                        })
+            except Exception:
+                pass
+
+        items.sort(key=lambda x: (
+            0 if x.get('bounce_confirmed') else 1,
+            0 if x['signal'] == 'BUY' else (1 if x['signal'] == 'SELL' else 2),
+            x['simbolo'],
+        ))
+        return {'items': items, 'fecha': str(fecha), 'market': market}
+
+    return _scan_endpoint_generic('channels', 1800, compute)
+
+
+# ── /api/scan/historical-lows ────────────────────────────────────────────────
+
+@app.route('/api/scan/historical-lows')
+def scan_historical_lows():
+    def compute(market):
+        assets = _get_scan_assets(market)
+        symbols = [a['simbolo'] for a in assets]
+        id_map = {a['simbolo']: a for a in assets}
+
+        from strategies.historical_lows import run_universe
+        all_results = run_universe(symbols)
+
+        items = []
+        for r in all_results:
+            if r.get('setup_state') == 'NO_SIGNAL':
+                continue
+            info = id_map.get(r['simbolo'], {})
+            items.append({
+                'accion_id':        info.get('id'),
+                'simbolo':          r['simbolo'],
+                'nombre':           info.get('nombre', ''),
+                'price':            r['price'],
+                'low_52w':          r['low_52w'],
+                'distance_52w_pct': r.get('distance_52w_pct'),
+                'setup_state':      r['setup_state'],
+                'decision':         r['decision'],
+                'reading':          r['reading'],
+                'is_all_time_low':  r.get('is_all_time_low', False),
+                'rsi14':            r.get('rsi14'),
+            })
+
+        items.sort(key=lambda x: x.get('distance_52w_pct') or 999)
+        return {'items': items, 'fecha': str(datetime.date.today()), 'market': market}
+
+    return _scan_endpoint_generic('historical_lows', 1800, compute)
+
+
+# ── /api/scan/historical-highs ───────────────────────────────────────────────
+
+@app.route('/api/scan/historical-highs')
+def scan_historical_highs():
+    def compute(market):
+        assets = _get_scan_assets(market)
+        symbols = [a['simbolo'] for a in assets]
+        id_map = {a['simbolo']: a for a in assets}
+
+        from strategies.historical_highs import run_universe
+        all_results = run_universe(symbols)
+
+        items = []
+        for r in all_results:
+            if r.get('setup_state') == 'NO_SIGNAL':
+                continue
+            info = id_map.get(r['simbolo'], {})
+            items.append({
+                'accion_id':        info.get('id'),
+                'simbolo':          r['simbolo'],
+                'nombre':           info.get('nombre', ''),
+                'price':            r['price'],
+                'high_52w':         r.get('high_52w'),
+                'distance_52w_pct': r.get('distance_52w_pct'),
+                'setup_state':      r['setup_state'],
+                'decision':         r.get('decision', ''),
+                'reading':          r.get('reading', ''),
+                'is_all_time_high': r.get('is_all_time_high', False),
+                'rsi14':            r.get('rsi14'),
+            })
+
+        items.sort(key=lambda x: abs(x.get('distance_52w_pct') or 999))
+        return {'items': items, 'fecha': str(datetime.date.today()), 'market': market}
+
+    return _scan_endpoint_generic('historical_highs', 1800, compute)
+
+
+# ── Crypto prices ─────────────────────────────────────────────────────────────
+
+_crypto_cache: dict = {}          # {'data': ..., 'ts': float}
+_crypto_lock = threading.Lock()
+_CRYPTO_TTL  = 120                # 2 minutos
+
+@app.route('/api/crypto/prices')
+def crypto_prices():
+    import requests as _req
+
+    now = time.time()
+    with _crypto_lock:
+        cached = _crypto_cache.get('data')
+        if cached and now - _crypto_cache.get('ts', 0) < _CRYPTO_TTL:
+            return jsonify(cached)
+
+    try:
+        url = 'https://api.coingecko.com/api/v3/coins/markets'
+        params = {
+            'vs_currency': 'usd',
+            'ids': 'bitcoin,tether',
+            'order': 'market_cap_desc',
+            'sparkline': 'true',
+            'price_change_percentage': '1h,24h,7d',
+        }
+        resp = _req.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        coins = resp.json()
+
+        result = {'coins': [], 'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
+        for c in coins:
+            result['coins'].append({
+                'id':                  c['id'],
+                'symbol':              c['symbol'].upper(),
+                'name':                c['name'],
+                'price':               c.get('current_price'),
+                'market_cap':          c.get('market_cap'),
+                'volume_24h':          c.get('total_volume'),
+                'change_1h_pct':       c.get('price_change_percentage_1h_in_currency'),
+                'change_24h_pct':      c.get('price_change_percentage_24h_in_currency'),
+                'change_7d_pct':       c.get('price_change_percentage_7d_in_currency'),
+                'high_24h':            c.get('high_24h'),
+                'low_24h':             c.get('low_24h'),
+                'ath':                 c.get('ath'),
+                'ath_change_pct':      c.get('ath_change_percentage'),
+                'sparkline':           c.get('sparkline_in_7d', {}).get('price', []),
+                'last_updated':        c.get('last_updated'),
+            })
+
+        with _crypto_lock:
+            _crypto_cache['data'] = result
+            _crypto_cache['ts'] = now
+
+        return jsonify(result)
+    except Exception as exc:
+        with _crypto_lock:
+            cached = _crypto_cache.get('data')
+        if cached:
+            return jsonify(cached)
+        return jsonify({'error': str(exc)}), 502
+
+
+# ── Crypto alerts CRUD ─────────────────────────────────────────────────────────
+
+@app.route('/api/crypto/alerts')
+@login_required
+def crypto_alerts_list():
+    user_id = request.user['sub']
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, coin_id, direction, target_price, label, active, triggered_at, created_at
+                FROM crypto_alerts WHERE user_id = %s ORDER BY created_at DESC
+            """, (user_id,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    items = []
+    for r in rows:
+        items.append({
+            'id':           r['id'],
+            'coin_id':      r['coin_id'],
+            'direction':    r['direction'],
+            'target_price': float(r['target_price']),
+            'label':        r['label'],
+            'active':       bool(r['active']),
+            'triggered_at': r['triggered_at'].isoformat() if r['triggered_at'] else None,
+            'created_at':   r['created_at'].isoformat() if r['created_at'] else None,
+        })
+    return jsonify({'alerts': items})
+
+
+@app.route('/api/crypto/alerts', methods=['POST'])
+@login_required
+def crypto_alerts_create():
+    user_id = request.user['sub']
+    data = request.get_json(force=True)
+    coin_id      = data.get('coin_id', 'bitcoin')
+    direction    = data.get('direction', 'below')
+    target_price = data.get('target_price')
+    label        = data.get('label', '')
+
+    if not target_price or float(target_price) <= 0:
+        return jsonify({'error': 'target_price inválido'}), 400
+    if direction not in ('below', 'above'):
+        return jsonify({'error': 'direction debe ser below o above'}), 400
+    if coin_id not in ('bitcoin', 'tether'):
+        return jsonify({'error': 'coin_id inválido'}), 400
+
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO crypto_alerts (user_id, coin_id, direction, target_price, label)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (user_id, coin_id, direction, float(target_price), label or None))
+            new_id = cur.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({'ok': True, 'id': new_id})
+
+
+@app.route('/api/crypto/alerts/<int:alert_id>', methods=['DELETE'])
+@login_required
+def crypto_alerts_delete(alert_id):
+    user_id = request.user['sub']
+    conn = pymysql.connect(**MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM crypto_alerts WHERE id = %s AND user_id = %s", (alert_id, user_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'ok': True})
+
+
+_crypto_ohlcv_cache: dict = {}      # coin_id → {'data': ..., 'ts': float, 'days': int}
+_crypto_ohlcv_lock = threading.Lock()
+_CRYPTO_OHLCV_TTL  = 300             # 5 minutos
+
+@app.route('/api/crypto/<coin_id>/ohlcv')
+def crypto_ohlcv(coin_id):
+    import requests as _req
+
+    allowed = {'bitcoin', 'tether'}
+    if coin_id not in allowed:
+        return jsonify({'error': 'Coin no soportada'}), 400
+
+    days = int(request.args.get('days', 90))
+    if days not in (1, 7, 14, 30, 90, 180, 365):
+        days = 90
+
+    cache_key = f'{coin_id}_{days}'
+    now = time.time()
+    with _crypto_ohlcv_lock:
+        cached = _crypto_ohlcv_cache.get(cache_key)
+        if cached and now - cached.get('ts', 0) < _CRYPTO_OHLCV_TTL:
+            return jsonify(cached['data'])
+
+    try:
+        url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc'
+        params = {'vs_currency': 'usd', 'days': days}
+        resp = _req.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        raw = resp.json()
+
+        candles = []
+        for row in raw:
+            ts_ms, o, h, l, c = row
+            dt = datetime.datetime.utcfromtimestamp(ts_ms / 1000)
+            candles.append({
+                'fecha':  dt.strftime('%Y-%m-%d'),
+                'time':   dt.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'open':   o,
+                'high':   h,
+                'low':    l,
+                'close':  c,
+                'volume': 0,
+            })
+
+        result = {'coin_id': coin_id, 'days': days, 'candles': candles}
+
+        with _crypto_ohlcv_lock:
+            _crypto_ohlcv_cache[cache_key] = {'data': result, 'ts': now}
+
+        return jsonify(result)
+    except Exception as exc:
+        with _crypto_ohlcv_lock:
+            cached = _crypto_ohlcv_cache.get(cache_key)
+        if cached:
+            return jsonify(cached['data'])
+        return jsonify({'error': str(exc)}), 502
 
 
 if __name__ == '__main__':
