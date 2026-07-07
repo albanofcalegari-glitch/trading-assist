@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { ArrowLeft, TrendingUp, Activity, BarChart2, Tv2 } from 'lucide-react'
-import { api, type AssetDetail as IAsset, type Candle, type Indicator, type LongtermSupport, type HorizontalZonesResponse, type TieredSRResponse } from '@/lib/api'
+import { api, backfillAsset, type AssetDetail as IAsset, type Candle, type Indicator, type LongtermSupport, type HorizontalZonesResponse, type TieredSRResponse, type AccelTrendlinesResponse } from '@/lib/api'
 import { fmtPrice, fmtPct, fmtVol, pctClass, fmt, calcRSI, calcADX } from '@/lib/utils'
 import PriceChart, { buildIndicatorLines, type TrendlineStatus, type LongtermSupportLayer, type HorizontalZoneData } from '@/components/detail/PriceChart'
 import { SemaphoreBadge } from '@/components/shared/Semaphore'
@@ -56,6 +56,10 @@ export default function AssetDetail() {
   const [tieredSR,         setTieredSR]         = useState<TieredSRResponse | null>(null)
   const [showTieredSR,     setShowTieredSR]     = useState(false)
   const [showADX,          setShowADX]          = useState(false)
+  const [accelData,        setAccelData]        = useState<AccelTrendlinesResponse | null>(null)
+  const [showAccel,        setShowAccel]        = useState(false)
+  const [staleInfo, setStaleInfo] = useState<{ stale: boolean; last_date: string | null } | null>(null)
+  const [updating, setUpdating] = useState(false)
   useEffect(() => {
     if (!accionId) return
     setLoading(true)
@@ -65,7 +69,10 @@ export default function AssetDetail() {
       api.indicators(accionId, 365),
     ]).then(([a, od, ind]) => {
       if (a.status === 'fulfilled')   setAsset(a.value)
-      if (od.status === 'fulfilled')  setCandles(od.value.candles)
+      if (od.status === 'fulfilled') {
+        setCandles(od.value.candles)
+        setStaleInfo({ stale: od.value.stale ?? false, last_date: od.value.last_date ?? null })
+      }
       if (ind.status === 'fulfilled') setIndicators(ind.value.indicators)
     }).finally(() => setLoading(false))
 
@@ -87,7 +94,12 @@ export default function AssetDetail() {
     api.tieredSR(accionId)
       .then(data => setTieredSR(data))
       .catch(() => setTieredSR(null))
-  }, [accionId])
+
+    // Fetch accelerated trendlines (depende del tf)
+    api.acceleratedTrendlines(accionId, tf === 'M' ? 'W' : tf)
+      .then(data => setAccelData(data))
+      .catch(() => setAccelData(null))
+  }, [accionId, tf])
 
   const rsiValues   = candles.length ? calcRSI(candles.map(c => Number(c.close))) : []
   const divergences = candles.length
@@ -150,6 +162,27 @@ export default function AssetDetail() {
     : null
 
 
+  async function handleRefreshPrices() {
+    if (!asset || !staleInfo?.stale) return
+    if (!window.confirm(`¿Actualizar precios de ${asset.simbolo}? Esto puede tardar unos segundos.`)) return
+    setUpdating(true)
+    try {
+      await backfillAsset(accionId)
+      // Reload data
+      const [od, a] = await Promise.all([
+        api.ohlcvExtended(accionId, 'D'),
+        api.asset(accionId),
+      ])
+      setCandles(od.candles)
+      setStaleInfo({ stale: od.stale ?? false, last_date: od.last_date ?? null })
+      setAsset(a)
+    } catch (e: any) {
+      alert(`Error actualizando: ${e.message}`)
+    } finally {
+      setUpdating(false)
+    }
+  }
+
   // Último indicador disponible
   const lastInd = indicators.length ? indicators[indicators.length - 1] : null
 
@@ -186,6 +219,20 @@ export default function AssetDetail() {
       >
         <ArrowLeft size={13} /> Volver
       </button>
+
+      {/* Stale data banner */}
+      {staleInfo?.stale && (
+        <div className="mx-4 mb-3 flex items-center gap-3 rounded-lg border border-yellow-600/50 bg-yellow-900/30 px-4 py-2.5 text-sm text-yellow-200">
+          <span>⚠ Datos desactualizados{staleInfo.last_date ? ` (último: ${staleInfo.last_date})` : ''}</span>
+          <button
+            onClick={handleRefreshPrices}
+            disabled={updating}
+            className="ml-auto rounded bg-yellow-600 px-3 py-1 text-xs font-medium text-white hover:bg-yellow-500 disabled:opacity-50"
+          >
+            {updating ? 'Actualizando...' : 'Actualizar precios'}
+          </button>
+        </div>
+      )}
 
       {/* Asset header */}
       <div className="card p-5">
@@ -395,6 +442,33 @@ export default function AssetDetail() {
           {showTieredSR && tieredSR && (
             <span className="text-2xs text-text-muted font-mono">tiered</span>
           )}
+
+          {/* Toggle accelerated trendlines */}
+          <button
+            title="Trendlines aceleradas (motor accelerated_trendlines)"
+            className={`px-2.5 py-1.5 text-xs rounded-md border transition-colors font-mono font-semibold ${
+              showAccel
+                ? 'border-transparent text-black'
+                : 'border-border text-text-muted hover:text-text-secondary'
+            }`}
+            style={showAccel ? { backgroundColor: '#39ff14', borderColor: '#39ff14' } : {}}
+            onClick={() => setShowAccel(v => !v)}
+          >
+            Ac
+          </button>
+          {showAccel && accelData && accelData.regime !== 'none' && (
+            <span className={`text-2xs font-medium px-1.5 py-0.5 rounded border ${
+              accelData.regime === 'accelerating_up'   ? 'text-green-400 bg-green-400/10 border-green-400/30' :
+              accelData.regime === 'accelerating_down'  ? 'text-red-400 bg-red-400/10 border-red-400/30' :
+              accelData.regime === 'compression'        ? 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30' :
+              'text-text-muted bg-surface border-border'
+            }`}>
+              {accelData.regime === 'accelerating_up'  ? '↑ Accel' :
+               accelData.regime === 'accelerating_down' ? '↓ Accel' :
+               accelData.regime === 'compression'       ? '◇ Compresión' :
+               accelData.regime}
+            </span>
+          )}
         </div>
 
         {/* ADX toggle */}
@@ -476,6 +550,7 @@ export default function AssetDetail() {
             activeResistanceLayer={activeResistanceLayer}
             horizontalZones={horizontalZones}
             tieredSR={showTieredSR ? tieredSR : null}
+            accelTrendlines={showAccel ? accelData : null}
           />
         ) : (
           <div className="h-80 flex items-center justify-center">

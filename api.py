@@ -104,6 +104,12 @@ _elliott_cache: dict = {}        # symbol → {'data': dict, 'ts': float}
 _elliott_lock = threading.Lock()
 _ELLIOTT_TTL  = 1800             # 30 minutos
 
+# ── Caché para accelerated-trendlines ────────────────────────────────────────
+
+_accel_cache: dict = {}          # "symbol_tf" → {'data': dict, 'ts': float}
+_accel_lock = threading.Lock()
+_ACCEL_TTL  = 3600               # 1 hora
+
 # ── Optionals ──────────────────────────────────────────────────────────────────
 try:
     from flask import Flask, jsonify, request
@@ -957,7 +963,29 @@ def get_ohlcv_extended(accion_id: int):
     for r in rows:
         r['fecha'] = str(r['fecha'])
 
-    return _jresp({'accion_id': accion_id, 'simbolo': simbolo, 'tf': tf, 'candles': rows})
+    # ── Staleness detection (solo para timeframe D) ──
+    stale = False
+    last_date = None
+    if tf == 'D' and rows:
+        last_date = rows[-1]['fecha']          # ya es str, sorted ASC
+        try:
+            ld = datetime.date.fromisoformat(last_date)
+            today = datetime.date.today()
+            # Contar días de negociación (lun-vie) entre last_date y hoy
+            bdays = 0
+            d = ld + datetime.timedelta(days=1)
+            while d <= today:
+                if d.weekday() < 5:            # 0=lun … 4=vie
+                    bdays += 1
+                d += datetime.timedelta(days=1)
+            stale = bdays > 1
+        except Exception:
+            pass
+
+    return _jresp({
+        'accion_id': accion_id, 'simbolo': simbolo, 'tf': tf,
+        'candles': rows, 'stale': stale, 'last_date': last_date,
+    })
 
 
 # ── /api/assets/<id>/indicators ───────────────────────────────────────────────
@@ -1809,8 +1837,6 @@ def get_historical_high_signal(accion_id: int):
 @app.route('/api/assets/<int:accion_id>/backfill', methods=['POST'])
 @login_required
 def backfill_asset(accion_id: int):
-    if request.user.get('user') != 'albano':
-        return _jresp({'error': 'forbidden'}, 403)
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute('SELECT simbolo FROM accion WHERE id=%s', [accion_id])
@@ -1840,6 +1866,25 @@ def backfill_asset(accion_id: int):
             for k in list(cache.keys()):
                 if k == symbol or (isinstance(k, tuple) and k and k[0] == symbol):
                     cache.pop(k, None)
+
+    # After ohlcv backfill, also update price_history
+    from data.data_loader import fetch_price_history, save_asset_prices
+    try:
+        ph_rows = fetch_price_history(symbol, start_date=datetime.date.today() - datetime.timedelta(days=10))
+        if ph_rows:
+            save_asset_prices(ph_rows)
+            out['price_history'] = {'rows': len(ph_rows)}
+    except Exception as e:
+        out['price_history'] = {'error': str(e)}
+
+    # Sync valorhistoricoaccion so dashboard price also updates
+    try:
+        from scripts.sync_price_tables import sync
+        sync(full=False)
+        out['sync'] = 'ok'
+    except Exception as e2:
+        out['sync'] = {'error': str(e2)}
+
     return _jresp({'symbol': symbol, 'results': out})
 
 
@@ -4132,6 +4177,85 @@ def crypto_ohlcv(coin_id):
         if cached:
             return jsonify(cached['data'])
         return jsonify({'error': str(exc)}), 502
+
+
+# ── /api/assets/<id>/accelerated-trendlines ──────────────────────────────────
+#
+# Motor acelerado independiente: detecta soportes/resistencias con pendiente
+# empinada (>=40%/yr) y régimen de aceleración/compresión.
+# No reemplaza /dynamic-supports ni /dynamic-resistances.
+
+@app.route('/api/assets/<int:accion_id>/accelerated-trendlines')
+def get_accelerated_trendlines_endpoint(accion_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT simbolo FROM accion WHERE id = %s", [accion_id])
+            row = cur.fetchone()
+
+    if not row:
+        return _jresp({'error': 'Asset not found'}, 404)
+
+    symbol = row['simbolo']
+    tf = (request.args.get('tf') or 'D').strip().upper()
+    if tf not in ('D', 'W'):
+        tf = 'D'
+
+    cache_key = f"{symbol}_{tf}"
+    with _accel_lock:
+        entry = _accel_cache.get(cache_key)
+        if entry and (time.time() - entry['ts']) < _ACCEL_TTL:
+            return _jresp(entry['data'])
+
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT fecha, open, high, low, close, volume
+                       FROM ohlcv_extended
+                       WHERE simbolo = %s AND timeframe = %s
+                       ORDER BY fecha ASC""",
+                    (symbol, tf),
+                )
+                raw = cur.fetchall()
+
+        if not raw:
+            result = {
+                'symbol': symbol, 'timeframe_used': tf, 'price': None,
+                'support': None, 'resistance': None, 'regime': 'none',
+                'meta': {'reason': f'No OHLCV data for {symbol}/{tf}'},
+            }
+            return _jresp(result)
+
+        ohlcv_rows = [
+            {'fecha': str(r['fecha']), 'open': float(r['open']),
+             'high': float(r['high']), 'low': float(r['low']),
+             'close': float(r['close']),
+             'volume': int(r.get('volume', 0) or 0)}
+            for r in raw
+        ]
+        price = ohlcv_rows[-1]['close']
+
+        from strategies.accelerated_trendlines import detect_accelerated_trendlines
+        accel = detect_accelerated_trendlines(ohlcv_rows, {'tf': tf})
+
+        meta = {k: v for k, v in accel.get('meta', {}).items() if k != 'config'}
+
+        result = {
+            'symbol':         symbol,
+            'timeframe_used': tf,
+            'price':          price,
+            'support':        accel['support'],
+            'resistance':     accel['resistance'],
+            'regime':         accel['regime'],
+            'meta':           meta,
+        }
+    except Exception as e:
+        return _jresp({'error': str(e), 'symbol': symbol}, 500)
+
+    with _accel_lock:
+        _accel_cache[cache_key] = {'data': result, 'ts': time.time()}
+
+    return _jresp(result)
 
 
 if __name__ == '__main__':
